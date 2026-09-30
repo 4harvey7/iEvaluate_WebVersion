@@ -59,6 +59,7 @@ class FakeServer:
         self.grace = grace
         self.command = None
         self.command_id = None
+        self.folder_path = None  # what the website tells the watcher to watch
         self.heartbeats, self.ingests = [], []
         self.ingest_reply = None  # (status, body) to force a reply
 
@@ -68,7 +69,7 @@ class FakeServer:
             if json.get("command_done") and json["command_done"] == self.command_id:
                 self.command = self.command_id = None
             ob = {"id": "b1", "created_at": "x"} if self.open_batch else None
-            return Resp(200, {"ok": True, "station_label": "L1", "open_batch": ob, "folder_path": None,
+            return Resp(200, {"ok": True, "station_label": "L1", "open_batch": ob, "folder_path": self.folder_path,
                               "command": self.command, "command_id": self.command_id})
         assert url.endswith("/scans/ingest")
         self.ingests.append(json)
@@ -289,5 +290,77 @@ def test_database_unreachable_code_is_read_from_top_level():
     assert code == "database_unreachable" and "database" in msg
 
 
+def test_kept_for_review_counts_as_delivered(make):
+    """Server kept a copy for its review page: the file goes to processed/, not skipped/."""
+    make_w, scans = make
+    server = FakeServer(open_batch=True)
+    server.ingest_reply = (422, {"detail": {"code": "failed_after_retries", "message": "kept",
+                                            "kept_for_review": True, "batch_id": "b1"}})
+    w = make_w(server)
+    w.heartbeat(force=True)
+    w.poll()
+    _jpeg(scans / "unsaved.jpg")
+    _settle(w)
+    assert len(server.ingests) == 1
+    assert os.listdir(scans / "processed" / datetime.now().strftime("%Y-%m-%d")) == ["unsaved.jpg"]
+    assert not (scans / "skipped").exists() or "unsaved.jpg" not in os.listdir(scans / "skipped")
+    _settle(w)
+    assert len(server.ingests) == 1  # never sent again
+
+
 def test_version():
-    assert fw.VERSION == "2.4.0"
+    assert fw.VERSION == "2.4.3"
+
+
+@pytest.mark.parametrize("shortcut", ["%USERPROFILE%/Scans", "~/Scans"])
+def test_website_folder_with_shortcut_is_refused(make, shortcut):
+    make_w, scans = make
+    server = FakeServer()
+    w = make_w(server)
+    server.folder_path = shortcut
+    w.heartbeat(force=True)
+    assert w.cfg.folder == str(scans)
+    assert w.folder_error == "unsafe_path"
+    w.heartbeat()  # the refusal is reported right away, not a minute later
+    assert server.heartbeats[-1]["folder_error"] == "unsafe_path"
+
+
+def test_website_folder_that_is_missing_is_not_created_and_reported(make, tmp_path):
+    make_w, scans = make
+    server = FakeServer()
+    w = make_w(server)
+    w.heartbeat(force=True)
+    typo = tmp_path / "scan"
+    server.folder_path = str(typo).replace("\\", "/")
+    w.heartbeat(force=True)
+    assert not typo.exists()
+    assert w.cfg.folder == os.path.normpath(str(typo))
+    assert w.local_folder_error == "not_found"
+    n = len(server.heartbeats)
+    w.heartbeat()  # no force: sent right away
+    assert len(server.heartbeats) == n + 1
+    assert server.heartbeats[-1]["folder_exists"] is False
+    assert server.heartbeats[-1]["folder_error"] == "not_found"
+    typo.mkdir()
+    w.poll()
+    n = len(server.heartbeats)
+    w.heartbeat()
+    assert len(server.heartbeats) == n + 1
+    assert server.heartbeats[-1]["folder_exists"] is True
+    assert server.heartbeats[-1]["folder_error"] is None
+
+
+def test_only_default_folder_is_created_and_only_at_startup(make, tmp_path, monkeypatch):
+    make_w, scans = make
+    default = tmp_path / "DefaultScans"
+    monkeypatch.setattr(fw, "DEFAULT_FOLDER", fw.normalize_folder(str(default)))
+    w = make_w(FakeServer())
+    w.switch_folder(fw.normalize_folder(str(default)))
+    assert not default.exists()
+    w.check_folder(create=True)
+    assert default.is_dir()
+    other = tmp_path / "OtherScans"
+    w.switch_folder(fw.normalize_folder(str(other)))
+    w.check_folder(create=True)
+    assert not other.exists()
+    assert w.local_folder_error == "not_found"

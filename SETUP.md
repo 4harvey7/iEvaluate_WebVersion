@@ -104,6 +104,8 @@ Copy `backend/.env.example` to `backend/.env` (or set these on your host):
 | `N8N_CORRECTION_WEBHOOK_URL` | no | Webhook the review page uses to credit a flagged form (the Flutter app's `sast-manual-correction`). Default: `N8N_BATCH_WEBHOOK_URL` with its last part `sast-batch-scan` replaced by `sast-manual-correction`. Empty (and no default) = the review page can't credit forms (`503 correction_not_configured`). Sent with `X-Webhook-Secret`. |
 | `N8N_IMPORT_ERROR_WEBHOOK_URL` | no | Webhook for fixing a website import error (the Flutter app's `import-error-correction`). Default: same derivation, `import-error-correction`. |
 | `N8N_CORRECTION_TIMEOUT_SECONDS` | no (default `180`) | How long the backend waits for a correction webhook. After a timeout the form shows "Sending..." and is settled when n8n's own update is seen, or marked "Not sent" after 10 minutes. |
+| `SCAN_IMAGE_BUCKET` | no (default `scan-pages`) | Page viewer (migration 010): PRIVATE Supabase Storage bucket where the backend keeps a viewing copy of every scanned page (long side `SCAN_IMAGE_MAX_SIDE`=1800 px, JPEG quality `SCAN_IMAGE_JPEG_QUALITY`=75, about 250 KB per page, 250 MB per 1,000 pages). Uploaded after marking answers, in the background, with the service key; staff see it only through the backend (login + batch access). Empty = keep no pictures. |
+| `SCAN_IMAGE_RETENTION_DAYS` | no (default `90`) | Pictures older than this are removed from the bucket (checked at most once an hour, started by the batch page's poll). `0` = keep them. The score stays on the page's row. |
 | `N8N_TIMEOUT_SECONDS`, `MAX_UPLOAD_MB`, `PREDATE_GRACE_SECONDS`, `WATCHER_ONLINE_SECONDS`, `PASSWORD_RESET_REDIRECT_URL` | no | Tuning, see `.env.example`. |
 
 ## 3. Run locally
@@ -124,6 +126,15 @@ npm run dev
 `VITE_API_BASE` defaults to `http://localhost:8000`.
 
 ## 4. Deploy
+
+### Deploy to Render + Vercel
+
+1. **Backend (Render):** New -> Blueprint -> pick this repo. `render.yaml` creates the `ievaluate-api` Docker service (root `backend/`, health check `/health`). Fill in the prompted values (SUPABASE_URL, SUPABASE_SERVICE_KEY, N8N_BATCH_WEBHOOK_URL, N8N_WEBHOOK_SECRET, CORS_ORIGINS, WATCHER_API_BASE, PASSWORD_RESET_REDIRECT_URL). Use the service's https onrender.com URL for WATCHER_API_BASE.
+2. **Frontend (Vercel):** import the repo, Root Directory `frontend`, env var `VITE_API_BASE=https://<render-url>`. The build fails unless it is https, and the Content-Security-Policy is generated from it.
+3. Set CORS_ORIGINS on Render to the Vercel URL (no trailing slash) and redeploy.
+4. Check `https://<render-url>/health` returns `{"status":"ok"}`.
+
+### Other hosts
 
 - **Backend:** any Docker host (Railway, Render, Fly). Root directory
   `backend/`, which has the Dockerfile. Set the env vars from step 2. Check

@@ -98,7 +98,7 @@ def setup(monkeypatch):
         monkeypatch.setattr(scans, "get_settings", lambda: settings)
         monkeypatch.setattr(scans, "_n8n", lambda: n8n)
         app.dependency_overrides[require_station] = lambda: {"id": "st-1", "label": "Laptop 1"}
-        return sb, n8n, TestClient(app, raise_server_exceptions=False)
+        return sb, n8n, TestClient(app, raise_server_exceptions=False, headers={"X-Station-Key": "test-station-key"})
 
     yield _setup
     app.dependency_overrides.clear()

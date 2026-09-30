@@ -1,27 +1,38 @@
 import React, { useEffect, useRef, useState } from "react";
 import { API_BASE, api } from "../api.js";
-import { ConfirmDialog, KeyReveal, Loading, PageHeader, downloadWatcherConfig } from "../components.jsx";
+import { ConfirmDialog, KeyReveal, Loading, PageHeader, downloadWatcherConfig, useNow } from "../components.jsx";
 import { Icon } from "../icons.jsx";
 import {
   DEFAULT_FOLDER,
+  FOLDER_SHORTCUT_MESSAGE,
   InstallSteps,
+  STATUS_POLL_MS,
   ScannerStatus,
+  folderCheckStatus,
   hasBeenOnline,
   sameFolder,
   toWindowsPath,
   useStation,
+  usesFolderShortcut,
 } from "../scanner.jsx";
 
 // "Scanner laptop" page: status light, one-click installer, scan folder, and
 // the old manual setup tucked away under "Advanced (for IT)".
 export default function WatcherSetup({ stationId, stationKey, onStationKey, onStationMissing }) {
-  const { station, setStation, error: loadError, loading, refresh } = useStation(stationId, { onMissing: onStationMissing });
+  // Ask the server more often while waiting for the scanner laptop to answer.
+  const [fastPoll, setFastPoll] = useState(false);
+  const { station, setStation, error: loadError, loading, refresh } = useStation(stationId, {
+    intervalMs: fastPoll ? 3000 : STATUS_POLL_MS,
+    onMissing: onStationMissing,
+  });
 
   const [folder, setFolder] = useState(DEFAULT_FOLDER);
   const folderTouched = useRef(false);
   const [savingFolder, setSavingFolder] = useState(false);
   const [folderError, setFolderError] = useState("");
-  const [folderSaved, setFolderSaved] = useState(false);
+  const [folderCheck, setFolderCheck] = useState(null); // { folder, savedAt, startedMs } after a save
+  const now = useNow(2000);
+  const check = folderCheckStatus(station, folderCheck, now);
 
   // Advanced (for IT)
   const [apiBase, setApiBase] = useState(API_BASE);
@@ -29,6 +40,10 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
   const [advInfo, setAdvInfo] = useState("");
   const [advBusy, setAdvBusy] = useState(false);
   const [confirmRegen, setConfirmRegen] = useState(false);
+
+  useEffect(() => {
+    setFastPoll(check?.kind === "checking");
+  }, [check?.kind]);
 
   // Fill the folder box from the server until the user starts typing.
   useEffect(() => {
@@ -42,9 +57,13 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
   async function saveFolder(e) {
     e.preventDefault();
     const value = folder.trim();
-    setFolderSaved(false);
+    setFolderCheck(null);
     if (!value) {
       setFolderError("Please type a folder, for example C:\\Scans.");
+      return;
+    }
+    if (usesFolderShortcut(value)) {
+      setFolderError(FOLDER_SHORTCUT_MESSAGE);
       return;
     }
     setFolderError("");
@@ -54,7 +73,7 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
       if (updated) setStation(updated);
       folderTouched.current = false;
       setFolder(toWindowsPath(updated?.folder_path) || value);
-      setFolderSaved(true);
+      setFolderCheck({ folder: updated?.folder_path || value, savedAt: updated?.updated_at || "", startedMs: Date.now() });
     } catch (err) {
       setFolderError(err?.message || "The folder couldn't be saved. Please try again.");
     } finally {
@@ -143,7 +162,7 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
             onChange={(e) => {
               folderTouched.current = true;
               setFolder(e.target.value);
-              setFolderSaved(false);
+              setFolderCheck(null);
               setFolderError("");
             }}
             placeholder={DEFAULT_FOLDER}
@@ -163,9 +182,12 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
         <strong>Tip:</strong> Set your scanner to save into this same folder.
       </p>
       {folderError && <div className="error" role="alert">{folderError}</div>}
-      {folderSaved && (
-        <div className="success-box" role="status">
-          Saved. The scanner laptop will switch to this folder by itself within 30 seconds. Nothing to do on the laptop.
+      {check && (
+        <div
+          className={check.tone === "success" ? "success-box" : check.tone === "error" ? "error" : "warning-box"}
+          role={check.tone === "error" ? "alert" : "status"}
+        >
+          {check.kind === "checking" && <span className="spinner" aria-hidden="true" />} {check.text}
         </div>
       )}
     </section>

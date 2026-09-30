@@ -20,6 +20,75 @@ export function sameFolder(a, b) {
   return folderKey(a) === folderKey(b);
 }
 
+export const FOLDER_SHORTCUT_MESSAGE =
+  "Please type the full folder path instead of using shortcuts like %NAME% or ~, for example C:\\Scans.";
+
+// Website folders must be full paths: %NAME% and ~ shortcuts are refused.
+export function usesFolderShortcut(p) {
+  const v = String(p || "").trim().replace(/^["']+/, "").trim();
+  return v.includes("%") || v.startsWith("~");
+}
+
+// How long the page waits for the scanner laptop to answer before it says so.
+export const FOLDER_CHECK_TIMEOUT_MS = 90000;
+
+// What the page says after "Save folder": the laptop's real answer, not a guess.
+// check = { folder, savedAt, startedMs }. Returns { kind, tone, text } or null.
+// tone: success | error | warn
+export function folderCheckStatus(station, check, now = Date.now()) {
+  if (!station || !check || !sameFolder(station.folder_path, check.folder)) return null;
+  const f = toWindowsPath(check.folder);
+  if (!hasBeenOnline(station)) {
+    return { kind: "not_installed", tone: "warn", text: `Saved. When the scan program is installed on the scanner laptop, it will watch ${f}.` };
+  }
+  if (!isOnline(station)) {
+    return {
+      kind: "offline",
+      tone: "warn",
+      text: `Saved. The scanner laptop is offline, so it can't check ${f} yet. It will switch by itself when it is back online.`,
+    };
+  }
+  const seen = Date.parse(station.last_seen_at);
+  const saved = Date.parse(check.savedAt);
+  const fresh = Number.isFinite(seen) && Number.isFinite(saved) && seen > saved;
+  const watching = fresh && sameFolder(station.watcher_folder, check.folder);
+  if (watching) {
+    const err = station.watcher_folder_error || null;
+    if (err === "not_found" || station.watcher_folder_exists === false) {
+      return {
+        kind: "not_found",
+        tone: "error",
+        text: `The scanner laptop can't find ${f}. Check the spelling. If the name is right, create this folder on the scanner laptop. This message updates by itself.`,
+      };
+    }
+    if (err === "access_denied") {
+      return { kind: "access_denied", tone: "error", text: `The scanner laptop isn't allowed to open ${f}. Please pick a different folder, such as C:\\Scans.` };
+    }
+    if (err === "unsafe_path") {
+      return { kind: "unsafe_path", tone: "error", text: "That folder isn't allowed on the scanner laptop. Please pick a folder just for scans, like C:\\Scans." };
+    }
+    if (err) {
+      return { kind: "problem", tone: "error", text: `There is a problem with ${f} on the scanner laptop. Please check the folder setting.` };
+    }
+    return {
+      kind: "done",
+      tone: "success",
+      text: `Done. The scanner laptop is now watching ${f}. Make sure your scanner program saves into this same folder.`,
+    };
+  }
+  if (now - (check.startedMs || 0) < FOLDER_CHECK_TIMEOUT_MS) {
+    return { kind: "checking", tone: "warn", text: "Saved. Checking the folder on the scanner laptop..." };
+  }
+  if (fresh && station.watcher_folder_error === "unsafe_path") {
+    return {
+      kind: "refused",
+      tone: "error",
+      text: `The scanner laptop refused ${f} because that folder is too big to watch. Please pick a folder just for scans, like C:\\Scans.`,
+    };
+  }
+  return { kind: "slow", tone: "warn", text: `Saved, but the scanner laptop hasn't switched to ${f} yet. Check the status above in a minute.` };
+}
+
 export function isOnline(station) {
   if (!station) return false;
   return Boolean(station.watcher_online ?? station.online);

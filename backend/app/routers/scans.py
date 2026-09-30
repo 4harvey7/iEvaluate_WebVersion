@@ -4,17 +4,22 @@ import base64
 import logging
 import threading
 from datetime import datetime, timezone
+from typing import Callable
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app import page_images
+from app import unsaved_pages as unsaved
 from app.db import get_settings, get_supabase
+from app.folder_safety import is_network_path
 from app.logic import (
     PIPELINE_MISCONFIGURED_MSG,
     PIPELINE_NOT_CONFIGURED_MSG,
     PIPELINE_REJECTED_MSG,
     SHA256_RE,
+    UNSAVED_REVIEW_MSG,
     ImageValidationError,
     PipelineResponseError,
     build_n8n_payload,
@@ -23,6 +28,7 @@ from app.logic import (
     file_predates_batch,
     is_permanent_not_saved,
     is_unsaved_internal_error,
+    item_error_code,
     make_task_id,
     prepare_page,
     parse_ts,
@@ -96,6 +102,8 @@ def _mark_error(item_id: str, message: str, retryable: bool = True, reasons: lis
 
 
 FAILED_AFTER_RETRIES_MSG = "Scoring failed after repeated attempts; the file was set aside. Rescan it if needed."
+KEPT_FOR_REVIEW_MSG = ("Marking couldn't save this page after several tries. A copy is waiting on the website's "
+                       "review page (try again or type in the answers there); no rescan needed.")
 
 
 def _failed_after_retries(attempts: int | None = None) -> HTTPException:
@@ -103,19 +111,71 @@ def _failed_after_retries(attempts: int | None = None) -> HTTPException:
     return _err(422, "failed_after_retries", FAILED_AFTER_RETRIES_MSG, attempts=attempts)
 
 
+def _kept_for_review(attempts: int | None, batch_id: str) -> HTTPException:
+    # Same code (watchers <= 2.4.0 set the file aside as before); 2.4.1+ see
+    # kept_for_review and count the page as delivered.
+    return _err(422, "failed_after_retries", KEPT_FOR_REVIEW_MSG, attempts=attempts,
+                kept_for_review=True, batch_id=batch_id)
+
+
+# keep(final, reasons, note, failures) -> True when a copy of the page was kept
+KeepFn = Callable[[bool, list | None, str, int], bool]
+
+
 def _pipeline_failure(item_id: str, prior_failures: int, code: str, client_msg: str, item_msg: str,
-                      reasons: list | None = None) -> HTTPException:
+                      reasons: list | None = None, keep: KeepFn | None = None,
+                      batch_id: str | None = None, note: str | None = None) -> HTTPException:
     """A REAL pipeline failure (n8n answered but didn't store / errored / bad
     reply). Counts toward MAX_PIPELINE_ATTEMPTS. Retryable -> 502 (watcher
-    backs off and retries); cap reached -> permanent error + 422."""
+    backs off and retries); cap reached -> permanent error + 422. A copy of
+    the page is kept (app/unsaved_pages.py) so that, once the cap is reached,
+    it waits on the review page instead of silently dropping out."""
     max_attempts = get_settings().max_pipeline_attempts
     failures = prior_failures + 1
-    if retries_exhausted(failures, max_attempts):
+    final = retries_exhausted(failures, max_attempts)
+    kept = bool(keep and keep(final, reasons, note or item_msg, failures))
+    if final:
+        if kept:
+            _mark_error(item_id, f"{UNSAVED_REVIEW_MSG} ({failures} automatic tries: {item_msg})", retryable=False,
+                        reasons=reasons, count_failure=True)
+            log.warning("item %s not saved after %s pipeline failures (%s); kept for review", item_id, failures, code)
+            return _kept_for_review(failures, batch_id or "")
         _mark_error(item_id, f"Failed after {failures} attempts: {item_msg}", retryable=False, reasons=reasons, count_failure=True)
         log.warning("item %s failed permanently after %s pipeline failures (%s)", item_id, failures, code)
         return _failed_after_retries(failures)
     _mark_error(item_id, item_msg, retryable=True, reasons=reasons, count_failure=True)
     return _err(502, code, client_msg, failures=failures, max_attempts=max_attempts)
+
+
+def _keep_failed_page(sb, item_id: str, keep: KeepFn) -> bool:
+    """A page that gave up BEFORE copies were kept (or while migration 008
+    was missing) is sent again, e.g. the file was put back into the scan
+    folder: keep it now so it shows on the review page. True when a copy
+    exists (then the item message says so)."""
+    if not unsaved.available():
+        return False
+    try:
+        rows = sb.table("scan_batch_items").select("id, status, retryable, message, review_reasons, pipeline_failures") \
+            .eq("id", item_id).limit(1).execute().data or []
+    except Exception:
+        log.exception("could not read item %s", item_id)
+        return False
+    item = rows[0] if rows and isinstance(rows[0], dict) else None
+    code = item_error_code(item) if item else None
+    if code == "not_saved_needs_review":
+        return True
+    if code != "failed_after_retries":
+        return False
+    if not keep(True, item.get("review_reasons") or [], str(item.get("message") or ""),
+                int(item.get("pipeline_failures") or 0)):
+        return False
+    try:
+        sb.table("scan_batch_items").update({
+            "message": f"{UNSAVED_REVIEW_MSG} ({item.get('message') or 'automatic tries used up'})"[:1000],
+        }).eq("id", item_id).eq("status", "error").eq("retryable", False).execute()
+    except Exception:
+        log.exception("could not update item %s after keeping it", item_id)
+    return True
 
 
 def _omr_prep_config(settings) -> OmrPrepConfig | None:
@@ -200,103 +260,130 @@ def ingest_scan(body: IngestScan, station: dict = Depends(require_station)):
         raise _err(500, "claim_failed", "Could not record the scan. Will retry.")
     item_id = row["item_id"]
     prior_failures = int(row.get("item_failures") or 0)
+
+    # A copy of the page for the review page, kept when marking can't save it.
+    jpeg_b64 = base64.b64encode(jpeg).decode("ascii")
+    header_b64 = base64.b64encode(page.header_jpeg).decode("ascii") if page.header_jpeg else None
+
+    def keep(final: bool, reasons: list | None, note: str, failures: int) -> bool:
+        return unsaved.record(
+            sb, item_id=item_id, batch_id=batch["id"], task_id=task_id, filename=filename, image_b64=jpeg_b64,
+            header_b64=header_b64, meta=unsaved.page_meta(page, sha, station_id), reasons=reasons or [],
+            message=note, failures=failures, final=final,
+        )
+
     if not row["claimed"]:
         if row["item_status"] == "processing":
             raise _err(409, "in_progress", "This page is already being processed. Will retry shortly.")
         if row["item_status"] == "error":
             # Only non-retryable errors are left unclaimed: retry cap reached.
+            if _keep_failed_page(sb, item_id, keep):
+                raise _kept_for_review(row.get("item_failures"), batch["id"])
             raise _failed_after_retries(row.get("item_failures"))
         item = sb.table("scan_batch_items").select("*").eq("id", item_id).limit(1).execute().data[0]
+        if not item.get("page_image_path") or not item.get("result_summary"):
+            # e.g. the first try's picture couldn't be kept: fill it in now
+            page_images.after_scan(sb, settings, batch_id=batch["id"], item_id=item_id, task_id=task_id, jpeg=jpeg)
         return _result_payload(item, batch["id"], idempotent=True)
 
     _record_orientation(item_id, page)
-
-    # 6a. Simulation (explicit opt-in, no webhook configured).
-    if not settings.n8n_batch_webhook_url:
-        if settings.simulate_scans:
-            msg = "SIMULATED result - no scoring pipeline configured."
-            sb.rpc("complete_batch_item", {
-                "p_item_id": item_id, "p_status": "success", "p_review_reasons": [], "p_identity": None,
-                "p_message": msg, "p_simulated": True,
-            }).execute()
-            return {
-                "batch_id": batch["id"], "item_id": item_id, "task_id": task_id, "status": "success", "flagged": False,
-                "review_reasons": [], "identity_check": None, "message": msg, "simulated": True, "idempotent": False,
-            }
-        _mark_error(item_id, PIPELINE_NOT_CONFIGURED_MSG)
-        log.error("N8N_BATCH_WEBHOOK_URL is not set and SIMULATE_SCANS is false")
-        raise _err(503, "pipeline_not_configured", "The scoring pipeline is not configured on the server. Will retry.")
-
-    # 6b. Forward to n8n. URL + raw errors stay server-side.
-    payload = build_n8n_payload(batch, station_id, filename, sha, base64.b64encode(jpeg).decode("ascii"), orientation=page)
-    headers = {"X-Webhook-Secret": settings.n8n_webhook_secret}  # required at startup when a URL is set
     try:
-        resp = _n8n().post(settings.n8n_batch_webhook_url, json=payload, headers=headers)
-    except httpx.TimeoutException:
-        # n8n may still be working on it: leave the item 'processing' so the
-        # stale window (timeout + 60s) blocks a parallel re-run. Not counted
-        # toward the retry cap.
-        log.warning("n8n call timed out (task %s); item left processing", task_id)
-        raise _err(502, "pipeline_timeout", "The scoring pipeline timed out. Will retry.")
-    except httpx.HTTPError as e:
-        log.warning("n8n transport error (task %s): %s; item left processing", task_id, type(e).__name__)
-        raise _err(502, "pipeline_unavailable", "The scoring pipeline is unavailable. Will retry.")
+        # 6a. Simulation (explicit opt-in, no webhook configured).
+        if not settings.n8n_batch_webhook_url:
+            if settings.simulate_scans:
+                msg = "SIMULATED result - no scoring pipeline configured."
+                sb.rpc("complete_batch_item", {
+                    "p_item_id": item_id, "p_status": "success", "p_review_reasons": [], "p_identity": None,
+                    "p_message": msg, "p_simulated": True,
+                }).execute()
+                return {
+                    "batch_id": batch["id"], "item_id": item_id, "task_id": task_id, "status": "success", "flagged": False,
+                    "review_reasons": [], "identity_check": None, "message": msg, "simulated": True, "idempotent": False,
+                }
+            _mark_error(item_id, PIPELINE_NOT_CONFIGURED_MSG)
+            log.error("N8N_BATCH_WEBHOOK_URL is not set and SIMULATE_SCANS is false")
+            raise _err(503, "pipeline_not_configured", "The scoring pipeline is not configured on the server. Will retry.")
 
-    if resp.status_code in (401, 403):
-        # Wrong/missing webhook secret: a configuration problem, not the page's fault.
-        log.error("n8n rejected the webhook secret (HTTP %s) - check N8N_WEBHOOK_SECRET", resp.status_code)
-        _mark_error(item_id, PIPELINE_MISCONFIGURED_MSG, retryable=True)
-        raise _err(503, "pipeline_misconfigured", "The scoring pipeline is misconfigured on the server. Will retry.")
+        # 6b. Forward to n8n. URL + raw errors stay server-side.
+        payload = build_n8n_payload(batch, station_id, filename, sha, jpeg_b64, orientation=page)
+        headers = {"X-Webhook-Secret": settings.n8n_webhook_secret}  # required at startup when a URL is set
+        try:
+            resp = _n8n().post(settings.n8n_batch_webhook_url, json=payload, headers=headers)
+        except httpx.TimeoutException:
+            # n8n may still be working on it: leave the item 'processing' so the
+            # stale window (timeout + 60s) blocks a parallel re-run. Not counted
+            # toward the retry cap.
+            log.warning("n8n call timed out (task %s); item left processing", task_id)
+            raise _err(502, "pipeline_timeout", "The scoring pipeline timed out. Will retry.")
+        except httpx.HTTPError as e:
+            log.warning("n8n transport error (task %s): %s; item left processing", task_id, type(e).__name__)
+            raise _err(502, "pipeline_unavailable", "The scoring pipeline is unavailable. Will retry.")
 
-    if resp.status_code != 200:
-        log.warning("n8n returned HTTP %s (task %s)", resp.status_code, task_id)
-        raise _pipeline_failure(item_id, prior_failures, "pipeline_error", "The scoring pipeline returned an error. Will retry.",
-                                f"Scoring pipeline returned HTTP {resp.status_code}.")
-    try:
-        result = validate_n8n_response(resp.json())
-    except (ValueError, PipelineResponseError) as e:
-        log.warning("n8n response invalid (task %s): %s", task_id, str(e)[:200])
-        raise _pipeline_failure(item_id, prior_failures, "pipeline_bad_response",
-                                "The scoring pipeline returned an unexpected response. Will retry.",
-                                "Scoring pipeline returned an unexpected response.")
+        if resp.status_code in (401, 403):
+            # Wrong/missing webhook secret: a configuration problem, not the page's fault.
+            log.error("n8n rejected the webhook secret (HTTP %s) - check N8N_WEBHOOK_SECRET", resp.status_code)
+            _mark_error(item_id, PIPELINE_MISCONFIGURED_MSG, retryable=True)
+            raise _err(503, "pipeline_misconfigured", "The scoring pipeline is misconfigured on the server. Will retry.")
 
-    # n8n rejected the request itself (invalid_request + not_saved_permanent):
-    # nothing stored, retrying can't help -> permanent error, watcher skips the file.
-    if is_permanent_not_saved(result):
-        log.warning("n8n rejected request permanently (task %s)", task_id)
-        _mark_error(item_id, PIPELINE_REJECTED_MSG, retryable=False, reasons=result["review_reasons"], count_failure=True)
-        raise _err(422, "pipeline_rejected_request", PIPELINE_REJECTED_MSG)
+        if resp.status_code != 200:
+            log.warning("n8n returned HTTP %s (task %s)", resp.status_code, task_id)
+            raise _pipeline_failure(item_id, prior_failures, "pipeline_error", "The scoring pipeline returned an error. Will retry.",
+                                    f"Scoring pipeline returned HTTP {resp.status_code}.", keep=keep, batch_id=batch["id"])
+        try:
+            result = validate_n8n_response(resp.json())
+        except (ValueError, PipelineResponseError) as e:
+            log.warning("n8n response invalid (task %s): %s", task_id, str(e)[:200])
+            raise _pipeline_failure(item_id, prior_failures, "pipeline_bad_response",
+                                    "The scoring pipeline returned an unexpected response. Will retry.",
+                                    "Scoring pipeline returned an unexpected response.", keep=keep, batch_id=batch["id"])
 
-    # n8n says "flagged" + internal_error_not_saved: the page was NOT stored.
-    # Retry instead of counting it as flagged.
-    if is_unsaved_internal_error(result):
-        log.warning("n8n internal error, page not saved (task %s, prior failures %s)", task_id, prior_failures)
-        raise _pipeline_failure(item_id, prior_failures, "pipeline_not_saved",
-                                "The scoring pipeline could not save this page. Will retry.",
-                                "Scoring pipeline internal error; page not saved.",
-                                reasons=result["review_reasons"])
+        # n8n rejected the request itself (invalid_request + not_saved_permanent):
+        # nothing stored, retrying can't help -> permanent error, watcher skips the file.
+        if is_permanent_not_saved(result):
+            log.warning("n8n rejected request permanently (task %s)", task_id)
+            _mark_error(item_id, PIPELINE_REJECTED_MSG, retryable=False, reasons=result["review_reasons"], count_failure=True)
+            if prior_failures:
+                unsaved.close_for_item(sb, item_id, "refused")
+            raise _err(422, "pipeline_rejected_request", PIPELINE_REJECTED_MSG)
 
-    sb.rpc("complete_batch_item", {
-        "p_item_id": item_id,
-        "p_status": result["status"],
-        "p_review_reasons": result["review_reasons"],
-        "p_identity": result["identity_check"],
-        "p_message": result["message"],
-        "p_simulated": False,
-    }).execute()
+        # n8n says "flagged" + internal_error_not_saved: the page was NOT stored.
+        # Retry instead of counting it as flagged.
+        if is_unsaved_internal_error(result):
+            log.warning("n8n internal error, page not saved (task %s, prior failures %s)", task_id, prior_failures)
+            raise _pipeline_failure(item_id, prior_failures, "pipeline_not_saved",
+                                    "The scoring pipeline could not save this page. Will retry.",
+                                    "Scoring pipeline internal error; page not saved.",
+                                    reasons=result["review_reasons"], keep=keep, batch_id=batch["id"],
+                                    note=result.get("message"))
 
-    return {
-        "batch_id": batch["id"],
-        "item_id": item_id,
-        "task_id": task_id,
-        "status": result["status"],
-        "flagged": result["flagged"],
-        "review_reasons": result["review_reasons"],
-        "identity_check": result["identity_check"],
-        "message": result["message"],
-        "simulated": False,
-        "idempotent": False,
-    }
+        sb.rpc("complete_batch_item", {
+            "p_item_id": item_id,
+            "p_status": result["status"],
+            "p_review_reasons": result["review_reasons"],
+            "p_identity": result["identity_check"],
+            "p_message": result["message"],
+            "p_simulated": False,
+        }).execute()
+        if prior_failures:
+            # an automatic resend worked after all: the kept copy is no longer needed
+            unsaved.close_for_item(sb, item_id, result["status"])
+
+        return {
+            "batch_id": batch["id"],
+            "item_id": item_id,
+            "task_id": task_id,
+            "status": result["status"],
+            "flagged": result["flagged"],
+            "review_reasons": result["review_reasons"],
+            "identity_check": result["identity_check"],
+            "message": result["message"],
+            "simulated": False,
+            "idempotent": False,
+        }
+    finally:
+        # Whatever marking answered (or not): keep the page's picture + score for the
+        # page viewer, in the background (app/page_images.py). Never blocks or fails the scan.
+        page_images.after_scan(sb, settings, batch_id=batch["id"], item_id=item_id, task_id=task_id, jpeg=jpeg)
 
 
 class Heartbeat(BaseModel):
@@ -330,6 +417,13 @@ def _watcher_status(body: Heartbeat) -> dict:
     }
 
 
+def _heartbeat_folder(raw) -> str | None:
+    folder = (raw or "").strip()
+    if not folder or is_network_path(folder):
+        return None
+    return folder
+
+
 @router.post("/heartbeat")
 def heartbeat(body: Heartbeat | None = None, station: dict = Depends(require_station)):
     sb = get_supabase()
@@ -349,7 +443,8 @@ def heartbeat(body: Heartbeat | None = None, station: dict = Depends(require_sta
         "server_time": now.isoformat(),
         "open_batch": ob[0] if ob else None,
         # Folder chosen on the website; watcher 2.3+ switches to it live.
-        "folder_path": (station.get("folder_path") or "").strip() or None,
+        # Never a network share (older watchers would follow it).
+        "folder_path": _heartbeat_folder(station.get("folder_path")),
         # Watcher 2.4+: null | "resend_skipped" | "discard_skipped" (pages in
         # skipped/before-batch/). The watcher echoes command_id back as
         # command_done on its next heartbeat.

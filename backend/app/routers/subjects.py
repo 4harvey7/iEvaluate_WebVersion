@@ -26,7 +26,7 @@ def _with_dept(rows: list[dict]) -> list[dict]:
 def _find_by_normalized_code(norm: str) -> dict | None:
     if not norm:
         return None
-    rows = get_supabase().table("subjects").select(COLUMNS).ilike("subject_code", code_like_pattern(norm)).limit(50).execute().data or []
+    rows = get_supabase().table("subjects").select(COLUMNS).ilike("subject_code", code_like_pattern(norm)).limit(1000).execute().data or []
     for r in rows:
         if normalize_code(r.get("subject_code") or "") == norm:
             return r

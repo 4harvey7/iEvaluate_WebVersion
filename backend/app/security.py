@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import threading
 import time
@@ -20,7 +21,7 @@ import httpx
 import jwt as pyjwt
 from fastapi import Depends, Header, HTTPException, Request
 
-from app.db import DatabaseUnreachable, get_supabase, is_valid_uuid
+from app.db import DatabaseUnreachable, get_settings, get_supabase, is_valid_uuid
 from app.logic import hash_station_key
 
 try:  # supabase-py >= 2.9 ships the auth client as supabase_auth, older as gotrue
@@ -258,5 +259,41 @@ class RateLimiter:
 login_limiter = RateLimiter()
 
 
+def _parse_ip(value: str | None) -> str | None:
+    """Normalised IP string, or None when `value` is not a bare IPv4/IPv6 address."""
+    if not value:
+        return None
+    candidate = value.strip()
+    if candidate.startswith("[") and "]" in candidate:  # "[2001:db8::1]:443"
+        candidate = candidate[1:candidate.index("]")]
+    elif candidate.count(":") == 1:  # "203.0.113.5:1234"
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
 def client_ip(request: Request) -> str:
+    """The caller's IP for rate limiting.
+
+    TRUST_PROXY_HEADERS=false (default, local runs): only the TCP peer
+    (`request.client.host`), so nobody can pick their own rate-limit bucket by
+    sending headers.
+
+    TRUST_PROXY_HEADERS=true (Render, behind Cloudflare):
+      1. CF-Connecting-IP, which Cloudflare always overwrites with the real client;
+      2. else the RIGHTMOST valid X-Forwarded-For entry, i.e. the one appended by
+         the nearest proxy (entries to its left are client-supplied and spoofable);
+      3. else the TCP peer.
+    """
+    if get_settings().trust_proxy_headers:
+        cf_ip = _parse_ip(request.headers.get("cf-connecting-ip"))
+        if cf_ip:
+            return cf_ip
+        xff = ",".join(request.headers.getlist("x-forwarded-for"))
+        for part in reversed(xff.split(",")):
+            ip = _parse_ip(part)
+            if ip:
+                return ip
     return request.client.host if request.client else "unknown"

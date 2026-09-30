@@ -12,8 +12,15 @@ from postgrest.exceptions import APIError
 from pydantic import BaseModel, Field
 
 from app.audit import audit
+from app.batch_access import (
+    NOT_YOUR_STATION_CODE,
+    NOT_YOUR_STATION_MSG,
+    STATION_IN_USE_CODE,
+    can_manage_station,
+    station_in_use_message,
+)
 from app.db import get_settings, get_supabase, is_valid_uuid
-from app.folder_safety import DEFAULT_FOLDER, check_folder_for_server
+from app.folder_safety import DEFAULT_FOLDER, check_folder_for_server, is_network_path
 from app.logic import generate_station_key, hash_station_key, parse_ts
 from app.routers.watcher_download import ZIP_PATH
 from app.security import CurrentUser, require_staff
@@ -99,6 +106,14 @@ def _get_station_row(station_id: str) -> dict:
     return rows[0]
 
 
+def _require_station_manager(station: dict, user: CurrentUser, action: str) -> None:
+    """Folder / key / installer: only the staff bound to this station, or an admin."""
+    if not can_manage_station(station, user):
+        audit(user.id, "station_change_refused", {"station_id": station.get("id"), "action": action,
+                                                  "bound_staff_id": station.get("current_staff_id")})
+        raise HTTPException(status_code=403, detail={"code": NOT_YOUR_STATION_CODE, "message": NOT_YOUR_STATION_MSG})
+
+
 def _rotate_key(station_id: str) -> str:
     key = generate_station_key()
     get_supabase().table("stations").update({
@@ -136,7 +151,7 @@ def register_station(body: RegisterStation, user: CurrentUser = Depends(require_
 
 @router.post("/{station_id}/regenerate-key")
 def regenerate_key(station_id: str, user: CurrentUser = Depends(require_staff)):
-    _get_station_row(station_id)
+    _require_station_manager(_get_station_row(station_id), user, "regenerate_key")
     key = _rotate_key(station_id)
     audit(user.id, "station_key_regenerated", {"station_id": station_id})
     station = _decorate([_get_station_row(station_id)])[0]
@@ -158,6 +173,11 @@ def _api_base_for_watcher(request: Request, override: str | None) -> str:
     if proto == "https" and base.startswith("http://"):
         base = "https://" + base[len("http://"):]
     return base
+
+
+def _installer_folder(raw: str | None) -> str:
+    folder = (raw or "").strip()
+    return folder if folder and not is_network_path(folder) else DEFAULT_FOLDER
 
 
 def _safe_label(label: str | None) -> str:
@@ -195,6 +215,7 @@ def download_installer(
     """One-file setup: the watcher package plus a ready watcher_config.json.
     Rotates the station key (any watcher using the old key stops working)."""
     station = _get_station_row(station_id)
+    _require_station_manager(station, user, "installer")
     api_base = _api_base_for_watcher(request, body.api_base if body else None)
     files = _read_package()  # before rotating, so a missing package changes nothing
     key = _rotate_key(station_id)
@@ -202,7 +223,8 @@ def download_installer(
     config = {
         "api_base": api_base,
         "station_key": key,
-        "folder": (station.get("folder_path") or "").strip() or DEFAULT_FOLDER,
+        # Never a network share from the website (IT may set one on the laptop by hand).
+        "folder": _installer_folder(station.get("folder_path")),
     }
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -232,7 +254,8 @@ def get_station(station_id: str, user: CurrentUser = Depends(require_staff)):
 
 @router.put("/{station_id}/folder")
 def set_folder(station_id: str, body: FolderUpdate, user: CurrentUser = Depends(require_staff)):
-    _get_station_row(station_id)
+    station = _get_station_row(station_id)
+    _require_station_manager(station, user, "set_folder")
     folder, problem = check_folder_for_server(body.folder_path)
     if problem:
         raise HTTPException(status_code=400, detail=problem)
@@ -240,6 +263,8 @@ def set_folder(station_id: str, body: FolderUpdate, user: CurrentUser = Depends(
         "folder_path": folder,
         "updated_at": _now_iso(),
     }).eq("id", station_id).execute()
+    audit(user.id, "station_folder_changed", {"station_id": station_id, "folder_path": folder,
+                                              "previous_folder_path": station.get("folder_path")})
     return _decorate([_get_station_row(station_id)])[0]
 
 
@@ -266,10 +291,38 @@ def skipped_pages(station_id: str, body: SkippedPagesAction, user: CurrentUser =
 
 @router.post("/{station_id}/bind")
 def bind_staff_to_station(station_id: str, user: CurrentUser = Depends(require_staff)):
-    """Bind the *authenticated* staff member to this laptop's station."""
-    _get_station_row(station_id)
-    get_supabase().table("stations").update({
+    """Bind the *authenticated* staff member to this laptop's station.
+
+    Staff share laptops, so this stays easy: allowed when the station is free,
+    already ours, we are an admin, or whoever is bound there has no open batch
+    on it. Otherwise 409 station_in_use (binding would not give access to their
+    batch any more - see app/batch_access.py - but it would cut them off their
+    own laptop setup mid-batch)."""
+    station = _get_station_row(station_id)
+    sb = get_supabase()
+    previous = str(station.get("current_staff_id") or "") or None
+    if previous and previous != user.id and not user.is_admin:
+        busy = (sb.table("scan_batches").select("id").eq("station_id", station_id).eq("status", "open")
+                .eq("created_by", previous).limit(1).execute().data)
+        if busy:
+            names = sb.table("user_info").select("first_name, last_name").eq("id", previous).limit(1).execute().data or []
+            name = " ".join(p for p in ((names[0].get("first_name"), names[0].get("last_name")) if names else ()) if p)
+            audit(user.id, "station_bind_refused", {"station_id": station_id, "bound_staff_id": previous,
+                                                    "open_batch_id": busy[0]["id"]})
+            raise HTTPException(status_code=409, detail={"code": STATION_IN_USE_CODE,
+                                                         "message": station_in_use_message(name or None)})
+    q = sb.table("stations").update({
         "current_staff_id": user.id,
         "updated_at": _now_iso(),
-    }).eq("id", station_id).execute()
+    }).eq("id", station_id)
+    # Only if nobody else bound in the meantime (the check above is not atomic).
+    if not user.is_admin:
+        q = q.eq("current_staff_id", previous) if previous else q.is_("current_staff_id", "null")
+    res = q.execute()
+    if not user.is_admin and not (getattr(res, "data", None) or []):
+        raise HTTPException(status_code=409, detail={"code": STATION_IN_USE_CODE,
+                                                     "message": "Someone else just logged in on this laptop. Please try again."})
+    audit(user.id, "station_bound", {"station_id": station_id, "previous_staff_id": previous,
+                                     "rebind": previous == user.id,
+                                     "admin_override": bool(previous and previous != user.id and user.is_admin)})
     return _decorate([_get_station_row(station_id)])[0]

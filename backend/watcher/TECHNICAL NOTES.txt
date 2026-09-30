@@ -11,6 +11,15 @@ WHAT IT IS
   is sent, files wait). Sent files are moved to <folder>\processed\<date>\,
   pages scanned before the batch started to <folder>\skipped\before-batch\,
   other unusable ones to <folder>\skipped\.
+  2.4.1+: a page marking still couldn't save after several tries, but that
+  the server kept a copy of for its review page ("Couldn't be saved": Try
+  again / enter the answers by hand), counts as sent and goes to processed\
+  (no rescan needed). Older watchers set such files aside in skipped\.
+  2.4.3+: a network folder (\\server\share\... or //server/share/...) sent
+  from the website is refused (old folder kept, website shows "folder isn't
+  allowed"); set one by hand in watcher_config.json if really needed. A
+  "server busy" reply (HTTP 503 + Retry-After, too many pages at once) is
+  retried after the time the server asks for.
 
 THE PACKAGE (ScanWatcher-<station>.zip, top folder ScanWatcher\)
   INSTALL.bat          one-click installer (see below)
@@ -52,8 +61,17 @@ WHAT INSTALL.bat DOES (safe to re-run; re-running = clean reinstall)
   start a second copy of the same install.
 
 FOLDER HANDLING
-  - Default C:\Scans. Created automatically (by INSTALL and by the watcher when
-    the parent exists).
+  - Default C:\Scans. Created automatically (by INSTALL, and by the watcher 2.4.2 only
+    at start-up and only for C:\Scans when its parent exists). A folder set on the
+    website is never created by the watcher: it must already exist, otherwise
+    the website shows "Folder not found" (so a typo can't quietly make a folder).
+  - Website folders must be full paths. Shortcuts (%NAME%, ~) are refused by the
+    website and by the watcher (reported as "isn't allowed"). Only a hand-edited
+    watcher_config.json (IT only) may still use %VARS%.
+  - Website folders must be on the laptop itself: network shares
+    (\\server\share\..., //server/share/...) are refused by the website, never
+    sent in a heartbeat, and ignored by watcher 2.4.3+ if they arrive anyway.
+    Only a hand-edited watcher_config.json may point at a folder inside a share.
   - Folder set on the website: every heartbeat (30 s; 10 s while files wait)
     returns the station's folder. The watcher hot-switches within ~30 s, no
     restart, and saves the new folder into watcher_config.json.

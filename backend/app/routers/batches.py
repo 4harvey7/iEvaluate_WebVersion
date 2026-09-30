@@ -5,9 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from postgrest.exceptions import APIError
 from pydantic import BaseModel
 
+from app import page_images, page_scores
 from app.audit import audit
+from app.batch_access import is_batch_owner
 from app.db import get_settings, get_supabase, is_valid_uuid
-from app.logic import item_error_code, last_activity, parse_ts
+from app.logic import UNSAVED_REVIEW_MSG, item_error_code, last_activity, parse_ts
 from app.routers.instructors import get_instructor_if_eligible
 from app.security import CurrentUser, require_staff
 from app.station_status import public_watcher_fields, select_stations
@@ -16,6 +18,8 @@ router = APIRouter()
 log = logging.getLogger("ievaluate.batches")
 
 ITEM_COLUMNS = "id, filename, status, review_reasons, identity, message, simulated, task_id, attempts, retryable, orientation_applied, orientation_confidence, orientation_uncertain, created_at, updated_at"
+# Migration 010 (page viewer). Read when present; the list works without them.
+PAGE_COLUMNS = "result_summary, page_image_path, page_image_saved_at"
 
 
 def _now() -> datetime:
@@ -107,6 +111,40 @@ def _load_batch(batch_id: str) -> dict:
     return res.data[0]
 
 
+def select_items(sb, build) -> list[dict]:
+    """scan_batch_items rows with the page-viewer columns when migration 010
+    is applied, else the old columns only (same rows either way)."""
+    if page_images.columns_available():
+        try:
+            rows = build(sb.table("scan_batch_items").select(f"{ITEM_COLUMNS}, {PAGE_COLUMNS}")).execute().data or []
+            page_images.mark_columns_present()
+            return rows
+        except APIError as e:
+            if not page_images.is_missing_column_error(e):
+                raise
+            page_images.mark_columns_missing(e)
+    return build(sb.table("scan_batch_items").select(ITEM_COLUMNS)).execute().data or []
+
+
+def has_page_access(batch: dict, user: CurrentUser, station: dict | None = None) -> bool:
+    """Same rule as reviews._has_batch_access: SAO admin or the batch's starter
+    (app/batch_access.py). `station` is accepted for older callers and ignored:
+    the laptop's current login no longer grants access to its batches."""
+    return is_batch_owner(batch, user)
+
+
+def _with_page_fields(items: list[dict], can_view: bool) -> list[dict]:
+    """Compact score + whether a picture is kept. Never the storage path, and
+    nothing at all for someone who can't open the pages."""
+    for it in items:
+        summary = it.pop("result_summary", None)
+        path = it.pop("page_image_path", None)
+        saved_at = it.pop("page_image_saved_at", None)
+        it["summary"] = page_scores.list_summary(summary) if can_view else None
+        it["image"] = ("kept" if path else "removed" if saved_at else None) if can_view else None
+    return items
+
+
 def _with_error_codes(items: list[dict]) -> list[dict]:
     """Add error_code (see logic.ITEM_ERROR_CODES; null unless status is 'error')."""
     for it in items:
@@ -146,7 +184,13 @@ def _item_counts(batch_id: str) -> dict:
         out[status] = r.count or 0
     r = (sb.table("scan_batch_items").select("id", count="exact", head=True)
          .eq("batch_id", batch_id).eq("status", "error").eq("retryable", False).execute())
-    out["failed"] = r.count or 0  # permanent: retry cap reached, file moved to skipped/ by the watcher
+    failed = r.count or 0  # permanent: retry cap reached, file moved to skipped/ by the watcher
+    # ...of which a copy waits on the review page (app/unsaved_pages.py): "Needs review", not "Failed".
+    r = (sb.table("scan_batch_items").select("id", count="exact", head=True)
+         .eq("batch_id", batch_id).eq("status", "error").eq("retryable", False)
+         .like("message", f"{UNSAVED_REVIEW_MSG}%").execute())
+    out["unsaved"] = min(failed, r.count or 0)
+    out["failed"] = failed - out["unsaved"]
     return out
 
 
@@ -165,19 +209,20 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
         t = sb.table("academic_terms").select("semester, academic_year").eq("id", b["term_id"]).limit(1).execute().data
         if t:
             term_label = f"{t[0].get('semester') or ''} {t[0].get('academic_year') or ''}".strip()
-    st = select_stations(sb, "id, label, last_seen_at, folder_path, watcher_version", lambda q: q.eq("id", b["station_id"]).limit(1))
+    st = select_stations(sb, "id, label, last_seen_at, folder_path, watcher_version, current_staff_id",
+                         lambda q: q.eq("id", b["station_id"]).limit(1))
     st = st[0] if st else {}
+    can_view = has_page_access(b, user, st)
 
     counts = _item_counts(batch_id)
-    attention = (
-        sb.table("scan_batch_items").select(ITEM_COLUMNS)
-        .eq("batch_id", batch_id).or_("status.in.(flagged,rejected,error),orientation_uncertain.is.true")
-        .order("created_at", desc=True).limit(200).execute().data or []
-    )
-    recent = (
-        sb.table("scan_batch_items").select(ITEM_COLUMNS)
-        .eq("batch_id", batch_id).order("updated_at", desc=True).limit(15).execute().data or []
-    )
+    attention = select_items(sb, lambda q: (
+        q.eq("batch_id", batch_id).or_("status.in.(flagged,rejected,error),orientation_uncertain.is.true")
+        .order("created_at", desc=True).limit(200)))
+    recent = select_items(sb, lambda q: q.eq("batch_id", batch_id).order("updated_at", desc=True).limit(15))
+    _with_page_fields(attention, can_view)
+    _with_page_fields(recent, can_view)
+    # Old page pictures are removed at most once an hour, in the background.
+    page_images.maybe_cleanup(sb, settings)
     queue_pending = (
         sb.table("failed_scan_queue").select("id", count="exact", head=True)
         .eq("batch_id", batch_id).eq("status", "pending").execute().count or 0
@@ -205,7 +250,8 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
         "flagged": b.get("flagged_count") or 0,
         "rejected": b.get("rejected_count") or 0,
         "duplicates": b.get("duplicate_count") or 0,
-        "errors": counts["error"] - counts["failed"],
+        "errors": counts["error"] - counts["failed"] - counts["unsaved"],
+        "unsaved": counts["unsaved"],  # couldn't be saved; waiting on the review page
         "failed": counts["failed"],
         "processing": counts["processing"],
     }
@@ -244,6 +290,10 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
         "marking_ready": bool(settings.n8n_batch_webhook_url) or bool(settings.simulate_scans),
         # Latest page activity for this batch (item created/updated), null if none.
         "last_item_at": _latest_item_at(recent + attention),
+        # Page viewer (picture + score of each page): only for whoever may open
+        # this batch's pages (same rule as the review page).
+        "can_view_pages": can_view,
+        "page_images_enabled": bool(page_images.bucket_name(settings)) and page_images.columns_available(),
         "attention_items": _with_review_status(sb, batch_id, _with_error_codes(attention)),
         "recent_items": _with_review_status(sb, batch_id, _with_error_codes(recent)),
     }
@@ -251,12 +301,10 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
 
 @router.get("/{batch_id}/flags")
 def get_batch_flags(batch_id: str, user: CurrentUser = Depends(require_staff)):
-    _load_batch(batch_id)
+    b = _load_batch(batch_id)
     sb = get_supabase()
-    return _with_review_status(sb, batch_id, _with_error_codes(
-        sb.table("scan_batch_items").select(ITEM_COLUMNS)
-        .eq("batch_id", batch_id).eq("status", "flagged").order("created_at", desc=True).execute().data or []
-    ))
+    items = select_items(sb, lambda q: q.eq("batch_id", batch_id).eq("status", "flagged").order("created_at", desc=True))
+    return _with_review_status(sb, batch_id, _with_error_codes(_with_page_fields(items, has_page_access(b, user))))
 
 
 class CloseBatch(BaseModel):
@@ -277,14 +325,10 @@ def _close(batch_id: str, user: CurrentUser, force_closed: bool) -> dict:
 
 
 def can_close_normally(batch: dict, user: CurrentUser) -> bool:
-    """Creator, the staff member currently bound to the batch's station, or an admin."""
-    if user.is_admin or batch.get("created_by") == user.id:
-        return True
-    st = (
-        get_supabase().table("stations").select("current_staff_id")
-        .eq("id", batch["station_id"]).limit(1).execute().data
-    )
-    return bool(st and st[0].get("current_staff_id") == user.id)
+    """The staff member who started the batch, or an admin (app/batch_access.py).
+    Anyone else waits for "Close a forgotten batch" (force-close after
+    ABANDONED_BATCH_HOURS of no activity)."""
+    return is_batch_owner(batch, user)
 
 
 @router.post("/{batch_id}/close")
@@ -295,8 +339,8 @@ def close_batch(batch_id: str, body: CloseBatch | None = None, user: CurrentUser
     if not can_close_normally(b, user):
         raise HTTPException(status_code=403, detail={
             "code": "not_your_batch",
-            "message": "Only the staff member who started this batch, the person logged in at its station, or an SAO admin can close it. "
-                       "Otherwise use force-close once it has been inactive long enough.",
+            "message": "Only the staff member who started this batch, or an SAO admin, can close it. "
+                       "Otherwise use \"Close a forgotten batch\" once it has been inactive long enough.",
         })
     processing = _item_counts(batch_id)["processing"]
     if processing and not (body and body.force):

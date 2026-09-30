@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
     print("Pillow is not installed. Run:  py -3 -m pip install -r requirements.txt")
     raise
 
-VERSION = "2.4.0"
+VERSION = "2.4.3"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
@@ -177,6 +177,22 @@ def folder_problem(path: str | None, forbidden_exact=(), forbidden_trees=(), all
         if len(parts) == 4 and parts[2].startswith("onedrive") and parts[3] in SPECIAL_ROOT_NAMES:
             return "too_big"
     return None
+
+
+def uses_shortcut(raw) -> bool:
+    """True for folder shortcuts like %USERPROFILE%/Scans or ~/Scans (kept in sync with the server copy)."""
+    p = normalize_folder(raw)
+    return "%" in p or p.startswith("~")
+
+
+def is_network_path(raw) -> bool:
+    """True for UNC / network-share paths (\\\\server\\share, //server/share, and
+    the \\\\?\\UNC\\... and \\\\.\\ device forms): all start with two slashes.
+    Refused when they come from the website (heartbeat folder_path); only a
+    hand-edited watcher_config.json on this laptop may use a network folder.
+    Kept in sync with the server copy."""
+    p = str(raw or "").strip().strip('"').strip("'").strip().replace("\\", "/")
+    return p.startswith("//")
 
 
 def _local_forbidden() -> tuple[list[str], list[str]]:
@@ -495,6 +511,15 @@ def list_page_files(folder: str) -> list[str]:
     return sorted(names)
 
 
+def retry_after_seconds(resp, default: float, low: float = 1.0, high: float = 120.0) -> float:
+    """The server's Retry-After (seconds form), clamped; `default` if absent/bad."""
+    try:
+        value = float(str(resp.headers.get("Retry-After", "")).strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
+    return max(low, min(high, value)) if value == value else default  # NaN -> default
+
+
 def backoff(failures: int, base: float = 5.0, cap: float = 300.0) -> float:
     return min(cap, base * (2 ** max(0, failures - 1)))
 
@@ -543,9 +568,16 @@ class Watcher:
             log.info("Scan folder OK: %s", self.cfg.folder)
         self.folder_logged = code
 
-    def check_folder(self) -> None:
-        """Refresh folder_exists / local_folder_error. Creates the folder when
-        it is missing but its parent exists (e.g. C:/Scans on a fresh laptop)."""
+    @staticmethod
+    def _may_create(folder: str) -> bool:
+        """Only the default folder (C:/Scans) is ever created by the watcher."""
+        return normalize_folder(folder).casefold() == normalize_folder(DEFAULT_FOLDER).casefold()
+
+    def check_folder(self, create: bool = False) -> None:
+        """Refresh folder_exists / local_folder_error. With create=True (only
+        at start-up) a missing default folder (C:/Scans) is created when its
+        parent exists. A folder pushed from the website is never created: a
+        typo must show up as "not found" instead of silently making a folder."""
         folder = self.cfg.folder
         if self.folder_unsafe:
             self.folder_exists = os.path.isdir(folder)
@@ -560,7 +592,7 @@ class Watcher:
         error = None
         if not os.path.isdir(folder):
             parent = os.path.dirname(folder.rstrip("\\/"))
-            if parent and parent != folder and os.path.isdir(parent):
+            if create and self._may_create(folder) and parent and parent != folder and os.path.isdir(parent):
                 try:
                     os.makedirs(folder, exist_ok=True)
                     log.info("Created scan folder %s", folder)
@@ -579,6 +611,8 @@ class Watcher:
             except OSError:
                 error = "not_found"
         self.folder_exists = os.path.isdir(folder)
+        if error != self.local_folder_error:
+            self.last_heartbeat = 0.0  # tell the website right away
         self.local_folder_error = error
         if error == "not_found":
             self._note_folder(error, f"Scan folder not found (will keep checking): {folder}")
@@ -592,6 +626,28 @@ class Watcher:
         if not isinstance(remote, str) or not remote.strip():
             self.rejected_remote_folder = None
             return
+        if uses_shortcut(remote):
+            if self.rejected_remote_folder != remote:
+                log.error(
+                    "The website asks to watch %s, but folder shortcuts like %%NAME%% or ~ are not allowed - "
+                    "still watching %s. Type the full folder path, like C:\\Scans.", remote, self.cfg.folder,
+                )
+                self.last_heartbeat = 0.0
+            self.rejected_remote_folder = remote
+            return
+        if is_network_path(remote):
+            # A folder pushed from the website must be on this laptop: a network
+            # share there could make this laptop read and send files from any
+            # server. IT can still set one in watcher_config.json by hand.
+            if self.rejected_remote_folder != remote:
+                log.error(
+                    "The website asks to watch %s, but network folders can't be set from the website - "
+                    "still watching %s. Use a folder on this laptop, like C:\\Scans (or set the network "
+                    "folder in watcher_config.json).", remote, self.cfg.folder,
+                )
+                self.last_heartbeat = 0.0
+            self.rejected_remote_folder = remote
+            return
         new = expand_folder(remote)
         if new.casefold() == normalize_folder(self.cfg.folder).casefold():
             self.rejected_remote_folder = None
@@ -602,6 +658,7 @@ class Watcher:
                     "The website asks to watch %s, but that folder is too big to watch - still watching %s. "
                     "Pick a folder just for scans, like C:\\Scans.", remote, self.cfg.folder,
                 )
+                self.last_heartbeat = 0.0
             self.rejected_remote_folder = remote
             return
         self.rejected_remote_folder = None
@@ -621,6 +678,7 @@ class Watcher:
         self.folder_generation += 1
         log.info("Now watching %s", cfg.folder)
         self.check_folder()
+        self.last_heartbeat = 0.0  # report the new folder to the website right away
         if cfg.path:
             try:
                 save_folder_to_config(cfg.path, new)
@@ -644,6 +702,19 @@ class Watcher:
             return d.get("code"), str(d.get("message") or d.get("code") or resp.status_code)
         # e.g. {"code": "database_unreachable", "detail": "..."}
         return body.get("code"), str(d or f"HTTP {resp.status_code}")
+
+    @staticmethod
+    def _kept_for_review(resp: requests.Response) -> str | None:
+        """Server 2026-09-30+: a page marking gave up on is kept for the website
+        review page. Returns its batch id ('' if not sent), or None when the
+        server did not keep a copy."""
+        try:
+            d = resp.json().get("detail")
+        except Exception:
+            return None
+        if isinstance(d, dict) and d.get("kept_for_review") is True:
+            return str(d.get("batch_id") or "")
+        return None
 
     # ------------------------------------------------------------ pages scanned before the batch
     @property
@@ -951,10 +1022,23 @@ class Watcher:
             return 15.0
         if resp.status_code == 503 and code == "pipeline_not_configured":
             return "marking_off"
+        if resp.status_code == 503 and code == "server_busy":
+            # Server 2026-09-30+: too many pages being marked at once. Not the page's fault.
+            log.info("%s: the server is busy with other pages - will retry", page_name)
+            return retry_after_seconds(resp, 10.0)
         if resp.status_code == 503 and code == "database_unreachable":
             log.warning("%s: the server can't reach the database right now - will retry", page_name)
             return None
         if resp.status_code == 422 and code == "failed_after_retries":
+            kept = self._kept_for_review(resp)
+            if kept is not None:
+                # The server kept a copy for its review page (Try again / enter by hand):
+                # the page is delivered, nothing to rescan.
+                log.warning("%s: marking couldn't save this page after several tries - a copy is waiting on the "
+                            "website's review page (no rescan needed)", page_name)
+                self.state.mark_sent(sha, page_name, "needs_review", kept or self.open_batch_id)
+                self.last_file_at = datetime.now(timezone.utc).isoformat()
+                return "sent"
             log.error("%s: scoring failed after repeated attempts - moving to skipped/ (rescan if needed)", page_name)
             return "skip_file"
         if resp.status_code == 422 and code == "pipeline_rejected_request":
@@ -976,7 +1060,7 @@ class Watcher:
     def run(self) -> None:
         log.info("iEvaluate watcher %s | folder=%s | server=%s", VERSION, self.cfg.folder, self.cfg.api_base)
         log.info("Processed files -> %s | skipped -> %s", self.cfg.processed_dir, self.cfg.skipped_dir)
-        self.check_folder()
+        self.check_folder(create=True)
         self.heartbeat(force=True)
         while True:
             try:

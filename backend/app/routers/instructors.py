@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.audit import audit
 from app.db import get_settings, get_supabase, is_valid_uuid, new_auth_client
+from app.name_match import is_near_duplicate, same_name, search_words_match, surname_parts
 from app.routers.departments import department_lookup
 from app.security import INSTRUCTOR_ROLES, CurrentUser, require_admin, require_staff, role_maps
 
@@ -69,6 +70,8 @@ def _search(q: str) -> list[dict]:
             "is_placeholder": bool(r.get("is_placeholder")),
             "disabled": bool(r.get("disabled")),
         })
+    # Rows where every typed word starts a word of the name come first (stable sort keeps the database order).
+    out.sort(key=lambda r: 0 if search_words_match(q, r["full_name"]) else 1)
     return out
 
 
@@ -87,6 +90,7 @@ class CreatePlaceholder(BaseModel):
     last_name: str = Field(min_length=1, max_length=80)
     department_id: int  # department_name.id
     employment_type: Literal["FULL-TIME", "PART-TIME"]
+    confirm_new_person: bool = False  # "This is a different person": skip the similar-name check
 
 
 def _cleanup_placeholder(sb, user_id: str) -> None:
@@ -100,6 +104,60 @@ def _cleanup_placeholder(sb, user_id: str) -> None:
         sb.auth.admin.delete_user(user_id)
     except Exception:
         log.exception("cleanup: failed deleting auth user for placeholder %s", user_id)
+
+
+def _near_duplicates(sb, first: str, last: str, limit: int = 5) -> list[dict]:
+    """Existing people who look like the same person as first + last: same
+    name, near-same name (see name_match) or a close spelling (old RPC)."""
+    cols = "id, first_name, last_name, disabled, is_placeholder"
+    found: dict[str, dict] = {}  # id -> row with "_strength": 0 exact, 1 near, 2 fuzzy
+    parts = surname_parts(last)
+    if parts:
+        rows = sb.table("user_info").select(cols).ilike("last_name", f"%{parts[-1]}%").limit(500).execute().data or []
+        for r in rows:
+            if not r.get("id"):
+                continue
+            if same_name(first, last, r.get("first_name"), r.get("last_name")):
+                found[r["id"]] = {**r, "_strength": 0}
+            elif is_near_duplicate(first, last, r.get("first_name"), r.get("last_name")):
+                found[r["id"]] = {**r, "_strength": 1}
+    # Safety net for spelling mistakes: the database's similarity check.
+    fuzzy = sb.rpc("find_duplicate_instructor", {"p_first": first, "p_last": last}).execute().data or []
+    for r in fuzzy:
+        if r.get("id") and r["id"] not in found:
+            found[r["id"]] = {**r, "_strength": 2}
+    if not found:
+        return []
+
+    ranked = sorted(found.values(), key=lambda r: (r["_strength"], _full_name(r).casefold()))
+    eligible_ids = {r["id"] for r in ranked[:10] if get_instructor_if_eligible(r["id"]) is not None}
+    ranked.sort(key=lambda r: (r["id"] not in eligible_ids, r["_strength"], _full_name(r).casefold()))
+    ranked = ranked[:limit]
+
+    ids = [r["id"] for r in ranked]
+    links = sb.table("instructor_departments").select("instructor_id, department_id, is_primary").in_("instructor_id", ids).execute().data or []
+    dept_of: dict[str, int] = {}
+    for link in sorted(links, key=lambda x: not x.get("is_primary")):
+        dept_of.setdefault(link["instructor_id"], link.get("department_id"))
+    depts = department_lookup()
+
+    out = []
+    for r in ranked:
+        dept_id = dept_of.get(r["id"])
+        d = depts.get(int(dept_id)) if dept_id is not None else None
+        out.append({
+            "id": r["id"],
+            "first_name": r.get("first_name"),
+            "last_name": r.get("last_name"),
+            "full_name": _full_name(r),
+            "department_id": dept_id,
+            "department_name": d.get("d_name") if d else None,
+            "is_placeholder": bool(r.get("is_placeholder")),
+            "disabled": bool(r.get("disabled")),
+            "eligible": r["id"] in eligible_ids,
+            "exact": r["_strength"] == 0,
+        })
+    return out
 
 
 @router.post("")
@@ -118,22 +176,18 @@ def create_placeholder_instructor(body: CreatePlaceholder, user: CurrentUser = D
     if not role_id:
         raise HTTPException(status_code=500, detail="Employment role missing from roles table.")
 
-    dup = sb.rpc("find_duplicate_instructor", {"p_first": first, "p_last": last}).execute()
-    if dup.data:
-        match = dup.data[0]
+    matches = _near_duplicates(sb, first, last)
+    if matches and not body.confirm_new_person:
+        names = ", ".join(m["full_name"] for m in matches)
+        msg = (f"An instructor with a very similar name already exists: {names}." if len(matches) == 1
+               else f"Instructors with very similar names already exist: {names}.")
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "duplicate_instructor",
-                "message": "An instructor with a very similar name already exists.",
-                "existing_instructor": {
-                    "id": match.get("id"),
-                    "first_name": match.get("first_name"),
-                    "last_name": match.get("last_name"),
-                    "full_name": _full_name(match),
-                    "disabled": bool(match.get("disabled")),
-                    "eligible": get_instructor_if_eligible(match.get("id")) is not None,
-                },
+                "message": msg,
+                "existing_instructor": matches[0],
+                "existing_instructors": matches,
             },
         )
 
@@ -186,9 +240,10 @@ def create_placeholder_instructor(body: CreatePlaceholder, user: CurrentUser = D
         _cleanup_placeholder(sb, new_id)
         raise HTTPException(status_code=500, detail="Could not create the instructor. Nothing was saved; try again.")
 
-    audit(user.id, "placeholder_instructor_created", {
-        "instructor_id": new_id, "department_id": body.department_id, "employment_type": body.employment_type,
-    })
+    meta = {"instructor_id": new_id, "department_id": body.department_id, "employment_type": body.employment_type}
+    if matches:  # only reachable with confirm_new_person: record who it looked like
+        meta["similar_to"] = [m["id"] for m in matches]
+    audit(user.id, "placeholder_instructor_created", meta)
     return {
         "id": new_id,
         "first_name": first,

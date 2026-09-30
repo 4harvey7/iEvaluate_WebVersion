@@ -103,11 +103,14 @@ Not sure?                            ->  Double-click "CHECK" in the
 
 HOW TO CHANGE THE SCAN FOLDER
 -----------------------------
-    You do not need to touch the laptop.
-    1. On the website, open "Scanner setup".
-    2. Change the folder and save.
-    3. Wait 30 seconds. The laptop switches by itself.
-    4. Set your scanner to save into the new folder.
+    1. On the scanner laptop, make the folder in File Explorer
+       (skip this for C:\Scans, it is made at install).
+    2. On the website, open "Scanner setup", type the full folder path
+       (for example D:\Scans - no shortcuts like %NAME% or ~) and click
+       "Save folder".
+    3. Wait for the message "Done. The scanner laptop is now watching ...".
+       This takes about 30 seconds.
+    4. Set your scanner to save into the same folder.
 
 
 MOVING TO A NEW LAPTOP

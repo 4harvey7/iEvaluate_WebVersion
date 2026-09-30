@@ -13,6 +13,8 @@ const CODE_TEXT = {
   pipeline_bad_response: "Marking gave an unexpected answer. Trying again.",
   pipeline_not_saved: "Marking couldn't save this page. Trying again.",
   internal_error_not_saved: "Marking couldn't save this page. Trying again.",
+  not_saved_needs_review:
+    "Marking couldn't save this page after several tries. It is waiting on the review page: try again from there, or type in the answers. No need to scan it again.",
   pipeline_rejected_request: "This page couldn't be read. Please scan the sheet again.",
   not_saved_permanent: "This page couldn't be read. Please scan the sheet again.",
   invalid_request: "This page couldn't be read. Please scan the sheet again.",
@@ -30,6 +32,7 @@ const CODE_TEXT = {
 
 // Technical messages the server stores on a page, matched to a code above.
 const MESSAGE_PATTERNS = [
+  [/^not saved by marking; waiting on the review page/i, "not_saved_needs_review"],
   [/scoring pipeline (is )?not configured/i, "pipeline_not_configured"],
   [/rejected the server's credentials|misconfigured/i, "pipeline_misconfigured"],
   [/timed out/i, "pipeline_timeout"],
@@ -96,7 +99,27 @@ const REASON_TEXT = {
   ai_validation_failed: "The AI double-check didn't run, so the student ID and remarks weren't read.",
   poor_scan_quality: "The scan looks blurry or faint.",
   spot_check: "Randomly picked for a quick check. Nothing looked wrong — confirm the details shown and approve.",
+  not_saved_by_pipeline:
+    "Marking couldn't save this page, so nothing was read into the form. Type the student ID, remarks and every rating from the scan.",
 };
+
+// "Couldn't be saved" pages on the review page (scan_unsaved_pages.status / outcome).
+const UNSAVED_OUTCOME_TEXT = {
+  success: "Saved and scored",
+  flagged: "Saved - now under Needs review",
+  rejected: "Marking says this isn't an evaluation form",
+  duplicate: "Already saved earlier",
+  refused: "Marking refused this page",
+};
+
+export function unsavedStateText(row) {
+  if (!row) return "";
+  if (row.status === "sending") return "Sending again...";
+  if (row.status === "retrying") return "The laptop is still trying";
+  if (row.status === "manual") return "Moved to Needs review";
+  if (row.status === "saved") return UNSAVED_OUTCOME_TEXT[row.outcome] || "Saved";
+  return "Couldn't be saved";
+}
 
 // Reasons that carry a number, e.g. "omr_agreement_below_80".
 const REASON_PATTERNS = [
@@ -173,7 +196,7 @@ const REVIEW_ERROR_TEXT = {
   migration_required: "Saving needs a database update first. Ask IT to apply migration 005.",
   correction_not_configured: "Sending corrections isn't set up on this server yet. Ask IT to set it up.",
   invalid_ratings: "Each rating must be 1 to 5, or left blank.",
-  not_your_batch: "Only the person who started this batch, the person logged in at its laptop, or an SAO admin can do this.",
+  not_your_batch: "Only the person who started this batch, or an SAO admin, can do this.",
 };
 
 export function reviewErrorText(err) {

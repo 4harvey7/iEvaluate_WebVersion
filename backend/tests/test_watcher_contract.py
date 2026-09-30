@@ -128,7 +128,8 @@ def env(monkeypatch):
         monkeypatch.setattr(stations, "audit", lambda *a, **k: None)
         app.dependency_overrides[require_staff] = lambda: USER
         app.dependency_overrides[require_station] = lambda: {"id": SID, "label": "Laptop 1", "folder_path": "C:/Scans"}
-        return TestClient(app, raise_server_exceptions=False)
+        # The body-limit middleware answers 401 to ingest calls without a key.
+        return TestClient(app, raise_server_exceptions=False, headers={"X-Station-Key": "test-station-key"})
 
     yield _env
     app.dependency_overrides.clear()
@@ -379,8 +380,10 @@ def test_item_error_codes():
     assert f({"status": "error", "message": "Scoring pipeline returned HTTP 500.", "retryable": True}) == "pipeline_error"
     assert f({"status": "error", "message": "Failed after 5 attempts: x", "retryable": False}) == "failed_after_retries"
     assert f({"status": "error", "message": logic.PIPELINE_REJECTED_MSG, "retryable": False}) == "pipeline_rejected_request"
+    assert f({"status": "error", "message": logic.UNSAVED_REVIEW_MSG + " (5 automatic tries: x)",
+              "retryable": False}) == "not_saved_needs_review"
     assert set(logic.ITEM_ERROR_CODES) == {"pipeline_not_configured", "pipeline_misconfigured", "pipeline_error",
-                                            "failed_after_retries", "pipeline_rejected_request"}
+                                            "not_saved_needs_review", "failed_after_retries", "pipeline_rejected_request"}
 
 
 # ---------------------------------------------------------------- 6. network errors -> 503
@@ -438,3 +441,23 @@ def test_real_auth_failure_is_still_401(monkeypatch):
     monkeypatch.setattr(security, "get_supabase", lambda: SimpleNamespace(auth=Auth()))
     r = TestClient(app, raise_server_exceptions=False).get("/stations", headers={"Authorization": "Bearer abc.def.ghi"})
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------- website folder: full paths only
+@pytest.mark.parametrize("folder", [r"%USERPROFILE%\Scans", r"~\Scans", "~/Scans", r"%OneDrive%\Scans", r"%FOO%\Scans"])
+def test_set_folder_refuses_shortcuts(env, folder):
+    from app.folder_safety import MESSAGES
+    sb = MemSB({"stations": [_station(current_staff_id=USER.id)]})  # only the bound staff may change it
+    client = env(sb)
+    r = client.put(f"/stations/{SID}/folder", json={"folder_path": folder})
+    assert r.status_code == 400 and r.json() == {"detail": MESSAGES["variables"]}
+    assert sb.tables["stations"][0]["folder_path"] == "C:/Scans"
+    assert not [u for u in sb.updates if u[0] == "stations"]
+
+
+def test_set_folder_saves_full_path(env):
+    sb = MemSB({"stations": [_station(current_staff_id=USER.id)]})  # only the bound staff may change it
+    client = env(sb)
+    r = client.put(f"/stations/{SID}/folder", json={"folder_path": r"C:\scan"})
+    assert r.status_code == 200 and r.json()["folder_path"] == "C:/scan"
+    assert sb.tables["stations"][0]["folder_path"] == "C:/scan"

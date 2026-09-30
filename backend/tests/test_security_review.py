@@ -66,7 +66,8 @@ def test_ingest_chunked_oversize_rejected():
         chunk = b"x" * (1024 * 1024)
         for _ in range(18):
             yield chunk
-    r = client.post("/scans/ingest", content=gen(), headers={"Content-Type": "application/json"})
+    r = client.post("/scans/ingest", content=gen(),
+                    headers={"Content-Type": "application/json", "X-Station-Key": "some-key"})
     assert r.status_code == 413
 
 
@@ -93,7 +94,7 @@ def test_pillow_limits_configured():
     import importlib
     import warnings
     importlib.reload(logic)  # pytest resets warning filters per test; re-apply module setup
-    assert Image.MAX_IMAGE_PIXELS == 40_000_000
+    assert Image.MAX_IMAGE_PIXELS == logic.MAX_IMAGE_PIXELS == 12_000_000
     assert any(f[0] == "error" and f[2] is Image.DecompressionBombWarning for f in warnings.filters)
 
 
@@ -132,12 +133,20 @@ def test_close_refused_for_unrelated_staff(close_env):
     assert sb.updates == []
 
 
+def test_close_refused_for_staff_only_bound_to_the_station(close_env):
+    # Security review: taking over the laptop must not let you close its batch.
+    sb = close_env(_user("operator"), "operator")
+    r = client.post(f"/batches/{BID}/close", json={})
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "not_your_batch"
+    assert sb.updates == []
+
+
 @pytest.mark.parametrize("user,bound", [
     (_user("creator"), "someone-else"),       # started the batch
-    (_user("operator"), "operator"),          # bound to the batch's station
+    (_user("creator"), None),                 # started it, logged out since
     (_user("boss", "SAO_ADMIN"), "someone-else"),  # admin override
 ])
-def test_close_allowed_for_owner_station_or_admin(close_env, user, bound):
+def test_close_allowed_for_owner_or_admin(close_env, user, bound):
     sb = close_env(user, bound)
     r = client.post(f"/batches/{BID}/close", json={})
     assert r.status_code == 200, r.text

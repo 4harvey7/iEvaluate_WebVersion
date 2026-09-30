@@ -1,6 +1,8 @@
+import ipaddress
 import os
 import uuid
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -57,10 +59,21 @@ class Settings:
         self.simulate_scans: bool = _bool_env("SIMULATE_SCANS", False)
         self.abandoned_batch_hours: float = _float_env("ABANDONED_BATCH_HOURS", 3.0)
         self.max_upload_mb: float = _float_env("MAX_UPLOAD_MB", 12.0)
+        # Scan-ingest calls handled at once (app/body_limit.py); more get 503
+        # server_busy + Retry-After and the watcher retries. Each call holds one
+        # decoded page and waits for n8n, so keep it >= the number of scanning laptops.
+        self.ingest_max_concurrency: int = max(1, int(_float_env("INGEST_MAX_CONCURRENCY", 4)))
         # Grace window (seconds) for the "file predates batch" check, on top of
         # the watcher clock-skew correction.
         self.predate_grace_seconds: float = _float_env("PREDATE_GRACE_SECONDS", 30.0)
         self.watcher_online_seconds: float = _float_env("WATCHER_ONLINE_SECONDS", 90.0)
+        # Page viewer (migration 010, app/page_images.py): a viewing copy of every
+        # scanned page in this PRIVATE Supabase Storage bucket. Empty = don't keep pictures.
+        self.scan_image_bucket: str = os.environ.get("SCAN_IMAGE_BUCKET", "scan-pages").strip()
+        # Pictures older than this many days are removed (0 = keep them).
+        self.scan_image_retention_days: int = max(0, int(_float_env("SCAN_IMAGE_RETENTION_DAYS", 90)))
+        self.scan_image_max_side: int = int(_float_env("SCAN_IMAGE_MAX_SIDE", 1800))
+        self.scan_image_jpeg_quality: int = int(_float_env("SCAN_IMAGE_JPEG_QUALITY", 75))
         self.password_reset_redirect_url: str = os.environ.get("PASSWORD_RESET_REDIRECT_URL", "").strip()
         # Public backend URL written into the watcher installer's watcher_config.json
         # (same value as the frontend's VITE_API_BASE). Empty = derive from the request.
@@ -77,6 +90,10 @@ class Settings:
         ]
         # Opt-in: also allow any private-LAN origin (dev convenience only).
         self.cors_allow_lan: bool = _bool_env("CORS_ALLOW_LAN", False)
+        # Rate limiting behind a proxy (security.client_ip): trust CF-Connecting-IP /
+        # the rightmost X-Forwarded-For entry. Leave false for local runs (headers
+        # would be spoofable); set true on Render (it sits behind Cloudflare).
+        self.trust_proxy_headers: bool = _bool_env("TRUST_PROXY_HEADERS", False)
 
     @property
     def simulation_mode(self) -> bool:
@@ -153,10 +170,43 @@ def validate_settings(s: Settings) -> None:
             "N8N_BATCH_WEBHOOK_URL is set but N8N_WEBHOOK_SECRET is empty. Set N8N_WEBHOOK_SECRET "
             "(the shared secret the n8n workflow checks in the X-Webhook-Secret header) and restart."
         )
-    if s.n8n_batch_webhook_url and not s.n8n_batch_webhook_url.lower().startswith(("https://", "http://")):
-        raise ConfigError("N8N_BATCH_WEBHOOK_URL must start with https:// (or http:// on a private network).")
-    for name, attr in (("N8N_CORRECTION_WEBHOOK_URL", "n8n_correction_webhook_url"),
+    for name, attr in (("N8N_BATCH_WEBHOOK_URL", "n8n_batch_webhook_url"),
+                       ("N8N_CORRECTION_WEBHOOK_URL", "n8n_correction_webhook_url"),
                        ("N8N_IMPORT_ERROR_WEBHOOK_URL", "n8n_import_error_webhook_url")):
         url = getattr(s, attr, "") or ""
-        if url and not url.lower().startswith(("https://", "http://")):
-            raise ConfigError(f"{name} must start with https:// (or http:// on a private network).")
+        if url and not is_safe_webhook_url(url):
+            # Never echo the URL itself (it can carry a token).
+            raise ConfigError(
+                f"{name} must start with https:// (plain http:// is only allowed for localhost "
+                "or a private-network address such as 192.168.x.x / 10.x.x.x)."
+            )
+
+
+def _is_private_host(host: str) -> bool:
+    """localhost, 127.0.0.0/8, ::1, or an RFC1918 / other private IP literal.
+    Hostnames other than 'localhost' are NOT trusted (DNS could point anywhere)."""
+    host = (host or "").strip().lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_private
+
+
+def is_safe_webhook_url(url: str) -> bool:
+    """https:// anywhere; http:// only to a loopback / private-network host."""
+    try:
+        parts = urlsplit((url or "").strip())
+        host = parts.hostname or ""
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    if not host:
+        return False
+    if scheme == "https":
+        return True
+    return scheme == "http" and _is_private_host(host)

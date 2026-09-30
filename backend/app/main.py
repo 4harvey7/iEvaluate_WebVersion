@@ -8,7 +8,7 @@ from postgrest.exceptions import APIError
 
 from app.body_limit import BodySizeLimitMiddleware
 from app.db import DatabaseUnreachable, get_settings, validate_settings
-from app.routers import auth, batches, departments, instructors, reviews, scans, stations, subjects, watcher_download
+from app.routers import auth, batch_pages, batches, departments, instructors, reviews, scans, stations, subjects, watcher_download
 from app.security import CurrentUser, require_staff
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -113,6 +113,8 @@ app.include_router(stations.router, prefix="/stations", tags=["stations"])
 app.include_router(instructors.router, prefix="/instructors", tags=["instructors"])
 app.include_router(subjects.router, prefix="/subjects", tags=["subjects"])
 app.include_router(batches.router, prefix="/batches", tags=["batches"])
+# Page viewer: /batches/{batch_id}/items/{item_id}[/image]
+app.include_router(batch_pages.router, prefix="/batches", tags=["batches"])
 app.include_router(scans.router, prefix="/scans", tags=["scans"])
 app.include_router(watcher_download.router, prefix="/watcher", tags=["watcher"])
 app.include_router(departments.router, prefix="/departments", tags=["departments"])

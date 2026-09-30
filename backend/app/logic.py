@@ -14,9 +14,16 @@ from typing import Any
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Decompression-bomb protection: a 200 dpi A4/Letter page is ~4 MP, so 40 MP
-# is generous. Pillow's warning becomes a hard error process-wide.
-MAX_IMAGE_PIXELS = 40_000_000
+# Decompression-bomb / memory protection. Pillow's warning becomes a hard error
+# process-wide. What reaches /scans/ingest is small: the watcher converts every
+# scan (whatever its dpi) to a ~200 dpi greyscale JPEG with a long edge of at
+# most 2200 px, i.e. <= ~3.7 MP for a long-bond (8.5x13 / 8.5x14 in) page, so a
+# 600 dpi long-bond scan (5100x8400 = ~43 MP) is shrunk on the laptop and keeps
+# working. 12 MP still accepts an un-shrunk 300 dpi long-bond page
+# (2550x4200 = 10.7 MP) from an older/other client, while one decoded RGB page
+# costs <= ~36 MB instead of ~120 MB at the old 40 MP cap (x the ingest
+# concurrency, x the copies orientation/OMR prep make).
+MAX_IMAGE_PIXELS = 12_000_000
 try:
     import warnings as _warnings
 
@@ -421,12 +428,15 @@ def retries_exhausted(attempts: int | None, max_attempts: int) -> bool:
 PIPELINE_NOT_CONFIGURED_MSG = "Scoring pipeline not configured."
 PIPELINE_MISCONFIGURED_MSG = "Scoring pipeline rejected the server's credentials (configuration error)."
 PIPELINE_REJECTED_MSG = "Rejected by pipeline (invalid request); the file was set aside."
+# Automatic tries used up, but a copy is kept for the review page (app/unsaved_pages.py).
+UNSAVED_REVIEW_MSG = "Not saved by marking; waiting on the review page."
 
 # item.error_code values (batch detail). None for every status except 'error'.
 ITEM_ERROR_CODES = (
     "pipeline_not_configured",    # marking is switched off on the server; retried automatically
     "pipeline_misconfigured",     # server's n8n secret rejected; retried automatically
     "pipeline_error",             # n8n failed / bad reply / not saved; retried automatically
+    "not_saved_needs_review",     # gave up automatically; a copy waits on the review page (Try again / Type in the answers)
     "failed_after_retries",       # gave up after MAX_PIPELINE_ATTEMPTS; file set aside, rescan
     "pipeline_rejected_request",  # n8n refused the request; file set aside, rescan
 )
@@ -440,6 +450,8 @@ def item_error_code(item: dict) -> str | None:
     msg = str(item.get("message") or "")
     if msg == PIPELINE_REJECTED_MSG:
         return "pipeline_rejected_request"
+    if msg.startswith(UNSAVED_REVIEW_MSG) and item.get("retryable") is False:
+        return "not_saved_needs_review"
     if item.get("retryable") is False:
         return "failed_after_retries"
     if msg.startswith(PIPELINE_NOT_CONFIGURED_MSG):

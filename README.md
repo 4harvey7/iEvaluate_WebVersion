@@ -15,11 +15,13 @@ migrations/002_batch_hardening.sql  # station keys, scan items, atomic counters 
 migrations/003_repair_import_error_scan_images.sql
 migrations/004_watcher_folder_status.sql  # watcher folder status columns (run manually; optional)
 migrations/005_scan_review_queue.sql      # review page: versions + live cursor on failed_scan_queue / import_errors (run manually)
+migrations/010_scan_page_images.sql       # page viewer: score + picture of every page, private bucket scan-pages (run manually, after 008/009)
 backend/                            # FastAPI (service-role Supabase client)
   app/main.py                       # app, CORS, error handling
   app/security.py                   # bearer-token + station-key auth, rate limiting
   app/logic.py                      # pure helpers (task ids, n8n validation, images)
   app/review_logic.py               # pure helpers for the review page (row shapes, checks, correction payloads)
+  app/page_scores.py, page_images.py  # page viewer: score summary per page, viewing copy in the private bucket, retention (SCAN_IMAGE_RETENTION_DAYS, default 90)
   app/routers/                      # auth, stations, instructors, subjects, departments, batches, scans, reviews, watcher
   tests/                            # pytest (no DB writes)
   watcher/                          # runs on EACH scanning laptop (served as a zip)

@@ -342,7 +342,7 @@ def env(monkeypatch):
         reviews._ctx_cache.clear()
         app.dependency_overrides[require_staff] = lambda: user(as_user, role)
         state.update(db=db, n8n=fake_n8n, audits=audits)
-        return db, fake_n8n, TestClient(app, raise_server_exceptions=False)
+        return db, fake_n8n, TestClient(app, raise_server_exceptions=False, headers={"X-Station-Key": "test-station-key"})
 
     def _as(uid, role="SAO_STAFF"):
         app.dependency_overrides[require_staff] = lambda: user(uid, role)
@@ -438,7 +438,10 @@ def test_access_rules(env):
     assert [x["id"] for x in r.json()["queue"]] == [Q4] and r.json()["import_errors"] == []
     assert client.get(f"/reviews/queue/{Q4}/image").status_code == 404  # allowed, just no picture
 
-    env.as_user(STATION_STAFF)  # logged in at the batch's laptop
+    env.as_user(STATION_STAFF)  # logged in at the batch's laptop, but didn't start it: no access
+    r = client.get(f"/reviews/batch/{BATCH}")
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "not_your_batch"
+    env.as_user(STAFF)  # started the batch
     assert client.get(f"/reviews/batch/{BATCH}").json()["access"] == "full"
     env.as_user(ADMIN, "SAO_ADMIN")
     assert client.get(f"/reviews/batch/{OTHER_BATCH}").json()["access"] == "full"
@@ -719,7 +722,7 @@ def test_claim_is_advisory_and_keeps_version(env):
     r = client.post(f"/reviews/queue/{Q1}/claim", json={})
     assert r.status_code == 200 and r.json()["claimed"] is True
     assert r.json()["claimed_by"]["id"] == STAFF and r.json()["row"]["review_version"] == 3
-    env.as_user(STATION_STAFF)
+    env.as_user(ADMIN, "SAO_ADMIN")  # a second person with access to the batch
     r = client.post(f"/reviews/queue/{Q1}/claim", json={})
     assert r.json()["claimed"] is False and r.json()["claimed_by"] == {"id": STAFF, "name": "Sara Staff"}
     r = client.post(f"/reviews/queue/{Q1}/claim", json={"release": True})  # not theirs: nothing released
@@ -816,7 +819,7 @@ def test_image_endpoints(env):
 
 
 def test_review_endpoints_require_login():
-    c = TestClient(app, raise_server_exceptions=False)
+    c = TestClient(app, raise_server_exceptions=False, headers={"X-Station-Key": "test-station-key"})
     for method, path in (("get", f"/reviews/batch/{BATCH}"), ("get", f"/reviews/queue/{Q1}/image"),
                          ("post", f"/reviews/queue/{Q1}/approve"), ("post", "/reviews/import-errors/1/discard")):
         r = getattr(c, method)(path)

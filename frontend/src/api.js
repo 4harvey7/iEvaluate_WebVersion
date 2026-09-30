@@ -3,6 +3,7 @@ export const API_BASE = (import.meta.env.VITE_API_BASE || "http://localhost:8000
 // Station laptops are shared: tokens live in sessionStorage so closing the
 // browser logs the user out.
 const SESSION_KEY = "ievaluate_session";
+export const REVIEW_DRAFT_PREFIX = "ievaluate_review_drafts_";
 
 export class ApiError extends Error {
   constructor(message, { status = 0, code = null, detail = null } = {}) {
@@ -48,6 +49,17 @@ export function clearSession() {
   memorySession = null;
   try {
     sessionStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+  // Unsaved review drafts must not survive a logout on a shared laptop.
+  try {
+    const stale = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k && k.startsWith(REVIEW_DRAFT_PREFIX)) stale.push(k);
+    }
+    stale.forEach((k) => sessionStorage.removeItem(k));
   } catch {
     /* ignore */
   }
@@ -276,9 +288,23 @@ export const api = {
   rejectReview: (id, body) => request(`/reviews/queue/${q(id)}/reject`, { method: "POST", body }),
   resolveImportError: (id, body) => request(`/reviews/import-errors/${q(id)}/resolve`, { method: "POST", body }),
   discardImportError: (id, body) => request(`/reviews/import-errors/${q(id)}/discard`, { method: "POST", body }),
+  // Pages marking couldn't save: send the kept copy again, or turn it into a
+  // Needs review form to type the answers in. body: { expected_version }.
+  retryUnsaved: (id, body) => request(`/reviews/unsaved/${q(id)}/retry`, { method: "POST", body }),
+  unsavedToReview: (id, body) => request(`/reviews/unsaved/${q(id)}/to-review`, { method: "POST", body }),
+  // Page viewer: one page's full result (per-question ratings).
+  getBatchItem: (batchId, itemId) => request(`/batches/${q(batchId)}/items/${q(itemId)}`),
   // The scanned page as a Blob (the image needs the login token, so it can't be a plain <img src>).
-  reviewImage: async (kind, id) => {
-    const path = kind === "import" ? `/reviews/import-errors/${q(id)}/image` : `/reviews/queue/${q(id)}/image`;
+  // kind "item" = a page of the live batch list (batchId needed).
+  reviewImage: async (kind, id, batchId) => {
+    const path =
+      kind === "item"
+        ? `/batches/${q(batchId)}/items/${q(id)}/image`
+        : kind === "import"
+        ? `/reviews/import-errors/${q(id)}/image`
+        : kind === "unsaved"
+          ? `/reviews/unsaved/${q(id)}/image`
+          : `/reviews/queue/${q(id)}/image`;
     const res = await request(path, { raw: true });
     return res.blob();
   },

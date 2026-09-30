@@ -80,9 +80,9 @@ const FAQ = [
     q: "How do I change the scan folder?",
     a: (
       <>
-        On the website only: open <Link to="/scanner-setup">Scanner setup</Link>, change the folder and click{" "}
-        <strong>Save folder</strong>. The laptop switches by itself within 30 seconds. Then set the scanner to save into
-        the new folder.
+        Open <Link to="/scanner-setup">Scanner setup</Link>, type the full folder path (like C:\Scans\) and click{" "}
+        <strong>Save folder</strong>. The page checks it on the laptop within about 30 seconds. The folder must already
+        exist on the scanner laptop (C:\Scans\ is made at install). Then set the scanner to save into the same folder.
       </>
     ),
   },

@@ -14,7 +14,7 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
   const [last, setLast] = useState("");
   const [dept, setDept] = useState("");
   const [employment, setEmployment] = useState("");
-  const [duplicate, setDuplicate] = useState(null);
+  const [duplicates, setDuplicates] = useState([]);
   const [createError, setCreateError] = useState("");
   const [creating, setCreating] = useState(false);
 
@@ -22,13 +22,13 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
     const parts = query.trim().split(/\s+/);
     setFirst(parts.length > 1 ? parts.slice(0, -1).join(" ") : parts[0] || "");
     setLast(parts.length > 1 ? parts[parts.length - 1] : "");
-    setDuplicate(null);
+    setDuplicates([]);
     setCreateError("");
     setShowCreate(true);
   }
 
-  async function submitCreate() {
-    setDuplicate(null);
+  async function submitCreate(confirmNew = false) {
+    setDuplicates([]);
     setCreateError("");
     setCreating(true);
     try {
@@ -37,12 +37,13 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
         last_name: last.trim(),
         department_id: Number(dept),
         employment_type: employment,
+        confirm_new_person: confirmNew === true,
       });
       onSelect(created);
       setShowCreate(false);
     } catch (err) {
       if (err.status === 409 && err.code === "duplicate_instructor") {
-        setDuplicate(err.detail?.existing_instructor || null);
+        setDuplicates(err.detail?.existing_instructors || (err.detail?.existing_instructor ? [err.detail.existing_instructor] : []));
       } else {
         setCreateError(err.message);
       }
@@ -109,12 +110,13 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
             <option value="FULL-TIME">Full-time</option>
             <option value="PART-TIME">Part-time</option>
           </select>
-          {duplicate && (
+          {duplicates.length === 1 && (
             <div className="error">
-              An instructor with a very similar name already exists: <strong>{duplicate.full_name || `${duplicate.first_name} ${duplicate.last_name}`}</strong>.
-              {duplicate.eligible ? (
+              An instructor with a very similar name already exists: <strong>{duplicates[0].full_name || `${duplicates[0].first_name} ${duplicates[0].last_name}`}</strong>
+              {duplicates[0].department_name ? ` (${duplicates[0].department_name})` : ""}.
+              {duplicates[0].eligible ? (
                 <div>
-                  <button type="button" className="primary" onClick={() => { onSelect(duplicate); setShowCreate(false); }}>
+                  <button type="button" className="primary" onClick={() => { onSelect(duplicates[0]); setShowCreate(false); }}>
                     Use existing instructor
                   </button>
                 </div>
@@ -123,12 +125,42 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
               )}
             </div>
           )}
+          {duplicates.length > 1 && (
+            <div className="error">
+              Instructors with very similar names already exist. Is it one of these?
+              <ul>
+                {duplicates.map((m) => (
+                  <li key={m.id}>
+                    <strong>{m.full_name || `${m.first_name} ${m.last_name}`}</strong>
+                    {m.department_name && <span className="muted"> - {m.department_name}</span>}
+                    {m.is_placeholder && <span className="badge">login not activated yet</span>}
+                    {m.eligible ? (
+                      <div>
+                        <button type="button" className="primary" onClick={() => { onSelect(m); setShowCreate(false); }}>
+                          Use existing instructor
+                        </button>
+                      </div>
+                    ) : (
+                      <div>That person isn't set up as an instructor. Ask an SAO admin to check before adding a new one.</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {duplicates.length > 0 && (
+            <div>
+              <button type="button" onClick={() => submitCreate(true)} disabled={creating}>
+                This is a different person - add "{first.trim()} {last.trim()}"
+              </button>
+            </div>
+          )}
           {createError && <div className="error">{createError}</div>}
           <button
             type="button"
             className="primary"
             disabled={!first.trim() || !last.trim() || !dept || !employment || creating}
-            onClick={submitCreate}
+            onClick={() => submitCreate(false)}
           >
             {creating ? "Adding..." : "Add instructor"}
           </button>

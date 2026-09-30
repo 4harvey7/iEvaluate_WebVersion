@@ -1,4 +1,4 @@
-"""Scan-folder safety checks shared by the website API and the folder watcher.
+r"""Scan-folder safety checks shared by the website API and the folder watcher.
 
 The watcher (backend/watcher/folder_watcher.py) is a standalone script, so it
 carries a copy of this logic. Keep the two in sync.
@@ -8,6 +8,14 @@ image in it is sent for scoring, so it must be a folder just for scans:
 never a drive root, the user profile, Windows / Program Files, the root of
 Desktop / Documents / Downloads / Pictures / OneDrive, or a network share root.
 Subfolders of Desktop, Documents, etc. are fine.
+
+Folders set on the website must be full paths on the laptop itself: no
+%NAME% variables, no ~, and no network shares (\\server\share or
+//server/share). A folder on the website is pushed to the laptop on its next
+heartbeat, so a network path there could make the laptop read (and send for
+scoring) files from any server the website user picks. Only a hand-edited
+watcher_config.json on the laptop may still use %VARS% or a folder inside a
+network share.
 """
 from __future__ import annotations
 
@@ -23,31 +31,6 @@ SYSTEM_TREES = {"windows", "program files", "program files (x86)"}
 # Top-level folders whose root is too big.
 TOP_ROOTS = {"users", "documents and settings", "programdata"}
 
-# Used only to CHECK paths written with Windows variables on the server, which
-# cannot know the laptop's real values. The stored path keeps the variable.
-_PLACEHOLDER_PROFILE = "C:/Users/_profile_"
-PLACEHOLDER_VARS = {
-    "USERPROFILE": _PLACEHOLDER_PROFILE,
-    "HOMEPATH": "/Users/_profile_",
-    "HOMEDRIVE": "C:",
-    "SYSTEMDRIVE": "C:",
-    "ONEDRIVE": _PLACEHOLDER_PROFILE + "/OneDrive",
-    "ONEDRIVECOMMERCIAL": _PLACEHOLDER_PROFILE + "/OneDrive - Org",
-    "ONEDRIVECONSUMER": _PLACEHOLDER_PROFILE + "/OneDrive",
-    "PUBLIC": "C:/Users/Public",
-    "SYSTEMROOT": "C:/Windows",
-    "WINDIR": "C:/Windows",
-    "PROGRAMFILES": "C:/Program Files",
-    "PROGRAMFILES(X86)": "C:/Program Files (x86)",
-    "PROGRAMW6432": "C:/Program Files",
-    "PROGRAMDATA": "C:/ProgramData",
-    "ALLUSERSPROFILE": "C:/ProgramData",
-    "LOCALAPPDATA": _PLACEHOLDER_PROFILE + "/AppData/Local",
-    "APPDATA": _PLACEHOLDER_PROFILE + "/AppData/Roaming",
-    "TEMP": _PLACEHOLDER_PROFILE + "/AppData/Local/Temp",
-    "TMP": _PLACEHOLDER_PROFILE + "/AppData/Local/Temp",
-}
-
 _EXAMPLE = "C:\\Scans"
 MESSAGES = {
     "empty": f"Please enter the folder the scanner saves to, like {_EXAMPLE}.",
@@ -55,22 +38,12 @@ MESSAGES = {
     "variables": f"Please type the full folder path instead of using shortcuts like %NAME% or ~, for example {_EXAMPLE}.",
     "drive_root": f"A whole drive cannot be watched. Please pick or create a folder just for scans, like {_EXAMPLE}.",
     "unc_root": "A whole network share cannot be watched. Please pick a folder inside the share that is just for scans.",
+    "network": f"Network folders (like \\\\server\\share) cannot be set from the website. Please use a folder on the laptop itself, like {_EXAMPLE}. "
+               "(IT can still set a network folder in watcher_config.json on the laptop.)",
     "system": f"Windows and Program Files folders cannot be watched. Please pick or create a folder just for scans, like {_EXAMPLE}.",
     "too_big": f"That folder is too big to watch. Please pick or create a folder just for scans, like {_EXAMPLE}.",
     "invalid": f"That does not look like a valid folder path. Please use something like {_EXAMPLE}.",
 }
-
-
-def expand_placeholders(raw: str) -> str:
-    """Server-side stand-in for os.path.expandvars/expanduser: substitutes
-    typical Windows values so %USERPROFILE%\\Desktop is still recognised."""
-    def sub(m: re.Match) -> str:
-        return PLACEHOLDER_VARS.get(m.group(1).upper(), m.group(0))
-
-    out = re.sub(r"%([^%/\\]+)%", sub, raw)
-    if out == "~" or out.startswith(("~/", "~\\")):
-        out = _PLACEHOLDER_PROFILE + out[1:]
-    return out
 
 
 def normalize_folder(raw: str | None) -> str:
@@ -151,9 +124,28 @@ def folder_problem(path: str | None, forbidden_exact=(), forbidden_trees=(), all
     return None
 
 
+def uses_shortcut(raw) -> bool:
+    """True for folder shortcuts like %USERPROFILE%/Scans or ~/Scans."""
+    p = normalize_folder(raw)
+    return "%" in p or p.startswith("~")
+
+
+def is_network_path(raw) -> bool:
+    """True for UNC / network-share paths (\\\\server\\share, //server/share, and
+    the \\\\?\\UNC\\... and \\\\.\\ device forms): all start with two slashes."""
+    p = str(raw or "").strip().strip('"').strip("'").strip().replace("\\", "/")
+    return p.startswith("//")
+
+
 def check_folder_for_server(raw: str | None) -> tuple[str, str | None]:
-    """(normalized path to store, plain-English error or None). Variables are
-    kept in the stored value (the watcher expands them on the laptop)."""
+    """(normalized path to store, plain-English error or None). Website folders
+    must be full local paths: shortcuts like %NAME% or ~ ("variables") and
+    network shares ("network") are refused."""
     normalized = normalize_folder(raw)
-    code = folder_problem(expand_placeholders(normalized)) if normalized else "empty"
+    if not normalized:
+        code = "empty"
+    elif is_network_path(raw) or is_network_path(normalized):
+        code = "network"
+    else:
+        code = folder_problem(normalized)
     return normalized, (MESSAGES.get(code, MESSAGES["too_big"]) if code else None)

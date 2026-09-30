@@ -1017,3 +1017,39 @@ button.danger-outline:hover { background: var(--danger-tint); border-color: var(
   .bulk-group .small-btn { width: 100%; }
   .review-callout .btn { width: 100%; }
 }
+/* Page viewer (pageViewer.jsx): score on each row + the scanned page in a modal. */
+.score-chip {
+  display: inline-flex; align-items: baseline; gap: 1px; padding: 1px 8px; border-radius: 999px;
+  background: var(--primary); color: #fff; font-size: 13px; line-height: 1.5; white-space: nowrap;
+}
+.score-chip strong { font-size: 14px; }
+.score-chip .score-of { font-size: 11px; opacity: 0.8; }
+.score-chip.partial { background: var(--accent-tint); color: var(--amber-text); border: 1px dashed #d9b86a; }
+.score-line { margin-top: 3px; color: var(--text); overflow-wrap: anywhere; }
+.item-actions { margin-top: 6px; }
+.item-actions .small-btn { margin: 0; }
+.review-row .rr-action { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; }
+.modal.page-viewer { max-width: 1040px; padding: 16px 18px; }
+.viewer-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.viewer-head h2 { margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.viewer-head .small-btn { margin: 0; flex: 0 0 auto; }
+.viewer-body { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; align-items: start; }
+.viewer-result { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.viewer-score { display: flex; gap: 10px; align-items: flex-start; }
+.viewer-score .score-chip { font-size: 16px; padding: 4px 12px; }
+.viewer-score .score-chip strong { font-size: 20px; }
+.ratings-view-group { margin-top: 4px; }
+.rv-title { font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+.ratings-view { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+.rv-cell { display: flex; justify-content: space-between; gap: 4px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; font-size: 13.5px; }
+.rv-cell .rv-key { color: var(--muted); font-weight: 600; }
+.rv-cell .rv-val { font-weight: 700; }
+.rv-cell.blank .rv-val { color: var(--grey-light); font-weight: 400; }
+@media (max-width: 760px) {
+  .viewer-body { grid-template-columns: 1fr; }
+  .modal.page-viewer { padding: 12px; }
+  .review-row .rr-action { justify-content: flex-start; }
+}
+@media (max-width: 420px) {
+  .ratings-view { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}

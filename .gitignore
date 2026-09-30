@@ -23,3 +23,22 @@ watcher_state.db
 *.log
 *.log.*
 logs/
+
+# Local tool / editor / OS files
+.claude/settings.local.json
+.vercel/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+coverage/
+
+# Local databases and key material
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+
+# Office lock files (e.g. ~$Report.docx)
+~$*

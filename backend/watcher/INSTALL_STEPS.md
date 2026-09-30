@@ -38,7 +38,10 @@ Start a batch for this station on the website, scan one page, wait one minute: t
 
 ## Change the scan folder
 
-On the website only. Change the folder and save. The laptop switches by itself within 30 seconds. Then set the scanner to save into the new folder.
+1. On the scanner laptop, make the folder in File Explorer (skip this for C:\Scans, it is made at install).
+2. On the website (Scanner setup), type the full folder path and click Save folder. No shortcuts like %NAME% or ~.
+3. Wait for "Done. The scanner laptop is now watching ..." (about 30 seconds).
+4. Set the scanner to save into the same folder.
 
 ## Moving to a new laptop
 

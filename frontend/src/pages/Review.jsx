@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api } from "../api.js";
+import { api, REVIEW_DRAFT_PREFIX } from "../api.js";
 import { ConfirmDialog, EmptyState, Loading, PageHeader, timeAgo, useNow } from "../components.jsx";
 import { Icon } from "../icons.jsx";
 import { useSearch } from "../useSearch.js";
-import { friendlyReason, importErrorText, matchText, reviewErrorText } from "../messages.js";
+import { friendlyReason, importErrorText, matchText, reviewErrorText, unsavedStateText } from "../messages.js";
+import { PageViewer, ScanImage, ScoreChip, scoreFromRatings } from "../pageViewer.jsx";
 
 // Live = polling through the backend (the browser never talks to Supabase).
 const POLL_VISIBLE_MS = 3000;
@@ -57,6 +58,18 @@ function mergeRows(prev, incoming, { full = false, trust = false } = {}) {
     if (!r || r.id === undefined || r.id === null) continue;
     const cur = prev.get(r.id);
     next.set(r.id, !cur || trust || isNewer(r, cur) ? r : cur);
+  }
+  return next;
+}
+
+// "Couldn't be saved" rows: no drafts, the server is the truth; keep the
+// highest version (an action's answer can arrive before an older poll).
+function mergeUnsaved(prev, incoming, full = false) {
+  const next = full ? new Map() : new Map(prev);
+  for (const r of incoming) {
+    if (!r || !r.id) continue;
+    const cur = prev.get(r.id);
+    next.set(r.id, !cur || Number(r.version) >= Number(cur.version) ? r : cur);
   }
   return next;
 }
@@ -190,7 +203,7 @@ function bulkGroups(rows, drafts) {
 }
 
 // ------------------------------------------------------------------ drafts (sessionStorage)
-const DRAFT_PREFIX = "ievaluate_review_drafts_";
+const DRAFT_PREFIX = REVIEW_DRAFT_PREFIX;
 
 function readDrafts(batchId) {
   try {
@@ -237,6 +250,7 @@ function useReviewData(batchId) {
     meta: {},
     queue: new Map(),
     imports: new Map(),
+    unsaved: new Map(),
     newQueue: new Set(),
     newImports: new Set(),
     pendingTasks: new Set(),
@@ -253,18 +267,22 @@ function useReviewData(batchId) {
       const opts = { full: !!d.full, trust: !d.migration_ready };
       const queue = mergeRows(prev.queue, d.queue || [], opts);
       const imports = mergeRows(prev.imports, d.import_errors || [], opts);
+      const unsaved = mergeUnsaved(prev.unsaved, d.unsaved || [], !!d.full);
       return {
         loaded: true,
         batch: d.batch || prev.batch,
-        counts: d.counts || {},
+        counts: { ...(d.counts || {}), unsaved_pending: Number(d.unsaved_pending) || 0 },
         meta: {
           migration_ready: !!d.migration_ready,
           correction_ready: d.correction_ready !== false,
           import_correction_ready: d.import_correction_ready !== false,
+          unsaved_ready: d.unsaved_ready !== false,
+          retry_ready: d.retry_ready !== false,
           access: d.access || "full",
         },
         queue,
         imports,
+        unsaved,
         // Pages that arrive after the first load wait behind an "N new" button
         // so the list never jumps under the reviewer.
         newQueue: prev.loaded ? newIds(prev.newQueue, prev.queue, queue) : new Set(),
@@ -329,7 +347,9 @@ function useReviewData(batchId) {
     setState((prev) =>
       kind === "import"
         ? { ...prev, imports: mergeRows(prev.imports, [row]) }
-        : { ...prev, queue: mergeRows(prev.queue, [row]) }
+        : kind === "unsaved"
+          ? { ...prev, unsaved: mergeUnsaved(prev.unsaved, [row]) }
+          : { ...prev, queue: mergeRows(prev.queue, [row]) }
     );
   }, []);
 
@@ -348,53 +368,6 @@ function LiveBadge({ lastOkAt, error, now }) {
       <span className="live-dot" aria-hidden="true" />
       {fresh ? "Live" : "Reconnecting..."}
     </span>
-  );
-}
-
-function ScanImage({ kind, id }) {
-  const [src, setSrc] = useState(null);
-  const [state, setState] = useState("loading");
-  const [zoom, setZoom] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    let url = null;
-    setState("loading");
-    setSrc(null);
-    api
-      .reviewImage(kind, id)
-      .then((blob) => {
-        url = URL.createObjectURL(blob);
-        if (alive) {
-          setSrc(url);
-          setState("ok");
-        } else {
-          URL.revokeObjectURL(url);
-        }
-      })
-      .catch((err) => {
-        if (alive) setState(err?.status === 404 ? "none" : "error");
-      });
-    return () => {
-      alive = false;
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [kind, id]);
-
-  if (state === "loading") return <div className="scan-image placeholder"><Loading>Loading the scan...</Loading></div>;
-  if (state === "none") return <div className="scan-image placeholder muted">No picture was saved for this form.</div>;
-  if (state === "error") return <div className="scan-image placeholder muted">The picture couldn't be loaded. Close and open the form to try again.</div>;
-  return (
-    <figure className={`scan-image ${zoom ? "zoomed" : ""}`}>
-      <button type="button" className="scan-image-btn" onClick={() => setZoom((z) => !z)} aria-label={zoom ? "Show the scan smaller" : "Show the scan bigger"}>
-        <img src={src} alt="The scanned form" />
-      </button>
-      <figcaption className="small">
-        <button type="button" className="link-btn" onClick={() => setZoom((z) => !z)}>{zoom ? "Smaller" : "Bigger"}</button>
-        {" · "}
-        <a href={src} target="_blank" rel="noreferrer">Open full size</a>
-      </figcaption>
-    </figure>
   );
 }
 
@@ -1115,6 +1088,33 @@ function ImportEditor({ row, batch, draft, setDraft, meta, onRowUpdate, onClose,
 }
 
 // ------------------------------------------------------------------ rows
+// "View page" + score on a review row (the picture opens in the page viewer).
+function RowViewer({ label, kind, id, summary, reasons, message }) {
+  const [viewing, setViewing] = useState(false);
+  return (
+    <>
+      <ScoreChip summary={summary} />
+      <button type="button" className="small-btn" onClick={() => setViewing(true)}>View page</button>
+      {viewing && (
+        <PageViewer title={label} kind={kind} id={id} summary={summary} reasons={reasons} message={message} onClose={() => setViewing(false)} />
+      )}
+    </>
+  );
+}
+
+function queueSummary(row) {
+  const c = row.status === "validated" && row.correction?.ratings ? row.correction : null;
+  const s = scoreFromRatings(c ? c.ratings : row.ratings);
+  return {
+    ...s,
+    credited: !!c,
+    instructor: c ? c.instructor?.name : row.suggested_instructor?.name,
+    subject_code: c ? c.subject?.code : row.suggested_subject?.code,
+    student_id: (c ? c.student_id : row.student_id) || null,
+    agreement_percent: c ? null : row.agreement_percent,
+  };
+}
+
 function QueueRow({ row, index, importRow, pendingTasks, open, isNew, hasDraft, me, now, onToggle }) {
   const st = queueState(row, importRow, pendingTasks);
   const finished = row.status !== "pending";
@@ -1161,6 +1161,7 @@ function QueueRow({ row, index, importRow, pendingTasks, open, isNew, hasDraft, 
         {viewer && !finished && <span className="muted small">{viewer.name || "Someone"} is looking</span>}
       </span>
       <span className="rr-action">
+        <RowViewer label={row.filename || "Scanned page"} kind="queue" id={row.id} summary={queueSummary(row)} reasons={row.review_reasons} />
         <button type="button" className="small-btn" aria-expanded={open} aria-controls={`editor-q-${row.id}`} onClick={onToggle}>
           {open ? "Close" : finished ? "View" : "Open"}
         </button>
@@ -1193,10 +1194,196 @@ function ImportRow({ row, index, open, isNew, hasDraft, now, onToggle }) {
         {hasDraft && !finished && <span className="badge">your edits</span>}
       </span>
       <span className="rr-action">
+        <RowViewer
+          label={row.student_id ? `Student ${row.student_id}` : "Scanned form"}
+          kind="import"
+          id={row.id}
+          summary={{ ...scoreFromRatings(row.ratings), credited: row.status === "resolved", instructor: row.raw_instructor_name, subject_code: row.raw_subject_name, student_id: row.student_id || null }}
+          reasons={row.review_reasons}
+        />
         <button type="button" className="small-btn" aria-expanded={open} aria-controls={`editor-ie-${row.id}`} onClick={onToggle}>
           {open ? "Close" : finished ? "View" : "Open"}
         </button>
       </span>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ couldn't be saved
+const UNSAVED_CONFLICTS = new Set(["stale_row", "already_resolved", "in_progress", "item_changed"]);
+const unsavedErrorText = (err) => (err?.code === "migration_required" ? err.message : reviewErrorText(err));
+
+function unsavedTone(row) {
+  if (row.status === "sending" || row.status === "retrying") return "proc";
+  if (row.status === "saved" || row.status === "manual") return "success";
+  return row.last_error ? "error" : "flagged";
+}
+
+function triesText(row) {
+  const auto = Number(row.watcher_failures) || 0;
+  const here = Number(row.website_attempts) || 0;
+  const parts = [];
+  if (auto) parts.push(`${auto} ${auto === 1 ? "try" : "tries"} by the laptop`);
+  if (here) parts.push(`${here} from this page`);
+  return parts.join(", ") || "-";
+}
+
+function UnsavedRow({ row, index, open, now, onToggle }) {
+  const finished = row.status === "saved" || row.status === "manual";
+  const notes = [...new Set((row.review_reasons || []).map(friendlyReason).filter(Boolean))];
+  return (
+    <div className={`review-row ${finished ? "finished" : ""} ${open ? "open" : ""}`} id={`review-u-${row.id}`}>
+      <span className="rr-num" aria-hidden="true">{index}</span>
+      <span className="rr-form">
+        <span className="item-file">{row.filename || "Scanned page"}</span>
+        <span className="muted small">{timeAgo(row.created_at, now)}</span>
+      </span>
+      <span className="rr-problem small">
+        <span className="rr-label">Problem: </span>
+        Marking couldn't save this page.
+        {notes.length > 0 && <span className="muted"> {notes[0]}</span>}
+      </span>
+      <span className="rr-credit small"><span className="rr-label">Tries: </span>{triesText(row)}</span>
+      <span className="rr-status">
+        <span className={`pill ${unsavedTone(row)}`}>{row.last_error && row.status === "needs_review" ? "Last try failed" : unsavedStateText(row)}</span>
+      </span>
+      <span className="rr-action">
+        {row.has_image !== false && (
+          <RowViewer label={row.filename || "Scanned page"} kind="unsaved" id={row.id} summary={null} reasons={row.review_reasons} message={row.message} />
+        )}
+        <button type="button" className="small-btn" aria-expanded={open} aria-controls={`editor-u-${row.id}`} onClick={onToggle}>
+          {open ? "Close" : finished ? "View" : "Open"}
+        </button>
+      </span>
+    </div>
+  );
+}
+
+function UnsavedEditor({ row, meta, onRowUpdate, onQueueRow, onOpenQueue, onClose, onRefresh, showToast }) {
+  const [busy, setBusy] = useState(null); // "retry" | "manual"
+  const [problem, setProblem] = useState("");
+  const [askManual, setAskManual] = useState(false);
+  const label = row.filename || "This page";
+  const waiting = row.status === "needs_review";
+  const max = Number(row.max_website_attempts) || 5;
+  const usedUp = (Number(row.website_attempts) || 0) >= max;
+
+  async function run(kind) {
+    setBusy(kind);
+    setProblem("");
+    try {
+      if (kind === "retry") {
+        const res = await api.retryUnsaved(row.id, { expected_version: row.version });
+        onRowUpdate(res.row);
+        showToast(`${label}: sent to marking again. This list updates by itself when it answers.`, "info");
+      } else {
+        const res = await api.unsavedToReview(row.id, { expected_version: row.version });
+        onRowUpdate(res.row);
+        setAskManual(false);
+        if (res.outcome === "already_saved") {
+          showToast(`${label}: marking had already saved and scored this page. Nothing to type in.`);
+        } else {
+          showToast(`${label}: moved to Needs review. Type in the answers there.`);
+          onQueueRow(res.queue_row);
+        }
+        onClose();
+      }
+    } catch (err) {
+      setAskManual(false);
+      setProblem(unsavedErrorText(err));
+      if (UNSAVED_CONFLICTS.has(err?.code)) onRefresh();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="review-editor" id={`editor-u-${row.id}`}>
+      {row.status === "sending" && (
+        <div className="info-box">Sent to marking again. Waiting for its answer... This updates by itself and can take a few minutes.</div>
+      )}
+      {row.status === "retrying" && (
+        <div className="info-box">The scanner laptop is still sending this page by itself. You can act on it here once it gives up.</div>
+      )}
+      {row.status === "saved" && <div className="success-box small">{unsavedStateText(row)}. Nothing else to do here.</div>}
+      {row.status === "manual" && (
+        <div className="success-box small">
+          Moved to Needs review{row.acted_by_name ? ` by ${row.acted_by_name}` : ""}. Type in the answers there.{" "}
+          {row.fsq_id && <button type="button" className="link-btn" onClick={() => onOpenQueue(row.fsq_id)}>Open it</button>}
+        </div>
+      )}
+      {waiting && row.last_error && <div className="error">Last try: {row.last_error}</div>}
+
+      <div className="editor-grid">
+        <div className="editor-image">
+          {row.has_image !== false ? (
+            <ScanImage kind="unsaved" id={row.id} />
+          ) : (
+            <div className="scan-image placeholder muted">
+              The scan is no longer kept here: it is with the {row.status === "manual" ? "Needs review form" : "saved form"}.
+            </div>
+          )}
+        </div>
+        <div className="editor-fields">
+          <p className="import-why">
+            <strong>Marking read this page but couldn't save it.</strong> Nothing from it is stored yet, so it isn't counted
+            for anyone. Send it to marking again, or type in the answers yourself. There is no need to scan the sheet again.
+          </p>
+          {(row.review_reasons || []).length > 0 && (
+            <>
+              <p className="small muted">Marking also noted:</p>
+              <ReasonList reasons={row.review_reasons} />
+            </>
+          )}
+          <p className="small muted">Tries so far: {triesText(row)}.</p>
+          {row.message && (
+            <details className="review-details">
+              <summary>Details from marking (for IT)</summary>
+              <p className="small">{row.message}</p>
+            </details>
+          )}
+
+          {problem && <div className="error" role="alert">{problem}</div>}
+          {waiting && !meta.retry_ready && (
+            <p className="muted small">Sending again isn't set up on this server. You can still type in the answers.</p>
+          )}
+          {waiting && meta.retry_ready && usedUp && (
+            <p className="muted small">It was sent again {max} times from here. Type in the answers instead.</p>
+          )}
+
+          <div className="editor-actions">
+            {waiting && (
+              <>
+                <button type="button" className="primary" disabled={!row.can_retry || !!busy} onClick={() => run("retry")}>
+                  <Icon name="scan" size={18} />
+                  {busy === "retry" ? "Sending..." : "Try again"}
+                </button>
+                <button type="button" disabled={!row.can_enter_by_hand || !!busy} onClick={() => setAskManual(true)}>
+                  Type in the answers
+                </button>
+              </>
+            )}
+            <button type="button" onClick={onClose}>Close</button>
+          </div>
+        </div>
+      </div>
+
+      {askManual && (
+        <ConfirmDialog
+          title="Type in the answers yourself?"
+          confirmLabel="Yes, move it to Needs review"
+          cancelLabel="Cancel"
+          busy={busy === "manual"}
+          onConfirm={() => run("manual")}
+          onCancel={() => setAskManual(false)}
+        >
+          <p>
+            The page moves to <strong>Needs review</strong> with the scan next to an empty form. Type the student ID,
+            remarks and every rating from the scan, then credit it as usual.
+          </p>
+          <p className="small">It can't be sent to marking again after that.</p>
+        </ConfirmDialog>
+      )}
     </div>
   );
 }
@@ -1248,6 +1435,7 @@ function ReviewPage({ batchId, profile }) {
   const [drafts, setDraft] = useDrafts(batchId);
   const [openQ, setOpenQ] = useState(null);
   const [openIe, setOpenIe] = useState(null);
+  const [openU, setOpenU] = useState(null);
   const [qFilter, setQFilter] = useState("all");
   const [ieFilter, setIeFilter] = useState("all");
   const [showFinished, setShowFinished] = useState(true);
@@ -1274,6 +1462,8 @@ function ReviewPage({ batchId, profile }) {
 
   const queueRows = useMemo(() => [...data.queue.values()].sort(byCreated), [data.queue]);
   const importRows = useMemo(() => [...data.imports.values()].sort(byCreated), [data.imports]);
+  const unsavedRows = useMemo(() => [...data.unsaved.values()].sort(byCreated), [data.unsaved]);
+  const unsavedIndex = useMemo(() => new Map(unsavedRows.map((r, i) => [r.id, i + 1])), [unsavedRows]);
   const queueIndex = useMemo(() => new Map(queueRows.map((r, i) => [r.id, i + 1])), [queueRows]);
   const importIndex = useMemo(() => new Map(importRows.map((r, i) => [r.id, i + 1])), [importRows]);
   const importByTask = useMemo(() => {
@@ -1288,7 +1478,28 @@ function ReviewPage({ batchId, profile }) {
   const ieTodo = (key) => shownImports.filter((r) => r.status === "pending" && IMPORT_CATEGORY[key](r)).length;
   const visibleQueue = shownQueue.filter((r) => QUEUE_CATEGORY[qFilter](r) && (showFinished || r.status === "pending" || r.id === openQ));
   const visibleImports = shownImports.filter((r) => IMPORT_CATEGORY[ieFilter](r) && (showFinished || r.status === "pending" || r.id === openIe));
+  const unsavedOpen = (r) => r.status !== "saved" && r.status !== "manual";
+  const visibleUnsaved = unsavedRows.filter((r) => showFinished || unsavedOpen(r) || r.id === openU);
   const groups = bulkGroups(shownQueue, drafts);
+
+  // Coming from the batch page's "Try again or type in the answers" link.
+  const jumped = useRef(false);
+  useEffect(() => {
+    if (jumped.current || !data.loaded || window.location.hash !== "#couldnt-save") return;
+    jumped.current = true;
+    requestAnimationFrame(() => document.getElementById("couldnt-save")?.scrollIntoView?.({ block: "start" }));
+  }, [data.loaded]);
+
+  // "Type in the answers": the new Needs review form opens right away.
+  function openQueueRow(id) {
+    setOpenU(null);
+    setOpenQ(id);
+    requestAnimationFrame(() => document.getElementById(`review-q-${id}`)?.scrollIntoView?.({ block: "center", behavior: "smooth" }));
+  }
+  function toggleU(id) {
+    setOpenU((cur) => (cur === id ? null : id));
+    requestAnimationFrame(() => document.getElementById(`review-u-${id}`)?.scrollIntoView?.({ block: "nearest" }));
+  }
 
   function reveal(kind) {
     const pending = kind === "import" ? data.newImports : data.newQueue;
@@ -1357,7 +1568,7 @@ function ReviewPage({ batchId, profile }) {
       <div>
         <PageHeader
           title="Review forms"
-          subtitle="Only the staff member who started this batch, the person logged in at its laptop, or an SAO admin can review these forms."
+          subtitle="Only the staff member who started this batch, or an SAO admin, can review these forms."
           back={{ to: "/", label: "Home" }}
         />
       </div>
@@ -1414,6 +1625,11 @@ function ReviewPage({ batchId, profile }) {
           Needs review <span className="chip-count">{counts.queue_pending ?? qTodo("all")}</span>
           {data.newQueue.size > 0 && <span className="pill new">+{data.newQueue.size} new</span>}
         </button>
+        {meta.access !== "own" && meta.unsaved_ready && unsavedRows.length > 0 && (
+          <button type="button" className="chip" onClick={() => scrollTo("couldnt-save")}>
+            Couldn't be saved <span className="chip-count">{counts.unsaved_pending || 0}</span>
+          </button>
+        )}
         <button type="button" className="chip" onClick={() => scrollTo("import-errors")}>
           Import errors <span className="chip-count">{counts.import_pending ?? ieTodo("all")}</span>
           {data.newImports.size > 0 && <span className="pill new">+{data.newImports.size} new</span>}
@@ -1489,6 +1705,53 @@ function ReviewPage({ batchId, profile }) {
           </div>
         )}
       </section>
+
+      {/* ---------------- Couldn't be saved ---------------- */}
+      {meta.access !== "own" && meta.unsaved_ready && unsavedRows.length > 0 && (
+        <section className="section review-panel" id="couldnt-save" aria-labelledby="couldnt-save-title">
+          <div className="panel-head">
+            <h2 id="couldnt-save-title">Couldn't be saved</h2>
+          </div>
+          <p className="small panel-help">
+            Pages that marking read but couldn't save, even after the laptop tried several times. A copy of each scan is
+            kept here: send it to marking again, or type in the answers yourself. No need to scan the sheets again.
+          </p>
+          {visibleUnsaved.length === 0 ? (
+            <EmptyState icon="check" title={unsavedRows.length ? "Nothing left here" : "Nothing here"}>
+              {unsavedRows.length
+                ? "Every page that couldn't be saved has been dealt with."
+                : "Good - marking saved every page so far."}
+            </EmptyState>
+          ) : (
+            <div className="review-table" role="list" aria-label="Pages that couldn't be saved">
+              <div className="review-head" aria-hidden="true">
+                <span>#</span><span>Page</span><span>Problem</span><span>Tries</span><span>Status</span><span />
+              </div>
+              {visibleUnsaved.map((r) => (
+                <div role="listitem" className={`review-item ${openU === r.id ? "open" : ""}`} key={r.id}>
+                  <UnsavedRow row={r} index={unsavedIndex.get(r.id)} open={openU === r.id} now={now} onToggle={() => toggleU(r.id)} />
+                  {openU === r.id && (
+                    <UnsavedEditor
+                      key={`u-editor-${r.id}`}
+                      row={r}
+                      meta={meta}
+                      onRowUpdate={(row) => data.mergeRow("unsaved", row)}
+                      onQueueRow={(row) => {
+                        data.mergeRow("queue", row);
+                        if (row?.id) openQueueRow(row.id);
+                      }}
+                      onOpenQueue={openQueueRow}
+                      onClose={() => setOpenU(null)}
+                      onRefresh={data.refresh}
+                      showToast={showToast}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* ---------------- Import errors ---------------- */}
       <section className="section review-panel" id="import-errors" aria-labelledby="import-errors-title">

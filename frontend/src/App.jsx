@@ -332,6 +332,8 @@ export default function App() {
   const [stationKey, setStationKey] = useState(null);
   const [pendingAction, setPendingAction] = useState(null); // {type, openBatch}
   const [busy, setBusy] = useState(false);
+  // Set when this laptop is still taken by someone with an open batch (409 station_in_use).
+  const [bindProblem, setBindProblem] = useState("");
 
   const profile = session?.profile;
 
@@ -348,8 +350,10 @@ export default function App() {
   // Re-bind the logged-in user to this laptop's station on each login.
   useEffect(() => {
     if (session && stationId) {
+      setBindProblem("");
       api.bindStation(stationId).catch((err) => {
         if (err?.status === 404) setStationId("");
+        else if (err?.status === 409) setBindProblem(err.message || "Another staff member is still using this laptop.");
       });
     }
   }, [session?.profile?.id, stationId, setStationId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -410,6 +414,11 @@ export default function App() {
   return (
     <BrowserRouter>
       <Shell profile={profile} stationId={stationId} busy={busy} onRequest={requestAction} onStationMissing={handleStationMissing}>
+        {bindProblem && (
+          <div className="warning-box small" role="alert">
+            <p>{bindProblem}</p>
+          </div>
+        )}
         <Routes>
           <Route
             path="/"

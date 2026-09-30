@@ -13,6 +13,7 @@ import {
   rotationText,
 } from "../messages.js";
 import { ScannerStatus, SkippedPagesCard, getScannerState, skippedCount, useStation } from "../scanner.jsx";
+import { PageViewer, ScoreChip, ScoreLine } from "../pageViewer.jsx";
 
 const POLL_MS = 3000;
 
@@ -24,6 +25,12 @@ const COUNTERS = [
   { key: "rejected", label: "Rejected", cls: "c-reject", help: "Couldn't be scored. Check the sheet and scan it again." },
   { key: "duplicates", label: "Already scanned", cls: "c-dup", help: "This exact page was already received, so it was ignored." },
   { key: "errors", label: "Trying again", cls: "c-err", help: "Not marked yet. It is tried again automatically." },
+  {
+    key: "unsaved",
+    label: "Couldn't be saved",
+    cls: "c-flag",
+    help: "Marking couldn't save these pages. A copy is kept: open the review page to try again or type in the answers. No need to scan them again.",
+  },
   { key: "failed", label: "Failed", cls: "c-reject", help: "Gave up after several tries. Scan these sheets again." },
   { key: "processing", label: "Working on it", cls: "c-proc", help: "Received and being scored right now." },
 ];
@@ -37,13 +44,16 @@ const EMPTY_TEXT = {
   rejected: ["No rejected pages", "Good - every page could be read so far."],
   duplicates: ["No repeated pages", "Pages scanned twice will show up here."],
   errors: ["Nothing is being tried again", "Pages that hit a hiccup show up here while they are retried."],
+  unsaved: ["Nothing waiting", "Pages marking couldn't save would show up here, ready to try again or type in on the review page."],
   failed: ["Nothing has failed", "Pages that couldn't be marked after several tries would show up here."],
   processing: ["Nothing is being worked on", "New pages show up here for a few seconds while they are scored."],
 };
 
 // Same rule as the counters on the server (batches.py): errors that can
-// still be retried are "Trying again"; retryable === false is "Failed".
+// still be retried are "Trying again"; retryable === false is "Failed",
+// except pages whose copy waits on the review page ("Couldn't be saved").
 function itemBucket(item) {
+  if (item?.status === "error" && itemCode(item) === "not_saved_needs_review") return "unsaved";
   switch (item?.status) {
     case "success":
       return "processed";
@@ -104,7 +114,7 @@ function IdentityCheck({ identity }) {
   );
 }
 
-function ItemRow({ item, now, markingOff, reviewTo }) {
+function ItemRow({ item, now, markingOff, reviewTo, canView, onView }) {
   const bucket = itemBucket(item);
   const code = itemCode(item);
   // While marking is off, a page that is "trying again" is simply waiting.
@@ -136,6 +146,8 @@ function ItemRow({ item, now, markingOff, reviewTo }) {
   }
   if (!waiting) {
     for (const r of item.review_reasons || []) {
+      // "Couldn't save - trying again" is no longer true once the page waits for review.
+      if (bucket === "unsaved" && /^(internal_error_not_saved|not_saved_permanent)$/i.test(String(r).trim())) continue;
       const t = friendlyReason(r);
       if (t && !(bucket === "failed" && /scan (this|the) sheet again/i.test(t))) lines.push(t);
     }
@@ -143,15 +155,29 @@ function ItemRow({ item, now, markingOff, reviewTo }) {
   const MISMATCH_TEXT = "This sheet may be for a different instructor or subject.";
   const uniqueLines = [...new Set(lines.filter((t) => t && !(mismatch && t === MISMATCH_TEXT)))];
 
-  const pillCls = waiting ? "waiting" : bucket === "failed" || bucket === "errors" ? "error" : reviewed ? "reviewed" : item.status;
+  const pillCls = waiting
+    ? "waiting"
+    : bucket === "unsaved"
+      ? "flagged"
+      : bucket === "failed" || bucket === "errors"
+        ? "error"
+        : reviewed
+          ? "reviewed"
+          : item.status;
+  const rowCls = waiting ? "waiting" : bucket === "unsaved" ? "flagged" : bucket === "failed" || bucket === "errors" ? "error" : item.status;
   const at = item.created_at || item.updated_at;
   return (
-    <li className={`item-row ${waiting ? "waiting" : bucket === "failed" || bucket === "errors" ? "error" : item.status} ${mismatch ? "mismatch" : ""}`}>
+    <li className={`item-row ${rowCls} ${mismatch ? "mismatch" : ""}`}>
       <div className="item-head">
         <span className={`pill ${pillCls}`}>{label}</span>
+        <ScoreChip summary={item.summary} />
         <span className="item-file">{item.filename}</span>
         <span className="muted small" title={at ? new Date(at).toLocaleString() : undefined}>{timeAgo(at, now)}</span>
       </div>
+      <ScoreLine summary={item.summary} />
+      {bucket === "duplicates" && item.summary && (
+        <div className="muted small">This is the result saved the first time this page was scanned.</div>
+      )}
       {rotation && <div className="muted small">{rotation}</div>}
       {item.orientation_uncertain && (
         <div className="small orientation-note">
@@ -165,6 +191,14 @@ function ItemRow({ item, now, markingOff, reviewTo }) {
       <IdentityCheck identity={item.identity} />
       {bucket === "flagged" && !reviewed && reviewTo && (
         <Link className="small-link" to={reviewTo}>Review this form</Link>
+      )}
+      {bucket === "unsaved" && reviewTo && (
+        <Link className="small-link" to={`${reviewTo}#couldnt-save`}>Try again or type in the answers</Link>
+      )}
+      {canView && (
+        <div className="item-actions">
+          <button type="button" className="small-btn" onClick={() => onView(item)}>View page</button>
+        </div>
       )}
     </li>
   );
@@ -184,6 +218,7 @@ export default function ScanningLive({ stationId }) {
   const [acting, setActing] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const [filter, setFilter] = useState("all");
+  const [viewing, setViewing] = useState(null); // the page open in the page viewer
   const inFlight = useRef(false);
   const listRef = useRef(null);
   const now = useNow(1000);
@@ -309,7 +344,8 @@ export default function ScanningLive({ stationId }) {
   const toReview = Number(batch.queue_pending) || 0;
   const importPending = Number(batch.import_pending) || 0;
   const flaggedDone = Math.max(0, n("flagged") - toReview);
-  const needsAttention = toReview + n("rejected");
+  const unsaved = n("unsaved");
+  const needsAttention = toReview + n("rejected") + unsaved;
 
   return (
     <div>
@@ -401,19 +437,24 @@ export default function ScanningLive({ stationId }) {
         })}
       </div>
 
-      {(toReview > 0 || importPending > 0) && (
+      {(toReview > 0 || importPending > 0 || unsaved > 0) && (
         <div className="review-callout" role="status">
           <Icon name="alert" size={20} />
           <span>
             <strong>
-              {toReview > 0 &&
-                (flaggedDone > 0
-                  ? `${toReview} of ${n("flagged")} flagged forms still ${toReview === 1 ? "needs" : "need"} review`
-                  : `${toReview === 1 ? "1 form needs" : `${toReview} forms need`} review`)}
-              {toReview > 0 && importPending > 0 && " and "}
-              {importPending > 0 && `${importPending === 1 ? "1 form" : `${importPending} forms`} couldn't be saved`}.
+              {[
+                toReview > 0 &&
+                  (flaggedDone > 0
+                    ? `${toReview} of ${n("flagged")} flagged forms still ${toReview === 1 ? "needs" : "need"} review`
+                    : `${toReview === 1 ? "1 form needs" : `${toReview} forms need`} review`),
+                importPending > 0 && `${importPending === 1 ? "1 form" : `${importPending} forms`} couldn't be saved`,
+                unsaved > 0 && `${unsaved === 1 ? "1 page" : `${unsaved} pages`} couldn't be saved by marking`,
+              ]
+                .filter(Boolean)
+                .join(" and ")}
+              .
             </strong>{" "}
-            You can fix {toReview + importPending === 1 ? "it" : "them"} now, even while scanning continues.
+            You can fix {toReview + importPending + unsaved === 1 ? "it" : "them"} now, even while scanning continues.
           </span>
           <Link className="btn primary" to={reviewTo}>Open review page</Link>
         </div>
@@ -456,7 +497,17 @@ export default function ScanningLive({ stationId }) {
         ) : (
           <>
             <ul className="item-list" aria-label={filterLabel}>
-              {shown.map((it) => <ItemRow key={it.id} item={it} now={now} markingOff={markingOff} reviewTo={reviewTo} />)}
+              {shown.map((it) => (
+                <ItemRow
+                  key={it.id}
+                  item={it}
+                  now={now}
+                  markingOff={markingOff}
+                  reviewTo={reviewTo}
+                  canView={batch.can_view_pages === true}
+                  onView={setViewing}
+                />
+              ))}
             </ul>
             {shown.length < expected && (
               <p className="muted small">Showing the {shown.length} most recent of {expected}. Older pages are still counted and saved.</p>
@@ -464,6 +515,14 @@ export default function ScanningLive({ stationId }) {
           </>
         )}
       </section>
+
+      {batch.can_view_pages === true && batch.page_images_enabled === false && (
+        <p className="muted small">Pictures of scanned pages aren't kept on this server yet, so "View page" shows the result only.</p>
+      )}
+
+      {viewing && (
+        <PageViewer title={viewing.filename || "Scanned page"} batchId={batchId} itemId={viewing.id} onClose={() => setViewing(null)} />
+      )}
 
       {error && <div className="error" role="alert">{error}</div>}
 
@@ -525,10 +584,15 @@ export default function ScanningLive({ stationId }) {
           )}
           <p>
             <strong>{n("processed")}</strong> scored, <strong>{n("flagged")}</strong> flagged ({toReview} still to review),{" "}
-            <strong>{n("rejected")}</strong> rejected, <strong>{n("failed")}</strong> failed.
+            <strong>{n("rejected")}</strong> rejected,{" "}
+            {unsaved > 0 && <><strong>{unsaved}</strong> couldn't be saved, </>}
+            <strong>{n("failed")}</strong> failed.
           </p>
           {needsAttention > 0 && (
-            <p>Flagged forms still to review and rejected sheets stay with this batch, so you can check them later on the review page.</p>
+            <p>
+              Flagged forms still to review, rejected sheets and pages that couldn't be saved stay with this batch, so you
+              can check them later on the review page.
+            </p>
           )}
           <p>Anything scanned after closing waits until the next batch is started.</p>
         </ConfirmDialog>

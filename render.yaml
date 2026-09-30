@@ -1,0 +1,87 @@
+# Render Blueprint for the iEvaluate batch-scanning API (FastAPI, backend/).
+# The React frontend is deployed separately on Vercel (frontend/, see SETUP.md).
+#
+# Values marked `sync: false` are secrets or per-deployment URLs: Render asks
+# for them when the Blueprint is first applied and never reads them from git.
+services:
+  - type: web
+    name: ievaluate-api
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    region: singapore
+    plan: starter
+    healthCheckPath: /health          # app/main.py: GET /health -> {"status": "ok"}
+    autoDeploy: true
+    envVars:
+      # --- secrets / URLs (set in the Render dashboard) ----------------------
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY           # secret key, backend only
+        sync: false
+      - key: N8N_BATCH_WEBHOOK_URL          # must be https:// (http:// is refused at start-up)
+        sync: false
+      - key: N8N_WEBHOOK_SECRET             # required whenever N8N_BATCH_WEBHOOK_URL is set
+        sync: false
+      - key: CORS_ORIGINS                   # the Vercel site, e.g. https://ievaluate-scan.vercel.app (no trailing slash)
+        sync: false
+      - key: WATCHER_API_BASE               # this service's public https URL (= the frontend's VITE_API_BASE)
+        sync: false
+      - key: PASSWORD_RESET_REDIRECT_URL    # e.g. https://ievaluate-scan.vercel.app/reset-password
+        sync: false
+      # Optional: leave empty to derive them from N8N_BATCH_WEBHOOK_URL
+      # (.../sast-batch-scan -> .../sast-manual-correction, .../import-error-correction).
+      - key: N8N_CORRECTION_WEBHOOK_URL
+        sync: false
+      - key: N8N_IMPORT_ERROR_WEBHOOK_URL
+        sync: false
+
+      # --- safe literal values -----------------------------------------------
+      - key: SIMULATE_SCANS
+        value: "false"
+      - key: CORS_ALLOW_LAN
+        value: "false"
+      # Rate limiting uses CF-Connecting-IP (Render sits behind Cloudflare), else
+      # the rightmost X-Forwarded-For entry (app/security.py client_ip).
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+      # Only makes uvicorn honour X-Forwarded-Proto so the app sees https://
+      # (request scheme / installer URL). "*" is safe here because the container
+      # is only reachable through Render's proxy, and client_ip() no longer
+      # trusts request.client (uvicorn would put the spoofable LEFTMOST
+      # X-Forwarded-For entry there) while TRUST_PROXY_HEADERS=true.
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"
+
+      # --- timeouts / limits (code defaults) ---------------------------------
+      - key: N8N_TIMEOUT_SECONDS
+        value: "360"
+      - key: N8N_CORRECTION_TIMEOUT_SECONDS
+        value: "180"
+      - key: MAX_PIPELINE_ATTEMPTS
+        value: "5"
+      - key: ABANDONED_BATCH_HOURS
+        value: "3"
+      - key: MAX_UPLOAD_MB
+        value: "12"
+      - key: INGEST_MAX_CONCURRENCY         # keep >= number of scanning laptops
+        value: "4"
+      - key: PREDATE_GRACE_SECONDS
+        value: "30"
+      - key: WATCHER_ONLINE_SECONDS
+        value: "90"
+      - key: PAD_FOR_OMR
+        value: "true"
+      - key: PAD_PERCENT
+        value: "5"
+      - key: CROP_LONG_BOND
+        value: "true"
+      # Page viewer pictures (migration 010, private Supabase Storage bucket).
+      - key: SCAN_IMAGE_BUCKET
+        value: scan-pages
+      - key: SCAN_IMAGE_RETENTION_DAYS
+        value: "90"
+      - key: SCAN_IMAGE_MAX_SIDE
+        value: "1800"
+      - key: SCAN_IMAGE_JPEG_QUALITY
+        value: "75"
