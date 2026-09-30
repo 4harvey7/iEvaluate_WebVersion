@@ -1,0 +1,174 @@
+--- a/mark_detect.py
++++ b/mark_detect.py
+@@ -48,6 +48,42 @@
+ Y_TOP_FRAC = 0.18
+ Y_BOT_FRAC = 0.06
+ 
++# PATCH (fix B): isolated ink specks are dropped after the rulings are
++# stripped. Sizes are in warped-table pixels (TABLE_W = 2048), so they do
++# not depend on the input resolution. On 22 flatbed scans dust specks scored
++# 0.004-0.010 ink - above BLANK_INK_RATIO and overlapping the faintest real
++# mark (0.008) - so no ink threshold could separate them, but their size does.
++#
++# Fragments are GROUPED before measuring: ink pieces within SPECK_GROUP_PX of
++# each other count as one blob, and a blob is kept if its overall extent
++# (longest side) is >= SPECK_MIN_PX. A faint pencil tick on a phone photo
++# binarizes as a chain of 4-11 px dashes; measured one fragment at a time
++# (the first version, 12 px, no grouping) those dashes were all deleted and
++# 4 real marks on 2 of 42 labelled phone photos read as blank. A dust speck
++# is isolated, so grouping does not rescue it.
++# Measured plateau (both sets at their best: scanner 438/440, phone 823/840):
++#   min 10 px with group 3-7 px, min 12 px with group 5-7 px.
++# Min 14+ px deletes real phone marks; group 8+ px lets a scanner speck back.
++# 10 / 5 is the middle of that plateau. Set SPECK_MIN_PX = 0 to disable.
++SPECK_MIN_PX = 10
++SPECK_GROUP_PX = 5
++
++
++def remove_specks(ink, min_px=SPECK_MIN_PX, group_px=SPECK_GROUP_PX):
++    """Drop ink blobs (fragments within group_px merged) shorter than min_px on their longest side."""
++    if ink is None or min_px <= 0:
++        return ink
++    grow = max(0, int(group_px))
++    grouped = cv2.dilate(ink, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8)) if grow else ink
++    n, lab, st, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
++    if n <= 1:
++        return ink
++    keep = np.zeros(n, bool)
++    # the dilation added `grow` px on every side; subtract it to get the group's real extent
++    extent = np.maximum(st[1:, cv2.CC_STAT_WIDTH], st[1:, cv2.CC_STAT_HEIGHT]) - 2 * grow
++    keep[1:] = extent >= min_px
++    return np.where((ink > 0) & keep[lab], 255, 0).astype(np.uint8)
++
+ 
+ def binarize_rating_block(gray, x_lo, x_hi):
+     """
+@@ -80,7 +116,7 @@
+ 
+     # Drop salt noise left behind by the ruling removal.
+     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+-    return ink
++    return remove_specks(ink)
+ 
+ 
+ def cell_scores(ink, x_lo, y1, y2, col_xs):
+--- a/utlis.py
++++ b/utlis.py
+@@ -290,6 +290,19 @@
+         if best is not None:
+             break
+ 
++    # PATCH (fix B): a handwritten stroke crossing the table border can
++    # (a) stop the border from closing as a 4-vertex contour at all, or
++    # (b) drag one corner of the quad far off the border. Both fed a skewed
++    # or missing table to the grid fit. Recover (a) from the extreme points
++    # of the largest table-sized contour, then square up one bad corner.
++    if best is None:
++        best = _table_quad_from_extremes(paper_img)
++        if best is not None:
++            print("[INFO] findTableContour: no 4-vertex table contour — using the "
++                  "extreme points of the largest table-sized contour.")
++    if best is not None:
++        best = _repair_table_quad(best)
++
+     if best is None:
+         print("[WARN] findTableContour: table rectangle not detected.")
+     else:
+@@ -303,6 +316,97 @@
+     return best
+ 
+ 
++# PATCH (fix B) — table-quad repair helpers used by findTableContour().
++# The printed table is a rectangle, but a phone photo whose page edge was
++# only roughly found leaves it as a genuine trapezoid (keystone), which the
++# perspective warp handles correctly and must NOT be "repaired". A corner
++# dragged off the border by ink is a much bigger distortion. Measured:
++#   phone photos (47)    : worst corner <= 2.8 deg, parallelogram residual <= 5.8% of table height
++#   crossed-border scan  : worst corner    8.1 deg, residual 21% of table height
++# Repair only when BOTH limits are exceeded, well clear of the phone range.
++TABLE_CORNER_TOL_DEG = 4.0
++TABLE_QUAD_MIN_RESIDUAL = 0.12   # |tl + br - tr - bl| / shorter side edge length
++
++
++def _quad_corner_errors(q):
++    """|angle - 90| in degrees at each corner of a reorder_corners() quad (tl, tr, bl, br)."""
++    tl, tr, bl, br = q
++    ring = [tl, tr, br, bl]
++    errs = []
++    for i in range(4):
++        p, a, b = ring[i], ring[i - 1], ring[(i + 1) % 4]
++        v1, v2 = a - p, b - p
++        c = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9))
++        errs.append(abs(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))) - 90.0))
++    return errs
++
++
++def _repair_table_quad(approx, tol_deg=TABLE_CORNER_TOL_DEG,
++                       min_residual=TABLE_QUAD_MIN_RESIDUAL):
++    """
++    If one corner is far off (worst corner angle >= tol_deg AND the
++    parallelogram residual >= min_residual of the table's side height),
++    rebuild each corner in turn as the parallelogram completion of the
++    other three and keep the most rectangular result — only if it is
++    better than the original. Anything milder is returned unchanged.
++    """
++    q = reorder_corners(approx)
++    worst = max(_quad_corner_errors(q))
++    tl, tr, bl, br = q
++    side_h = min(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)) + 1e-9
++    residual = float(np.linalg.norm(tl + br - tr - bl)) / side_h
++    if worst < tol_deg or residual < min_residual:
++        return approx
++    cands = [
++        (tr + bl - br, tr, bl, br),
++        (tl, tl + br - bl, bl, br),
++        (tl, tr, tl + br - tr, br),
++        (tl, tr, bl, tr + bl - tl),
++    ]
++    best = min(cands, key=lambda c: max(_quad_corner_errors(np.array(c))))
++    best_err = max(_quad_corner_errors(np.array(best)))
++    if best_err >= worst:
++        return approx
++    print(f"[INFO] findTableContour: repaired a skewed table corner "
++          f"({worst:.1f} -> {best_err:.1f} deg off square).")
++    return np.array(best, np.float32).reshape(4, 1, 2)
++
++
++def _table_quad_from_extremes(paper_img):
++    """
++    Fallback when no 4-vertex table contour exists: take the largest contour
++    whose bounding box passes the same size/position filters as
++    findTableContour() and use its extreme points (min/max of x+y and y-x)
++    as a rough quad; _repair_table_quad() then squares it up.
++    """
++    H, W = paper_img.shape[:2]
++    BORDER_MARGIN = 0.03
++    for lo, hi, dil in [(15, 75, 1), (10, 60, 2)]:
++        e = _edge_map(paper_img, lo, hi, dil)
++        cnts, _ = cv2.findContours(e, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
++        best, best_area = None, 0
++        for c in cnts:
++            x, y, w, h = cv2.boundingRect(c)
++            if w < W * 0.55 or h < H * 0.20 or h > H * 0.75:
++                continue
++            cy = y + h / 2.0
++            if cy < H * 0.25 or cy > H * 0.95:
++                continue
++            if (x <= W * BORDER_MARGIN or y <= H * BORDER_MARGIN or
++                    (x + w) >= W * (1 - BORDER_MARGIN) or
++                    (y + h) >= H * (1 - BORDER_MARGIN)):
++                continue
++            if w * h > best_area:
++                best_area, best = w * h, c
++        if best is not None:
++            pts = best.reshape(-1, 2).astype(np.float32)
++            s, d = pts.sum(axis=1), pts[:, 1] - pts[:, 0]
++            quad = np.array([pts[np.argmin(s)], pts[np.argmin(d)],
++                             pts[np.argmax(d)], pts[np.argmax(s)]], np.float32)
++            return quad.reshape(4, 1, 2)
++    return None
++
++
+ def warpTable(img, corners, target_w, target_h):
+     pts    = reorder_corners(corners).astype(np.float32)
+     dst    = np.float32([[0, 0], [target_w, 0], [0, target_h], [target_w, target_h]])

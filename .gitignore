@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node / build
+node_modules/
+dist/
+
+# Watcher runtime files (hold a station secret / local state)
+watcher_config.json
+watcher_state.db
+*.log
+*.log.*
+logs/

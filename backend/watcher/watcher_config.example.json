@@ -1,0 +1,5 @@
+{
+  "api_base": "https://your-backend.example.com",
+  "station_key": "PASTE-THE-STATION-KEY-SHOWN-ON-THE-WEBSITE",
+  "folder": "C:/Scans"
+}

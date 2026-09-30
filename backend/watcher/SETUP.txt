@@ -1,0 +1,4 @@
+This file was replaced.
+
+  End users:  see "HOW TO INSTALL.txt"
+  IT staff:   see "TECHNICAL NOTES.txt"

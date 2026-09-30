@@ -1,0 +1,579 @@
+--- a/utlis.py
++++ b/utlis.py
+@@ -290,6 +290,24 @@
+         if best is not None:
+             break
+ 
++    # PATCH (fix B): a handwritten stroke crossing the table border can
++    # (a) stop the border from closing as a 4-vertex contour at all, or
++    # (b) drag one corner of the quad far off the border. Both fed a skewed
++    # or missing table to the grid fit. Recover (a) from the extreme points
++    # of the largest table-sized contour, then square up one bad corner.
++    rough = False
++    if best is None:
++        best = _table_quad_from_extremes(paper_img)
++        rough = best is not None
++        if best is not None:
++            print("[INFO] findTableContour: no 4-vertex table contour — using the "
++                  "extreme points of the largest table-sized contour.")
++    if best is not None:
++        # PATCH (fix C): put the sides back on the border rulings first
++        # (see _snap_table_quad), then the fix-B one-corner repair.
++        best = _snap_table_quad(paper_img, best, rough=rough)
++        best = _repair_table_quad(best)
++
+     if best is None:
+         print("[WARN] findTableContour: table rectangle not detected.")
+     else:
+@@ -303,6 +321,291 @@
+     return best
+ 
+ 
++# PATCH (fix C) — snap the table quad onto the table's real border rulings.
++# findTableContour() takes the corners from approxPolyDP on a DILATED edge
++# map, so anything printed or written close to the border merges into the
++# contour and drags a corner. On short-bond flatbed scans the "Subject
++# Taught" underline ends right above the table's top-left corner and pulled
++# it up by ~40 px on 6 of 16 sheets (also on 2 of 42 phone photos); the
++# warped table came out sheared by a whole row across its width, the row
++# grid could not be fitted and those sheets read 3-8 of 20 rows correctly.
++# The corner-angle repair below cannot catch this: a 40 px drag is only
++# ~2 deg, the same as a phone photo's genuine keystone.
++#
++# What is always true is that each side of the table is a straight printed
++# ruling along (almost) the whole side. For each side we sample a darkness
++# profile across it at TR_SAMPLES points, keep the ruling-like peaks (darker
++# than both flanks by TR_PEAK_PROM grey levels), and vote for straight lines
++# (a small Hough over offset-at-start x offset-at-end).
++#   * If a well-supported line lies within tolerance of the contour side,
++#     the side is right and nothing moves (true for 34/38 scans and 40/42
++#     phone photos, which are therefore unchanged).
++#   * Otherwise the side moves onto the nearest line that is nearly as well
++#     supported as the best one - but only if that line is TILTED against
++#     the side (a dragged corner tilts its side; a far parallel line is an
++#     inner ruling, meaning the real border was just too faint to see).
++# Once a side moves, every fitted side is placed on its ruling (keeping the
++# contour's usual few-px outward margin) and the corners are re-intersected.
++# A rough quad from _table_quad_from_extremes() is searched wider and all
++# its sides are snapped.
++# Measured plateau (all three labelled sets unchanged): search 0.07-0.14 of
++# the table height, support 0.5-0.75, relative support 0.75-0.95, peak
++# prominence 14-30, move tolerance 0.008-0.012 of the table height.
++TR_SAMPLES = 48            # sample points per side
++TR_T_RANGE = (0.06, 0.94)  # skip the corners themselves (that is where a drag is)
++TR_SEARCH_FRAC = 0.07      # +/- search across a side, share of table height
++TR_ROUGH_SEARCH_FRAC = 0.20
++TR_STRIP_HALF = 6          # average +/- this many px along the side (noise)
++TR_HIT_TOL = 2.5           # px: a sample supports a line if a peak is this close
++TR_MIN_SUPPORT = 0.60      # share of samples that must lie on the line
++TR_SUPPORT_REL = 0.85      # ... and nearly as many as the best-supported line
++TR_MOVE_TOL_FRAC = 0.012   # a side "agrees" if both ends are within this share of height
++TR_PEAK_WIN = 8            # px either side used to measure a peak's prominence
++TR_PEAK_PROM = 20.0        # grey levels darker than both flanks
++
++
++def _tr_profiles(gray, p0, p1, D):
++    """Darkness profiles across side p0->p1: (TR_SAMPLES, 2D+1), plus sample ts."""
++    p0, p1 = np.float32(p0), np.float32(p1)
++    u = (p1 - p0) / (float(np.linalg.norm(p1 - p0)) + 1e-9)
++    n = np.float32([-u[1], u[0]])
++    ts = np.linspace(TR_T_RANGE[0], TR_T_RANGE[1], TR_SAMPLES).astype(np.float32)
++    offs = np.arange(-D, D + 1, dtype=np.float32)
++    along = np.arange(-TR_STRIP_HALF, TR_STRIP_HALF + 1, dtype=np.float32)
++    base = p0[None, :] + ts[:, None] * (p1 - p0)[None, :]
++    pts = (base[:, None, None, :] + offs[None, :, None, None] * n
++           + along[None, None, :, None] * u)
++    mx = pts[..., 0].reshape(TR_SAMPLES, -1).astype(np.float32)
++    my = pts[..., 1].reshape(TR_SAMPLES, -1).astype(np.float32)
++    vals = cv2.remap(gray, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
++    vals = vals.reshape(TR_SAMPLES, len(offs), len(along)).astype(np.float32)
++    return 255.0 - vals.mean(axis=2), ts
++
++
++def _tr_candidates(prof):
++    """Local darkness maxima darker than BOTH flanks by TR_PEAK_PROM."""
++    O = prof.shape[1]
++    w = TR_PEAK_WIN
++    pad = np.pad(prof, ((0, 0), (w, w)), mode="edge")
++    left = np.min(np.stack([pad[:, w - k:w - k + O] for k in range(1, w + 1)]), axis=0)
++    right = np.min(np.stack([pad[:, w + k:w + k + O] for k in range(1, w + 1)]), axis=0)
++    prom = prof - np.maximum(left, right)
++    c = np.zeros_like(prof, bool)
++    c[:, 1:-1] = ((prof[:, 1:-1] >= prof[:, :-2]) & (prof[:, 1:-1] > prof[:, 2:])
++                  & (prom[:, 1:-1] >= TR_PEAK_PROM))
++    return c
++
++
++def _tr_fit_side(gray, p0, p1, D, near_tol):
++    """
++    Straight ruling along side p0->p1. Returns (o0, o1, agrees) - the line's
++    offset along the side normal at t=0 and t=1, and whether the contour
++    side already sits on it - or None when no line is supported.
++    """
++    prof, ts = _tr_profiles(gray, p0, p1, D)
++    cand = _tr_candidates(prof)
++    tol = int(np.ceil(TR_HIT_TOL))
++    hit = cand.copy()
++    for k in range(1, tol + 1):
++        hit[:, k:] |= cand[:, :-k]
++        hit[:, :-k] |= cand[:, k:]
++    O = prof.shape[1]
++    grid = np.arange(-D, D + 1, dtype=np.float32)
++    A, B = np.meshgrid(grid, grid, indexing="ij")
++    pred = A[..., None] + (B - A)[..., None] * ts[None, None, :]
++    idx = np.rint(pred).astype(np.int32) + D
++    ok = (idx >= 0) & (idx < O)
++    np.clip(idx, 0, O - 1, out=idx)
++    support = (hit[np.arange(len(ts))[None, None, :], idx] & ok).sum(axis=2) / float(len(ts))
++    near = (np.abs(A) <= near_tol) & (np.abs(B) <= near_tol)
++    near_sup = np.where(near, support, 0.0)
++    agree = bool(near_sup.max() >= TR_MIN_SUPPORT)
++    if agree:
++        i, j = np.unravel_index(np.argmax(near_sup), near_sup.shape)
++    else:
++        good = support >= max(TR_MIN_SUPPORT, TR_SUPPORT_REL * support.max())
++        if not good.any():
++            return None
++        dist = np.abs(pred).mean(axis=2)
++        dist[~good] = np.inf
++        i, j = np.unravel_index(np.argmin(dist), dist.shape)
++    # best-supported line in that neighbourhood, then least squares on its peaks
++    i0, i1 = max(0, i - 4), min(len(grid), i + 5)
++    j0, j1 = max(0, j - 4), min(len(grid), j + 5)
++    sub = support[i0:i1, j0:j1]
++    di, dj = np.unravel_index(np.argmax(sub), sub.shape)
++    a, b = float(grid[i0 + di]), float(grid[j0 + dj])
++    tt, oo = [], []
++    for s, t in enumerate(ts):
++        o_pred = a + (b - a) * t
++        cs = np.where(cand[s])[0] - D
++        if cs.size:
++            k = int(np.argmin(np.abs(cs - o_pred)))
++            if abs(cs[k] - o_pred) <= TR_HIT_TOL:
++                tt.append(float(t))
++                oo.append(float(cs[k]))
++    if len(tt) >= 5:
++        m, c = np.polyfit(np.array(tt), np.array(oo), 1)
++        a, b = float(c), float(c + m)
++    return a, b, agree
++
++
++def _tr_line(p0, p1):
++    return np.cross([p0[0], p0[1], 1.0], [p1[0], p1[1], 1.0])
++
++
++def _tr_meet(l1, l2):
++    x = np.cross(l1, l2)
++    if abs(x[2]) < 1e-9:
++        return None
++    return np.float32([x[0] / x[2], x[1] / x[2]])
++
++
++def _snap_table_quad(paper_img, approx, rough=False):
++    """
++    Returns `approx` unchanged when every side sits on its ruling (or the
++    rulings cannot be found reliably); otherwise a (4,1,2) float32 quad with
++    the sides moved onto the table's border rulings.
++    """
++    gray = cv2.cvtColor(paper_img, cv2.COLOR_BGR2GRAY) if paper_img.ndim == 3 else paper_img
++    tl, tr, bl, br = [np.float32(p) for p in reorder_corners(approx)]
++    th = 0.5 * (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr))
++    D = max(12, int(round((TR_ROUGH_SEARCH_FRAC if rough else TR_SEARCH_FRAC) * th)))
++    near_tol = max(4.0, TR_MOVE_TOL_FRAC * th)
++    centre = (tl + tr + bl + br) / 4.0
++    sides = {"top": (tl, tr), "bottom": (bl, br), "left": (tl, bl), "right": (tr, br)}
++    fits = {}
++    for name, (p0, p1) in sides.items():
++        f = _tr_fit_side(gray, p0, p1, D, near_tol)
++        if f is None:
++            continue
++        d = p1 - p0
++        nrm = np.float32([-d[1], d[0]]) / (np.linalg.norm(d) + 1e-9)
++        sgn = 1.0 if np.dot((p0 + p1) / 2.0 - centre, nrm) > 0 else -1.0   # + = outward
++        fits[name] = (f[0] * sgn, f[1] * sgn, nrm * sgn, f[2])
++    if len(fits) < 3:
++        return approx
++    agreeing = [k for k in fits if fits[k][3]]
++    # the contour runs a few px outside the ruling (dilated edges); keep that margin
++    margin = float(np.median([-v for k in agreeing for v in fits[k][:2]])) if agreeing else 0.0
++    if rough:
++        moved_sides = list(fits)
++    else:
++        moved_sides = [k for k in fits
++                       if not fits[k][3] and abs(fits[k][0] - fits[k][1]) > near_tol]
++    if not moved_sides:
++        return approx
++    lines = {}
++    for name, (p0, p1) in sides.items():
++        if name in fits:
++            a, b, nrm, _ = fits[name]
++            lines[name] = _tr_line(p0 + nrm * (a + margin), p1 + nrm * (b + margin))
++        else:
++            lines[name] = _tr_line(p0, p1)
++    corners = [_tr_meet(lines["top"], lines["left"]), _tr_meet(lines["top"], lines["right"]),
++               _tr_meet(lines["bottom"], lines["left"]), _tr_meet(lines["bottom"], lines["right"])]
++    if any(c is None for c in corners):
++        return approx
++    out = np.float32(corners)
++    moved = float(np.max(np.linalg.norm(out - np.float32([tl, tr, bl, br]), axis=1)))
++    if moved > 2.5 * D:
++        return approx
++    print(f"[INFO] findTableContour: snapped table side(s) {', '.join(moved_sides)} onto the "
++          f"border ruling (corner moved up to {moved:.0f} px).")
++    return out.reshape(4, 1, 2)
++
++
++# PATCH (fix B) — table-quad repair helpers used by findTableContour().
++# The printed table is a rectangle, but a phone photo whose page edge was
++# only roughly found leaves it as a genuine trapezoid (keystone), which the
++# perspective warp handles correctly and must NOT be "repaired". A corner
++# dragged off the border by ink is a much bigger distortion. Measured:
++#   phone photos (47)    : worst corner <= 2.8 deg, parallelogram residual <= 5.8% of table height
++#   crossed-border scan  : worst corner    8.1 deg, residual 21% of table height
++# Repair only when BOTH limits are exceeded, well clear of the phone range.
++TABLE_CORNER_TOL_DEG = 4.0
++TABLE_QUAD_MIN_RESIDUAL = 0.12   # |tl + br - tr - bl| / shorter side edge length
++
++
++def _quad_corner_errors(q):
++    """|angle - 90| in degrees at each corner of a reorder_corners() quad (tl, tr, bl, br)."""
++    tl, tr, bl, br = q
++    ring = [tl, tr, br, bl]
++    errs = []
++    for i in range(4):
++        p, a, b = ring[i], ring[i - 1], ring[(i + 1) % 4]
++        v1, v2 = a - p, b - p
++        c = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9))
++        errs.append(abs(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))) - 90.0))
++    return errs
++
++
++def _repair_table_quad(approx, tol_deg=TABLE_CORNER_TOL_DEG,
++                       min_residual=TABLE_QUAD_MIN_RESIDUAL):
++    """
++    If one corner is far off (worst corner angle >= tol_deg AND the
++    parallelogram residual >= min_residual of the table's side height),
++    rebuild each corner in turn as the parallelogram completion of the
++    other three and keep the most rectangular result — only if it is
++    better than the original. Anything milder is returned unchanged.
++    """
++    q = reorder_corners(approx)
++    worst = max(_quad_corner_errors(q))
++    tl, tr, bl, br = q
++    side_h = min(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)) + 1e-9
++    residual = float(np.linalg.norm(tl + br - tr - bl)) / side_h
++    if worst < tol_deg or residual < min_residual:
++        return approx
++    cands = [
++        (tr + bl - br, tr, bl, br),
++        (tl, tl + br - bl, bl, br),
++        (tl, tr, tl + br - tr, br),
++        (tl, tr, bl, tr + bl - tl),
++    ]
++    best = min(cands, key=lambda c: max(_quad_corner_errors(np.array(c))))
++    best_err = max(_quad_corner_errors(np.array(best)))
++    if best_err >= worst:
++        return approx
++    print(f"[INFO] findTableContour: repaired a skewed table corner "
++          f"({worst:.1f} -> {best_err:.1f} deg off square).")
++    return np.array(best, np.float32).reshape(4, 1, 2)
++
++
++def _table_quad_from_extremes(paper_img):
++    """
++    Fallback when no 4-vertex table contour exists: take the largest contour
++    whose bounding box passes the same size/position filters as
++    findTableContour() and use its extreme points (min/max of x+y and y-x)
++    as a rough quad; _repair_table_quad() then squares it up.
++    """
++    H, W = paper_img.shape[:2]
++    BORDER_MARGIN = 0.03
++    for lo, hi, dil in [(15, 75, 1), (10, 60, 2)]:
++        e = _edge_map(paper_img, lo, hi, dil)
++        cnts, _ = cv2.findContours(e, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
++        best, best_area = None, 0
++        for c in cnts:
++            x, y, w, h = cv2.boundingRect(c)
++            if w < W * 0.55 or h < H * 0.20 or h > H * 0.75:
++                continue
++            cy = y + h / 2.0
++            if cy < H * 0.25 or cy > H * 0.95:
++                continue
++            if (x <= W * BORDER_MARGIN or y <= H * BORDER_MARGIN or
++                    (x + w) >= W * (1 - BORDER_MARGIN) or
++                    (y + h) >= H * (1 - BORDER_MARGIN)):
++                continue
++            if w * h > best_area:
++                best_area, best = w * h, c
++        if best is not None:
++            pts = best.reshape(-1, 2).astype(np.float32)
++            s, d = pts.sum(axis=1), pts[:, 1] - pts[:, 0]
++            quad = np.array([pts[np.argmin(s)], pts[np.argmin(d)],
++                             pts[np.argmax(d)], pts[np.argmax(s)]], np.float32)
++            return quad.reshape(4, 1, 2)
++    return None
++
++
+ def warpTable(img, corners, target_w, target_h):
+     pts    = reorder_corners(corners).astype(np.float32)
+     dst    = np.float32([[0, 0], [target_w, 0], [0, target_h], [target_w, target_h]])
+--- a/mark_detect.py
++++ b/mark_detect.py
+@@ -48,6 +48,100 @@
+ Y_TOP_FRAC = 0.18
+ Y_BOT_FRAC = 0.06
+ 
++# PATCH (fix B): isolated ink specks are dropped after the rulings are
++# stripped. Sizes are in warped-table pixels (TABLE_W = 2048), so they do
++# not depend on the input resolution. On 22 flatbed scans dust specks scored
++# 0.004-0.010 ink - above BLANK_INK_RATIO and overlapping the faintest real
++# mark (0.008) - so no ink threshold could separate them, but their size does.
++#
++# Fragments are GROUPED before measuring: ink pieces within SPECK_GROUP_PX of
++# each other count as one blob, and a blob is kept if its overall extent
++# (longest side) is >= SPECK_MIN_PX. A faint pencil tick on a phone photo
++# binarizes as a chain of 4-11 px dashes; measured one fragment at a time
++# (the first version, 12 px, no grouping) those dashes were all deleted and
++# 4 real marks on 2 of 42 labelled phone photos read as blank. A dust speck
++# is isolated, so grouping does not rescue it.
++# Measured plateau (both sets at their best: scanner 438/440, phone 823/840):
++#   min 10 px with group 3-7 px, min 12 px with group 5-7 px.
++# Min 14+ px deletes real phone marks; group 8+ px lets a scanner speck back.
++# 10 / 5 is the middle of that plateau. Set SPECK_MIN_PX = 0 to disable.
++SPECK_MIN_PX = 10
++SPECK_GROUP_PX = 5
++
++
++def remove_specks(ink, min_px=SPECK_MIN_PX, group_px=SPECK_GROUP_PX):
++    """Drop ink blobs (fragments within group_px merged) shorter than min_px on their longest side."""
++    if ink is None or min_px <= 0:
++        return ink
++    grow = max(0, int(group_px))
++    grouped = cv2.dilate(ink, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8)) if grow else ink
++    n, lab, st, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
++    if n <= 1:
++        return ink
++    keep = np.zeros(n, bool)
++    # the dilation added `grow` px on every side; subtract it to get the group's real extent
++    extent = np.maximum(st[1:, cv2.CC_STAT_WIDTH], st[1:, cv2.CC_STAT_HEIGHT]) - 2 * grow
++    keep[1:] = extent >= min_px
++    return np.where((ink > 0) & keep[lab], 255, 0).astype(np.uint8)
++
++
++# PATCH (fix C): show-through / faint-ink filter.
++# Short-bond flatbed scans show the printed text of the sheet's back side
++# through the paper. The adaptive threshold turned that mirror-image text
++# into "ink" in every cell it crossed (up to 0.25 of a cell), which made the
++# argmax pick a random column: 0/16 short-bond sheets were read fully
++# correctly. Show-through is faint: measured against the local paper level
++# its darkest pixels reach at most ~1/3 of the contrast of the printed
++# rulings on the same sheet, while a pen or pencil mark reaches about as
++# dark as the rulings. The test is relative to the sheet's own ruling
++# contrast (so exposure and phone shading cancel out): a blob (fragments
++# within FAINT_GROUP_PX merged) is kept only if its darkest decile reaches
++# FAINT_REL x ruling contrast. Kept blobs keep ALL their pixels, so real
++# marks score exactly as before and the omr_debug scores keep the scale the
++# n8n reconcilers' absolute weak-row threshold (top score < 0.05) expects.
++# FAINT_PX_REL > 0 additionally drops single pixels fainter than that share
++# of the ruling contrast; it is OFF because it trims the anti-aliased edges
++# of every stroke (median tick score 0.077 -> 0.063 on long-bond scans, which
++# made the reconcilers flag correct forms as low-confidence) for no
++# accuracy gain. Measured plateau (FAINT_PX_REL 0): FAINT_REL 0.35-0.5,
++# FAINT_GROUP_PX 0-2. Below 0.35 show-through comes back. Set FAINT_REL = 0
++# to disable.
++FAINT_REL = 0.4
++FAINT_PX_REL = 0.0
++FAINT_GROUP_PX = 2
++PAPER_WIN_PX = 25       # local paper level = grey dilation over this window
++
++
++def remove_faint(ink, block, ruling_px, rel=FAINT_REL, px_rel=FAINT_PX_REL,
++                 group_px=FAINT_GROUP_PX):
++    """Drop ink much fainter than the printed rulings (show-through, shadows)."""
++    if ink is None or rel <= 0 or not ruling_px.any():
++        return ink
++    k = cv2.getStructuringElement(cv2.MORPH_RECT, (PAPER_WIN_PX, PAPER_WIN_PX))
++    paper = cv2.blur(cv2.dilate(block, k), (PAPER_WIN_PX, PAPER_WIN_PX))
++    contrast = np.clip(paper.astype(np.int16) - block.astype(np.int16), 0, 255).astype(np.float32)
++    rul_c = float(np.median(contrast[ruling_px]))
++    if rul_c < 10:          # no usable ruling contrast: leave the ink alone
++        return ink
++    if px_rel > 0:
++        ink = np.where((ink > 0) & (contrast >= px_rel * rul_c), 255, 0).astype(np.uint8)
++    grow = max(0, int(group_px))
++    grouped = cv2.dilate(ink, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8)) if grow else ink
++    n, lab, _, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
++    if n <= 1:
++        return ink
++    on = ink > 0
++    labs, vals = lab[on], contrast[on]
++    order = np.argsort(labs, kind="stable")
++    labs_s, vals_s = labs[order], vals[order]
++    bounds = np.searchsorted(labs_s, np.arange(n + 1))
++    keep = np.zeros(n, bool)
++    for i in range(1, n):
++        v = vals_s[bounds[i]:bounds[i + 1]]
++        if v.size:
++            keep[i] = np.percentile(v, 90) >= rel * rul_c
++    return np.where(on & keep[lab], 255, 0).astype(np.uint8)
++
+ 
+ def binarize_rating_block(gray, x_lo, x_hi):
+     """
+@@ -56,6 +150,12 @@
+     Returns an ink mask (255 = ink) the same height as `gray` and
+     (x_hi - x_lo) wide, so callers index it with x - x_lo.
+     """
++    out = _binarize(gray, x_lo, x_hi)
++    return None if out is None else out[0]
++
++
++def _binarize(gray, x_lo, x_hi):
++    """binarize_rating_block() plus the (dilated) ruling mask it removed."""
+     block = gray[:, x_lo:x_hi]
+     if block.size == 0:
+         return None
+@@ -75,12 +175,59 @@
+     vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, bh // 12)))
+     rulings = cv2.bitwise_or(cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk),
+                              cv2.morphologyEx(bw, cv2.MORPH_OPEN, vk))
++    ruling_px = rulings > 0
+     rulings = cv2.dilate(rulings, np.ones((3, 3), np.uint8), iterations=1)
+     ink = cv2.bitwise_and(bw, cv2.bitwise_not(rulings))
+ 
+     # Drop salt noise left behind by the ruling removal.
+     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+-    return ink
++    ink = remove_specks(ink)
++    return remove_faint(ink, block, ruling_px), rulings
++
++
++# PATCH (fix C): spill-over of a mark into the neighbouring row.
++# A tick drawn across a row ruling leaves a short tail in the next row
++# (one labelled scanner sheet read a blank row as "S" from such a tail).
++# Ruling removal cuts the stroke at the ruling, so the pieces are re-joined
++# first - growing the ink by BRIDGE_PX, but only inside a band around the
++# removed rulings, so separate marks elsewhere never merge. Each joined
++# stroke then keeps only the rows holding at least LEAK_FRAC of its largest
++# per-row share. Deliberately conservative: two marks that touch across a
++# ruling are usually of similar size and both stay.
++# Measured plateau: LEAK_FRAC 0.25-0.35, BRIDGE_PX 4-8 (0.15 lets one spill
++# tail through again; 0.4+ starts eating
++# small real marks that touch a neighbour's mark on phone photos).
++LEAK_FRAC = 0.25
++BRIDGE_PX = 6
++
++
++def attribute_to_rows(ink, rulings, row_y1s, row_y2s, frac=LEAK_FRAC, bridge=BRIDGE_PX):
++    """Remove each stroke's small spill-over into neighbouring rows."""
++    if frac <= 0 or ink is None:
++        return ink
++    h = ink.shape[0]
++    grown = cv2.dilate(ink, cv2.getStructuringElement(
++        cv2.MORPH_ELLIPSE, (2 * bridge + 1, 2 * bridge + 1)))
++    band = cv2.dilate(rulings, np.ones((7, 7), np.uint8)) > 0
++    joined = np.where((ink > 0) | ((grown > 0) & band), 255, 0).astype(np.uint8)
++    n, lab, _, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
++    if n <= 1:
++        return ink
++    row_of = np.full(h, -1, int)
++    for r, (a, b) in enumerate(zip(row_y1s, row_y2s)):
++        row_of[max(0, int(a)):min(h, int(b))] = r
++    ys, xs = np.nonzero(ink > 0)
++    rr = row_of[ys]
++    ll = lab[ys, xs]
++    sel = rr >= 0
++    mass = np.zeros((n, len(row_y1s)), np.int64)
++    np.add.at(mass, (ll[sel], rr[sel]), 1)
++    keep = mass >= frac * np.maximum(mass.max(axis=1, keepdims=True), 1)
++    drop = sel.copy()
++    drop[sel] = ~keep[ll[sel], rr[sel]]
++    out = ink.copy()
++    out[ys[drop], xs[drop]] = 0
++    return out
+ 
+ 
+ def cell_scores(ink, x_lo, y1, y2, col_xs):
+@@ -102,21 +249,78 @@
+     return out
+ 
+ 
++# PATCH (fix C): second look at rows that read blank.
++# Raters often draw the tick ON a row ruling, so it lands in the trimmed
++# top/bottom strip of its own cell or just across the ruling, in the strip
++# of the neighbouring row that Y_TOP_FRAC trims away. For a row that read
++# blank only, count its whole band plus RESCUE_Z row-heights beyond each
++# ruling - in a neighbour's strip only ink OUTSIDE the column that
++# neighbour chose (that ink is the neighbour's own mark) - and accept the
++# best column if it reaches RESCUE_MIN. Never looks across a section edge
++# (the column headers and section titles live there). Rows that already
++# have a mark are never changed. Measured plateau: RESCUE_Z 0.25-0.5,
++# RESCUE_MIN 0.004-0.006; no labelled blank row was turned into a mark.
++# Rescued rows report the rescue scores, which are small, so the n8n
++# reconcilers see them as weak rows. Set RESCUE_Z = 0 to disable.
++RESCUE_Z = 0.35
++RESCUE_MIN = 0.006
++ROWS_PER_SECTION = 10
++
++
++def rescue_scores(ink, x_lo, y1s, y2s, col_xs, i, best_c, z=RESCUE_Z):
++    """Scores for blank row i from its whole band plus the neighbours' near strips."""
++    h = ink.shape[0]
++    y1, y2 = int(y1s[i]), int(y2s[i])
++    rh = y2 - y1
++    if rh < 4:
++        return None
++    first = i % ROWS_PER_SECTION == 0
++    last = i % ROWS_PER_SECTION == ROWS_PER_SECTION - 1
++    ext = int(round(z * rh))
++    parts = [(y1, y2, None)]
++    if not first and i - 1 >= 0:
++        parts.append((max(0, y1 - ext), y1, best_c[i - 1]))
++    if not last and i + 1 < len(y1s):
++        parts.append((y2, min(h, y2 + ext), best_c[i + 1]))
++    out = []
++    for c in range(len(col_xs) - 1):
++        a, b = int(col_xs[c]) - x_lo, int(col_xs[c + 1]) - x_lo
++        mx = max(2, int((b - a) * X_MARGIN_FRAC))
++        cnt = 0
++        for ya, yb, nb in parts:
++            if nb is not None and nb == c:
++                continue
++            cnt += int((ink[ya:yb, a + mx:b - mx] > 0).sum())
++        out.append(cnt / float(max(1, rh * (b - a - 2 * mx))))
++    return out
++
++
+ def read_rows(gray, row_y1s, row_y2s, col_xs, rating_names,
+               blank_ink_ratio=BLANK_INK_RATIO, return_scores=False):
+     """
+     Read all rows at once. Returns a list of rating names (or "blank").
+     """
+     x_lo, x_hi = int(col_xs[0]), int(col_xs[-1])
+-    ink = binarize_rating_block(gray, x_lo, x_hi)
+-    if ink is None:
++    b = _binarize(gray, x_lo, x_hi)
++    if b is None:
+         res = ['blank'] * len(row_y1s)
+         return (res, []) if return_scores else res
++    ink = attribute_to_rows(b[0], b[1], row_y1s, row_y2s)
+ 
+-    names, all_scores = [], []
++    names, all_scores, best_c = [], [], []
+     for y1, y2 in zip(row_y1s, row_y2s):
+         s = cell_scores(ink, x_lo, y1, y2, col_xs)
+         all_scores.append(s)
+         best = int(np.argmax(s))
+-        names.append(rating_names[best] if s[best] >= blank_ink_ratio else 'blank')
++        ok = s[best] >= blank_ink_ratio
++        best_c.append(best if ok else -1)
++        names.append(rating_names[best] if ok else 'blank')
++    if RESCUE_Z > 0:
++        for i in range(len(row_y1s)):
++            if best_c[i] >= 0:
++                continue
++            s = rescue_scores(ink, x_lo, row_y1s, row_y2s, col_xs, i, best_c)
++            if s is not None and max(s) >= RESCUE_MIN:
++                all_scores[i] = s
++                names[i] = rating_names[int(np.argmax(s))]
+     return (names, all_scores) if return_scores else names

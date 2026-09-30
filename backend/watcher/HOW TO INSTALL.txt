@@ -1,0 +1,128 @@
+HOW TO INSTALL THE SCAN WATCHER
+===============================
+
+The Scan Watcher sends your scans to the website by itself.
+You set it up once on each scanner laptop. It takes about 5 minutes.
+
+
+STEP 1 - Get the installer
+    On the website, open "Scanner setup".
+    Choose your scanner station.
+    Click "Download installer".
+
+STEP 2 - Unpack it
+    Open your Downloads folder.
+    Right-click the ScanWatcher file.
+    Click "Extract All".
+    Click "Extract".
+    A new window opens.
+
+STEP 3 - Start the installer
+    In the new window, double-click the "ScanWatcher" folder.
+    Double-click "INSTALL".
+    A blue window opens.
+    If you see "Windows protected your PC":
+        click "More info", then click "Run anyway".
+    If you see "Open File - Security Warning":
+        click "Run".
+    If you see "Do you want to allow this app to make changes":
+        click "Yes".
+
+STEP 4 - Wait
+    Do not type anything. Just wait.
+    The window turns green and says "ALL DONE".
+    Close the window.
+
+STEP 5 - Set up your scanner
+    Open your scanner program.
+    Look for "Save to", "Destination" or "Folder".
+    Choose  C:\Scans
+    (Type it like this: C, colon, backslash, Scans.)
+
+STEP 6 - Look at the website
+    Open "Scanner setup" again.
+    The light should be green. It says "Online".
+
+That's it! Keep the laptop on and connected to the internet.
+
+
+HOW DO I KNOW IT WORKS?
+-----------------------
+    1. On the website, start a batch for this scanner station.
+    2. Scan one page.
+    3. Wait one minute.
+    4. The page shows up on the website.
+    Yes? Great, it works.
+
+
+SOMETHING WENT WRONG?
+---------------------
+If you see ...                           Do this ...
+
+The light is red ("Offline")         ->  Turn the laptop on. Connect it to
+                                         the internet. Wait 1 minute.
+                                         Still red? Restart the laptop.
+
+"Folder not found"                   ->  Check the folder on the website.
+                                         Change it to C:\Scans. Wait 1 minute.
+
+"That folder isn't allowed"          ->  The folder is too big (like the
+                                         whole Desktop). On the website,
+                                         change it to C:\Scans.
+
+The black or blue window closes      ->  Right-click the ScanWatcher file.
+right away                               Click "Extract All" first. Then
+                                         double-click INSTALL in the new
+                                         folder.
+
+The window says "STOP" or is red     ->  Read the numbered lines in the
+                                         window and do them.
+
+"no internet"                        ->  Connect the laptop to the internet.
+                                         Double-click INSTALL again.
+
+The window asks you to install       ->  Do the numbered steps in the window.
+a helper program                         Then double-click INSTALL again.
+
+Scans do not show up                 ->  Your scanner saves somewhere else.
+                                         Open the scanner program. Set the
+                                         save folder to C:\Scans.
+
+The page shows up in                 ->  It was scanned before the batch
+"skipped\before-batch"                   was started. On the website, open
+                                         the batch and add these pages to
+                                         it. Or scan the page again.
+
+Other pages in "skipped"             ->  The page could not be used.
+                                         Scan the page again.
+
+Not sure?                            ->  Double-click "CHECK" in the
+                                         ScanWatcher folder. It tells you
+                                         what is wrong.
+
+
+HOW TO CHANGE THE SCAN FOLDER
+-----------------------------
+    You do not need to touch the laptop.
+    1. On the website, open "Scanner setup".
+    2. Change the folder and save.
+    3. Wait 30 seconds. The laptop switches by itself.
+    4. Set your scanner to save into the new folder.
+
+
+MOVING TO A NEW LAPTOP
+----------------------
+    1. On the NEW laptop, do Steps 1 to 6 again.
+    2. The OLD laptop stops sending scans. That is normal.
+    Only download the installer again for a new or replaced laptop.
+    Every new download stops the old one.
+
+
+TO REMOVE IT
+------------
+    Double-click "UNINSTALL" in the ScanWatcher folder.
+    Your scans are NOT deleted.
+
+
+Please keep the ScanWatcher folder. You need CHECK and UNINSTALL later.
+Do not share the ScanWatcher file. It has this laptop's secret key.
