@@ -208,7 +208,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : 'n/a');
         if (!isPhone) {
           const wb = Q.filter((q, i) => pyLetters[i] !== null && weak.has(i) && (t[i] === null)).length;
           const wbReason = out.review_reasons.find((x) => x.startsWith('python_weak_gemini_blank_'));
-          check(wb ? wbReason === `python_weak_gemini_blank_${wb}_rows` : !wbReason, `omr_debug weak/gemini-blank rows (${wb})`);
+          check(wb >= 3 ? wbReason === `python_weak_gemini_blank_${wb}_rows` : !wbReason, `omr_debug weak/gemini-blank rows (${wb})`);   // WEAK_BLANK_LIMIT = 3
         }
         const outBlank = await reconcile(isPhone, py, gemini(t, { blankText: true }));
         const instr = isPhone ? outBlank.instructor : outBlank.ocr_instructor;

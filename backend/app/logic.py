@@ -428,6 +428,9 @@ def retries_exhausted(attempts: int | None, max_attempts: int) -> bool:
 PIPELINE_NOT_CONFIGURED_MSG = "Scoring pipeline not configured."
 PIPELINE_MISCONFIGURED_MSG = "Scoring pipeline rejected the server's credentials (configuration error)."
 PIPELINE_REJECTED_MSG = "Rejected by pipeline (invalid request); the file was set aside."
+# n8n didn't answer in time / couldn't be reached. Retried; counts toward the cap.
+PIPELINE_TIMEOUT_MSG = "Scoring pipeline timed out."
+PIPELINE_UNAVAILABLE_MSG = "Scoring pipeline is unavailable."
 # Automatic tries used up, but a copy is kept for the review page (app/unsaved_pages.py).
 UNSAVED_REVIEW_MSG = "Not saved by marking; waiting on the review page."
 
@@ -436,6 +439,8 @@ ITEM_ERROR_CODES = (
     "pipeline_not_configured",    # marking is switched off on the server; retried automatically
     "pipeline_misconfigured",     # server's n8n secret rejected; retried automatically
     "pipeline_error",             # n8n failed / bad reply / not saved; retried automatically
+    "pipeline_timeout",           # n8n took too long to answer; retried automatically
+    "pipeline_unavailable",       # n8n couldn't be reached; retried automatically
     "not_saved_needs_review",     # gave up automatically; a copy waits on the review page (Try again / Type in the answers)
     "failed_after_retries",       # gave up after MAX_PIPELINE_ATTEMPTS; file set aside, rescan
     "pipeline_rejected_request",  # n8n refused the request; file set aside, rescan
@@ -458,4 +463,8 @@ def item_error_code(item: dict) -> str | None:
         return "pipeline_not_configured"
     if msg.startswith(PIPELINE_MISCONFIGURED_MSG):
         return "pipeline_misconfigured"
+    if msg.startswith(PIPELINE_TIMEOUT_MSG):
+        return "pipeline_timeout"
+    if msg.startswith(PIPELINE_UNAVAILABLE_MSG):
+        return "pipeline_unavailable"
     return "pipeline_error"

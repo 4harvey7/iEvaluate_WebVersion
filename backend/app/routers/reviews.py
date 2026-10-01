@@ -540,6 +540,181 @@ def list_batch_reviews(batch_id: str, since: str | None = Query(default=None, ma
     }
 
 
+# ------------------------------------------------------------------ past batches list (/review)
+LIST_BATCH_COLUMNS = f"{BATCH_COLUMNS}, closed_at"
+MAX_PENDING_ROWS = 5000   # pending rows read per request (all batches together)
+MAX_TOP_BATCHES = 200     # batches with work (or still open) shown above the history
+ID_CHUNK = 100            # ids per in_() filter (URL length)
+
+
+def _review_columns_ready(sb) -> bool:
+    """Migration 005 applied? One tiny probe, skipped for 5 minutes after a miss."""
+    if not migration_available():
+        return False
+    try:
+        sb.table(FSQ).select("id, review_version").limit(1).execute()
+    except APIError as e:
+        if not rl.is_missing_review_column(e):
+            raise
+        mark_migration_missing(e)
+        return False
+    mark_migration_present()
+    return True
+
+
+def _pending_work(sb) -> dict:
+    """Everything still waiting for a person, grouped by batch, in 3 queries
+    (same rules as list_batch_reviews): Needs review (pending queue rows + who
+    scanned them), Import errors (distinct pending web:<batch>: task_ids),
+    Couldn't be saved (needs_review/sending, migration 008)."""
+    queue: dict[str, list[str]] = {}
+    for r in (sb.table(FSQ).select("batch_id, user_id").eq("status", rl.QUEUE_PENDING)
+              .limit(MAX_PENDING_ROWS).execute().data or []):
+        if r.get("batch_id"):
+            queue.setdefault(str(r["batch_id"]).lower(), []).append(str(r.get("user_id") or ""))
+    imports: dict[str, set[str]] = {}
+    for r in (sb.table(IE).select("task_id").like("task_id", "web:%").eq("status", rl.IMPORT_PENDING)
+              .limit(MAX_PENDING_ROWS).execute().data or []):
+        bid = rl.batch_id_from_task(r.get("task_id"))
+        if bid:
+            imports.setdefault(bid, set()).add(str(r["task_id"]))
+    unsaved: dict[str, int] = {}
+    ready = uv.available()
+    if ready:
+        try:
+            rows = (sb.table(uv.TABLE).select("batch_id").in_("status", [uv.NEEDS_REVIEW, uv.SENDING])
+                    .limit(MAX_PENDING_ROWS).execute().data or [])
+        except APIError as e:
+            if not uv.is_missing_table_error(e):
+                raise
+            uv.mark_missing(e)
+            rows, ready = [], False
+        else:
+            uv.mark_present()
+        for r in rows:
+            if r.get("batch_id"):
+                bid = str(r["batch_id"]).lower()
+                unsaved[bid] = unsaved.get(bid, 0) + 1
+    return {"queue": queue, "imports": imports, "unsaved": unsaved, "unsaved_ready": ready}
+
+
+def _visible_counts(sb, batch: dict, user: CurrentUser, work: dict) -> tuple[str, dict] | None:
+    """The review page's own rule: 'full' (admin / started it) or 'own' (only
+    their own pending Needs review rows). None = they couldn't open it."""
+    bid = str(batch["id"]).lower()
+    users = work["queue"].get(bid, [])
+    if _has_batch_access(sb, batch, user):
+        return "full", {"queue_pending": len(users), "import_pending": len(work["imports"].get(bid, ())),
+                        "unsaved_pending": work["unsaved"].get(bid, 0)}
+    own = sum(1 for u in users if u == user.id)
+    return ("own", {"queue_pending": own, "import_pending": 0, "unsaved_pending": 0}) if own else None
+
+
+def _batches_by_id(sb, ids: list[str]) -> list[dict]:
+    out: list[dict] = []
+    for i in range(0, len(ids), ID_CHUNK):
+        out += sb.table("scan_batches").select(LIST_BATCH_COLUMNS).in_("id", ids[i:i + ID_CHUNK]).execute().data or []
+    return out
+
+
+def _names_for_batches(sb, batches: list[dict]) -> dict:
+    """Instructor, starter, subject, term and laptop names of many batches in <= 4 queries."""
+    def ids(*keys):
+        return sorted({str(b[k]) for b in batches for k in keys if b.get(k)})
+
+    def rows(table, cols, wanted):
+        out = {}
+        for i in range(0, len(wanted), ID_CHUNK):
+            for r in sb.table(table).select(cols).in_("id", wanted[i:i + ID_CHUNK]).execute().data or []:
+                out[str(r["id"])] = r
+        return out
+
+    return {"people": rows("user_info", "id, first_name, last_name", ids("instructor_id", "created_by")),
+            "subjects": rows("subjects", "id, subject_code, subject_name", ids("subject_id")),
+            "terms": rows("academic_terms", "id, semester, academic_year", ids("term_id")),
+            "stations": rows("stations", "id, label", ids("station_id"))}
+
+
+def _person_name(names: dict, pid) -> str | None:
+    return (rl.full_name(names["people"].get(str(pid))) or None) if pid else None
+
+
+def _serialize_list_batch(b: dict, access: str, counts: dict, names: dict) -> dict:
+    subj = names["subjects"].get(str(b.get("subject_id")), {})
+    term = names["terms"].get(str(b.get("term_id")), {})
+    return {
+        "id": b["id"], "status": b.get("status"), "created_at": b.get("created_at"),
+        "closed_at": b.get("closed_at"), "access": access,
+        "instructor": {"id": b.get("instructor_id"), "name": _person_name(names, b.get("instructor_id"))},
+        "subject": {"id": b.get("subject_id"), "code": subj.get("subject_code"), "name": subj.get("subject_name")},
+        "term": {"id": b.get("term_id"),
+                 "label": f"{term.get('semester') or ''} {term.get('academic_year') or ''}".strip() or None},
+        "station": {"id": b.get("station_id"),
+                    "label": names["stations"].get(str(b.get("station_id")), {}).get("label")},
+        "started_by": {"id": b.get("created_by"), "name": _person_name(names, b.get("created_by"))},
+        "counts": counts,
+        "to_review": sum(counts.values()),
+    }
+
+
+@router.get("/batches")
+def list_review_batches(limit: int = Query(default=20, ge=1, le=50),
+                        before: str | None = Query(default=None, max_length=64),
+                        only_pending: bool = False,
+                        user: CurrentUser = Depends(require_staff)):
+    """Batches this user may review (the /review page). First answer: every
+    batch with forms left, or still open (work first, then newest), then the
+    rest newest first, `limit` at a time; pass next_before as `before` for more."""
+    before_dt = parse_ts(before) if before else None
+    if before and before_dt is None:
+        raise _err(400, "invalid_cursor", "This list is out of date. Reload the page.")
+    sb = get_supabase()
+    now = rl.now_utc()
+    migration_ready = _review_columns_ready(sb)
+    work = _pending_work(sb)
+
+    ids = set(work["queue"]) | set(work["imports"]) | set(work["unsaved"])
+    candidates = {str(b["id"]).lower(): b for b in _batches_by_id(sb, sorted(ids))}
+    if not only_pending:
+        q = sb.table("scan_batches").select(LIST_BATCH_COLUMNS).eq("status", "open")
+        if not user.is_admin:
+            q = q.eq("created_by", user.id)
+        for b in q.limit(50).execute().data or []:
+            candidates.setdefault(str(b["id"]).lower(), b)
+    top = []
+    for b in candidates.values():
+        seen = _visible_counts(sb, b, user, work)
+        if seen and (sum(seen[1].values()) > 0 or (not only_pending and b.get("status") == "open")):
+            top.append((b, *seen))
+    top.sort(key=lambda t: str(t[0].get("created_at") or ""), reverse=True)
+    top.sort(key=lambda t: sum(t[2].values()) == 0)  # work first; stable, so newest first within
+    top = top[:MAX_TOP_BATCHES]
+    shown = {str(t[0]["id"]).lower() for t in top}
+
+    picked = [] if before_dt else list(top)  # "Show more" pages carry only the history
+    next_before = None
+    if not only_pending:
+        q = sb.table("scan_batches").select(LIST_BATCH_COLUMNS)
+        if not user.is_admin:
+            q = q.eq("created_by", user.id)
+        if before_dt:
+            q = q.lt("created_at", rl.iso(before_dt))
+        fetched = q.order("created_at", desc=True).limit(limit + 1 + len(shown)).execute().data or []
+        rest = [b for b in fetched if str(b["id"]).lower() not in shown]
+        if len(rest) > limit:
+            rest = rest[:limit]
+            next_before = rl.iso(parse_ts(rest[-1]["created_at"]))
+        for b in rest:
+            seen = _visible_counts(sb, b, user, work)
+            if seen:
+                picked.append((b, *seen))
+    names = _names_for_batches(sb, [t[0] for t in picked])
+    return {"server_time": rl.iso(now), "migration_ready": migration_ready,
+            "unsaved_ready": work["unsaved_ready"],
+            "batches": [_serialize_list_batch(b, a, c, names) for b, a, c in picked],
+            "next_before": next_before}
+
+
 # ------------------------------------------------------------------ images
 def _image_bytes(sb, scan_image_id: Any, task_id: Any) -> bytes | None:
     """The stored scan picture: by scan_image_id, else the oldest non-empty

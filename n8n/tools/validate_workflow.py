@@ -42,8 +42,10 @@ Checks
     drop profane/masked keywords; both main Gemini prompts transcribe without censoring
   * known names: 'Website Known Names' / 'Phone Known Names' (known_names.sql, continue on error)
     right before the main Gemini calls, whose prompts list the known instructors/subjects and
-    ask for known_instructor / known_subject; Decide and the phone reconciler use them through
-    one identical copy of website_src/name_match.js; not_found never flags
+    ask for known_instructor / known_subject -- except the website: 'Website Known Names' runs
+    website_known_names.sql (subjects only, no parameters) and its prompt asks only for
+    known_subject, so no instructor name ever reaches Gemini; Decide (subject pick) and the phone
+    reconciler use them through one identical copy of website_src/name_match.js; not_found never flags
 Exit code 0 = all checks passed.
 """
 from __future__ import annotations
@@ -122,6 +124,8 @@ SUBJECT_HINT_OLD = "2. subject: CTU course code (DDMGT, IT, CSO, HCI, ADBAS, IDA
 SUBJECT_HINT_NEW = "2. subject: the course code and/or subject title, as written."
 NM_START = "// name matcher, from website_src/name_match.js\n"
 NM_END = "// end of name matcher\n"
+LC_START = "// layout check, from website_src/layout_check.js\n"
+LC_END = "// end of layout check\n"
 NOT_FOUND_RULE = "const flags = (m) => m.match === 'found' || (m.match === 'ambiguous' && !m.contenders.some((c) => c.is_batch));"
 NO_CENSOR = "Never censor or mask a word, even a vulgar one: it is filtered later."
 # removed identity reasons (earlier designs): must never come back
@@ -689,17 +693,27 @@ def main(argv):
 
     # ---- known instructors/subjects in the main Gemini prompts (phone + website)
     known_bad = []
-    known_sql = (HERE / "website_src" / "known_names.sql").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
+    def src_sql(fname):
+        return (HERE / "website_src" / fname).read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
     for before, known, gemini in KNOWN_CHAINS:
         kn = by_name.get(known)
         if not kn:
             known_bad.append(f"{known} missing")
             continue
         kp = kn["parameters"]
-        if (kn["type"] != "n8n-nodes-base.postgres" or kp.get("query") != known_sql
+        is_web = gemini == "Website AI Validation"
+        # website (privacy): subjects only, no parameters; phone: instructors + subjects, unchanged
+        sql_file = "website_known_names.sql" if is_web else "known_names.sql"
+        repl = kp.get("options", {}).get("queryReplacement")
+        params_ok = repl is None if is_web else str(repl or "").startswith("={{ [")
+        if (kn["type"] != "n8n-nodes-base.postgres" or kp.get("query") != src_sql(sql_file)
                 or kn.get("onError") != "continueRegularOutput" or kn.get("alwaysOutputData") is not True
-                or not str(kp.get("options", {}).get("queryReplacement", "")).startswith("={{ [")):
-            known_bad.append(f"{known}: Postgres node with known_names.sql, array parameters, continue on error, always output")
+                or not params_ok):
+            known_bad.append(f"{known}: Postgres node with {sql_file}, "
+                             + ("no parameters" if is_web else "array parameters")
+                             + ", continue on error, always output")
+        if is_web and re.search(r"user_info|instructor", re.sub(r"--[^\n]*", "", kp.get("query", "")), re.I):
+            known_bad.append(f"{known}: must not look up or return instructor names (privacy)")
         if targets(conns, before, 0) != [known] or targets(conns, known, 0) != [gemini] or inbound(gemini) != [(known, 0)]:
             known_bad.append(f"wiring {before} -> {known} -> {gemini}")
         gbody = by_name[gemini]["parameters"].get("jsonBody", "")
@@ -709,7 +723,7 @@ def main(argv):
         if gemini == "Website AI Validation":
             needles += ['"instructor_confidence": { "type": "STRING", "enum": ["high", "medium", "low"] }',
                         "header_image_base64"]
-            if "known_instructor" in gbody or "Known instructors" in gbody:
+            if any(w in gbody for w in ("known_instructor", "Known instructors", "instructor_list", "instructor_names")):
                 known_bad.append(f"{gemini}: must not send an instructor name list to Gemini (privacy)")
         else:
             needles.append('"known_instructor": { "type": "STRING" }')
@@ -720,7 +734,7 @@ def main(argv):
             known_bad.append(f"{gemini}: old subject hint or .item reference left")
     nm_src = (HERE / "website_src" / "name_match.js").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
     nm_body = "\n".join(ln for ln in nm_src.split("\n") if ln.strip() and not ln.lstrip().startswith("//"))
-    for name, needle in (("Website Decide", "String(rec.known_instructor || '')"),
+    for name, needle in (("Website Decide", "String(rec.known_subject || '')"),
                          ("reconcile ocr and omr1", "nmKnownInstructor(gText('known_instructor')")):
         code = by_name[name]["parameters"].get("jsCode", "")
         i = code.find(NM_START)
@@ -729,16 +743,48 @@ def main(argv):
             known_bad.append(f"{name}: copy of website_src/name_match.js missing or different")
         if needle not in code:
             known_bad.append(f"{name}: does not use the known pick ({needle})")
-    if "known_instructor" not in code_of("Website Reconcile OCR OMR"):
-        known_bad.append("Website Reconcile OCR OMR does not pass known_instructor on")
+    for name in ("Website Reconcile OCR OMR", "Website Decide"):
+        if "known_instructor" in code_of(name):
+            known_bad.append(f"{name}: the website has no known_instructor (no instructor list is sent to Gemini)")
+    if "known_subject" not in code_of("Website Reconcile OCR OMR"):
+        known_bad.append("Website Reconcile OCR OMR does not pass known_subject on")
     if NOT_FOUND_RULE not in dec:
         known_bad.append("Decide: only found / ambiguous without the batch may flag")
     check(not known_bad, "known names: Known Names lookup (continue on error) right before both main Gemini calls; "
           "phone prompt lists known instructors/subjects and asks for known_instructor / known_subject (optional); "
-          "website prompt sends no instructor name list (privacy) and only asks for known_subject, plus optional "
+          "website lookup returns subjects only and the website prompt sends no instructor name (privacy) and only "
+          "asks for known_subject, plus optional "
           "per-field confidence and the optional header_image third part; Decide + phone reconciler use the known "
           "picks via one copy of website_src/name_match.js; not_found never flags"
           + (f": {known_bad}" if known_bad else ""))
+
+    # ---- layout safety net: one identical copy of website_src/layout_check.js in both reconcilers,
+    # used before the rows are compared; both main Gemini prompts ask for the OPTIONAL column_order
+    lay_bad = []
+    lc_src = (HERE / "website_src" / "layout_check.js").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
+    lc_body = "\n".join(ln for ln in lc_src.split("\n") if ln.strip() and not ln.lstrip().startswith("//"))
+    for name in ("Website Reconcile OCR OMR", "reconcile ocr and omr1"):
+        code = code_of(name)
+        i = code.find(LC_START)
+        j = code.find(LC_END, i)
+        if i < 0 or j < 0 or code[code.index("\n", i) + 1:j].rstrip("\n") != lc_body:
+            lay_bad.append(f"{name}: copy of website_src/layout_check.js missing or different")
+        for needle in ("const layoutSignals = lcLayoutSignals(py, gemini, geminiOk);",
+                       "const pythonConfident = !layoutMismatch && ",
+                       "if (layoutMismatch) reasons.push('layout_mismatch');"):
+            if needle not in code:
+                lay_bad.append(f"{name}: lacks {needle!r}")
+        if code.find("const layoutMismatch") > code.find("const pythonConfident"):
+            lay_bad.append(f"{name}: layout check must run before the rows are compared")
+    for name in ("ai validation ocr and omr", "Website AI Validation"):
+        gbody = by_name[name]["parameters"].get("jsonBody", "")
+        if '"column_order": { "type": "ARRAY", "items": { "type": "STRING" } }' not in gbody or "- column_order: " not in gbody:
+            lay_bad.append(f"{name}: does not ask for column_order")
+        if "column_order" in gbody[gbody.rfind('"required"'):]:
+            lay_bad.append(f"{name}: column_order must stay optional")
+    check(not lay_bad, "layout safety net: both reconcilers run one identical copy of website_src/layout_check.js "
+          "before comparing rows (layout_mismatch, no python_confident win); both Gemini prompts ask for the "
+          "optional column_order" + (f": {lay_bad}" if lay_bad else ""))
 
     # ---- unchanged outside the website front end (vs original)
     if in_path.exists():

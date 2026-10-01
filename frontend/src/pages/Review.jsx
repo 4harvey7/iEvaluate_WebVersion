@@ -43,6 +43,7 @@ const pct = (v) => (v === null || v === undefined ? "" : `${Math.round(Number(v)
 const subjectLabel = (s) => (s ? [s.code, s.name].filter(Boolean).join(" - ") : "") || "Unknown subject";
 const personLabel = (p) => p?.name || "Unknown instructor";
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const PICK_FIRST_TEXT = "Pick the instructor and the subject first.";
 
 // A row is replaced only by a newer version of itself (edits live in drafts, never here).
 function isNewer(a, b) {
@@ -609,7 +610,7 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
 
   async function send(vals, confirmOverwrite = false) {
     if (!vals.instructor?.id || !vals.subject?.id) {
-      setProblem("Pick the instructor and the subject first.");
+      setProblem(PICK_FIRST_TEXT);
       return;
     }
     setBusy(true);
@@ -818,13 +819,20 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
           {problem && <div className="error" role="alert">{problem}</div>}
           {!meta.migration_ready && <p className="muted small">Read-only until the database update (migration 005) is applied.</p>}
           {meta.migration_ready && !meta.correction_ready && <p className="muted small">Sending corrections isn't set up on this server yet.</p>}
+          {!finished && (!values.instructor?.id || !values.subject?.id) && problem !== PICK_FIRST_TEXT && (
+            <p className="small">{PICK_FIRST_TEXT}</p>
+          )}
 
           <div className="editor-actions">
             {!finished && (
               <>
                 <button type="button" className="primary" disabled={!canAct || busy || !values.instructor?.id || !values.subject?.id} onClick={() => send(values)}>
                   <Icon name="check" size={18} />
-                  {busy ? "Sending..." : `Credit to ${personLabel(values.instructor)}${values.subject?.code ? ` · ${values.subject.code}` : ""}`}
+                  {busy
+                    ? "Sending..."
+                    : values.instructor?.id
+                      ? `Credit to ${personLabel(values.instructor)}${values.subject?.code ? ` · ${values.subject.code}` : ""}`
+                      : "Credit"}
                 </button>
                 {batchLabel && (
                   <button type="button" disabled={!canAct || busy} onClick={toBatch}>{batchLabel}</button>
@@ -890,7 +898,7 @@ function ImportEditor({ row, batch, draft, setDraft, meta, onRowUpdate, onClose,
 
   async function send(confirmOverwrite = false) {
     if (!values.instructor?.id || !values.subject?.id) {
-      setProblem("Pick the instructor and the subject first.");
+      setProblem(PICK_FIRST_TEXT);
       return;
     }
     setBusy(true);
@@ -1054,6 +1062,9 @@ function ImportEditor({ row, batch, draft, setDraft, meta, onRowUpdate, onClose,
 
           {problem && <div className="error" role="alert">{problem}</div>}
           {!meta.migration_ready && <p className="muted small">Read-only until the database update (migration 005) is applied.</p>}
+          {!finished && (!values.instructor?.id || !values.subject?.id) && problem !== PICK_FIRST_TEXT && (
+            <p className="small">{PICK_FIRST_TEXT}</p>
+          )}
 
           <div className="editor-actions">
             {!finished && (
@@ -1416,7 +1427,7 @@ function BulkBox({ groups, meta, onRun, bulk }) {
       {bulk && (
         <div className="bulk-progress" role="status">
           {bulk.running
-            ? `Crediting ${bulk.done + 1} of ${bulk.total}...`
+            ? `Crediting ${Math.min(bulk.done + 1, bulk.total)} of ${bulk.total}...`
             : `${plural(bulk.ok, "form", "forms")} credited${bulk.skipped.length ? `, ${bulk.skipped.length} skipped` : ""}.`}
           {!bulk.running && bulk.skipped.length > 0 && (
             <ul className="small">
@@ -1559,7 +1570,7 @@ function ReviewPage({ batchId, profile }) {
   if (data.fatal === "not_found") {
     return (
       <div>
-        <PageHeader title="Batch not found" subtitle="This batch doesn't exist any more, or the link is wrong." back={{ to: "/", label: "Home" }} />
+        <PageHeader title="Batch not found" subtitle="This batch doesn't exist any more, or the link is wrong." back={{ to: "/review", label: "All batches" }} />
       </div>
     );
   }
@@ -1569,7 +1580,7 @@ function ReviewPage({ batchId, profile }) {
         <PageHeader
           title="Review forms"
           subtitle="Only the staff member who started this batch, or an SAO admin, can review these forms."
-          back={{ to: "/", label: "Home" }}
+          back={{ to: "/review", label: "All batches" }}
         />
       </div>
     );
@@ -1586,7 +1597,7 @@ function ReviewPage({ batchId, profile }) {
   const b = data.batch || {};
   const meta = data.meta;
   const counts = data.counts || {};
-  const back = b.status === "open" ? { to: `/batch/${batchId}`, label: "Scan & check" } : { to: "/", label: "Home" };
+  const back = b.status === "open" ? { to: `/batch/${batchId}`, label: "Scan & check" } : { to: "/review", label: "All batches" };
   const scrollTo = (id) => document.getElementById(id)?.scrollIntoView?.({ block: "start", behavior: "smooth" });
 
   return (

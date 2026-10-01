@@ -326,6 +326,8 @@ export default function ScanningLive({ stationId }) {
   const lastActivity = batch.last_activity_at ? new Date(batch.last_activity_at).getTime() : 0;
   const abandonedMs = (batch.abandoned_after_hours || 3) * 3600 * 1000;
   const canForce = lastActivity && now - lastActivity > abandonedMs;
+  const abandonedHours = Number(batch.abandoned_after_hours) || 3;
+  const forgottenHelp = `Only needed if a batch was left open. Available after ${abandonedHours} ${abandonedHours === 1 ? "hour" : "hours"} with no new scans.`;
   // Prefer the full station record; fall back to what the batch tells us.
   const station = liveStation && liveStation.id === batch.station?.id ? { ...batch.station, ...liveStation } : batch.station;
   const scannerReady = getScannerState(station, now).tone === "green";
@@ -533,11 +535,14 @@ export default function ScanningLive({ stationId }) {
         <button
           disabled={acting || !canForce}
           onClick={() => setDialog("force")}
-          title={canForce ? "" : `Only needed if a batch was left open. Available after ${batch.abandoned_after_hours || 3} hours with no new scans.`}
+          title={canForce ? "" : forgottenHelp}
         >
           Close a forgotten batch
         </button>
       </div>
+      <p className="muted small">
+        {canForce ? "Only needed if a batch was left open." : forgottenHelp}
+      </p>
 
       {dialog === "close" && (
         <ConfirmDialog

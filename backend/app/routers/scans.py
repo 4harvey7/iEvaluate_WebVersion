@@ -18,6 +18,8 @@ from app.logic import (
     PIPELINE_MISCONFIGURED_MSG,
     PIPELINE_NOT_CONFIGURED_MSG,
     PIPELINE_REJECTED_MSG,
+    PIPELINE_TIMEOUT_MSG,
+    PIPELINE_UNAVAILABLE_MSG,
     SHA256_RE,
     UNSAVED_REVIEW_MSG,
     ImageValidationError,
@@ -125,8 +127,8 @@ KeepFn = Callable[[bool, list | None, str, int], bool]
 def _pipeline_failure(item_id: str, prior_failures: int, code: str, client_msg: str, item_msg: str,
                       reasons: list | None = None, keep: KeepFn | None = None,
                       batch_id: str | None = None, note: str | None = None) -> HTTPException:
-    """A REAL pipeline failure (n8n answered but didn't store / errored / bad
-    reply). Counts toward MAX_PIPELINE_ATTEMPTS. Retryable -> 502 (watcher
+    """A REAL pipeline failure (n8n didn't store / errored / bad reply /
+    timed out / couldn't be reached). Counts toward MAX_PIPELINE_ATTEMPTS. Retryable -> 502 (watcher
     backs off and retries); cap reached -> permanent error + 422. A copy of
     the page is kept (app/unsaved_pages.py) so that, once the cap is reached,
     it waits on the review page instead of silently dropping out."""
@@ -310,14 +312,17 @@ def ingest_scan(body: IngestScan, station: dict = Depends(require_station)):
         try:
             resp = _n8n().post(settings.n8n_batch_webhook_url, json=payload, headers=headers)
         except httpx.TimeoutException:
-            # n8n may still be working on it: leave the item 'processing' so the
-            # stale window (timeout + 60s) blocks a parallel re-run. Not counted
-            # toward the retry cap.
-            log.warning("n8n call timed out (task %s); item left processing", task_id)
-            raise _err(502, "pipeline_timeout", "The scoring pipeline timed out. Will retry.")
+            # Shown as "Trying again" (not "Working on it") and counted toward the
+            # retry cap, so a page can't wait forever. The resend uses the same
+            # task_id, so n8n can tell if it stored the page after all.
+            log.warning("n8n call timed out (task %s)", task_id)
+            raise _pipeline_failure(item_id, prior_failures, "pipeline_timeout", "The scoring pipeline timed out. Will retry.",
+                                    PIPELINE_TIMEOUT_MSG, keep=keep, batch_id=batch["id"])
         except httpx.HTTPError as e:
-            log.warning("n8n transport error (task %s): %s; item left processing", task_id, type(e).__name__)
-            raise _err(502, "pipeline_unavailable", "The scoring pipeline is unavailable. Will retry.")
+            log.warning("n8n transport error (task %s): %s", task_id, type(e).__name__)
+            raise _pipeline_failure(item_id, prior_failures, "pipeline_unavailable",
+                                    "The scoring pipeline is unavailable. Will retry.",
+                                    PIPELINE_UNAVAILABLE_MSG, keep=keep, batch_id=batch["id"])
 
         if resp.status_code in (401, 403):
             # Wrong/missing webhook secret: a configuration problem, not the page's fault.

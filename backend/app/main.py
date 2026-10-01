@@ -92,6 +92,9 @@ async def catch_all(request: Request, call_next):
 
 settings = get_settings()
 validate_settings(settings)  # refuse to start with an unsafe config
+if not settings.email_configured:
+    # Optional: activation still works, the admin just passes the steps on in person.
+    log.warning("BREVO_API_KEY / BREVO_SENDER_EMAIL not set: instructor activation emails will not be sent")
 
 # Body cap sits inside CORS (so 413s carry CORS headers) and outside routing.
 app.add_middleware(BodySizeLimitMiddleware)

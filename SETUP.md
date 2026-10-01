@@ -106,7 +106,9 @@ Copy `backend/.env.example` to `backend/.env` (or set these on your host):
 | `N8N_CORRECTION_TIMEOUT_SECONDS` | no (default `180`) | How long the backend waits for a correction webhook. After a timeout the form shows "Sending..." and is settled when n8n's own update is seen, or marked "Not sent" after 10 minutes. |
 | `SCAN_IMAGE_BUCKET` | no (default `scan-pages`) | Page viewer (migration 010): PRIVATE Supabase Storage bucket where the backend keeps a viewing copy of every scanned page (long side `SCAN_IMAGE_MAX_SIDE`=1800 px, JPEG quality `SCAN_IMAGE_JPEG_QUALITY`=75, about 250 KB per page, 250 MB per 1,000 pages). Uploaded after marking answers, in the background, with the service key; staff see it only through the backend (login + batch access). Empty = keep no pictures. |
 | `SCAN_IMAGE_RETENTION_DAYS` | no (default `90`) | Pictures older than this are removed from the bucket (checked at most once an hour, started by the batch page's poll). `0` = keep them. The score stays on the page's row. |
-| `N8N_TIMEOUT_SECONDS`, `MAX_UPLOAD_MB`, `PREDATE_GRACE_SECONDS`, `WATCHER_ONLINE_SECONDS`, `PASSWORD_RESET_REDIRECT_URL` | no | Tuning, see `.env.example`. |
+| `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | recommended | Brevo API key and sender for the instructor activation email (the same values the Flutter app's Supabase functions use). Empty = activation still works, but no email is sent and the Activate page shows the sign-in steps for the admin to pass on. A warning is logged at start-up. |
+| `BREVO_SENDER_NAME` | no (default `SAO Management`) | Sender name on that email. |
+| `N8N_TIMEOUT_SECONDS`, `MAX_UPLOAD_MB`, `PREDATE_GRACE_SECONDS`, `WATCHER_ONLINE_SECONDS` | no | Tuning, see `.env.example`. |
 
 ## 3. Run locally
 
@@ -129,7 +131,7 @@ npm run dev
 
 ### Deploy to Render + Vercel
 
-1. **Backend (Render):** New -> Blueprint -> pick this repo. `render.yaml` creates the `ievaluate-api` Docker service (root `backend/`, health check `/health`). Fill in the prompted values (SUPABASE_URL, SUPABASE_SERVICE_KEY, N8N_BATCH_WEBHOOK_URL, N8N_WEBHOOK_SECRET, CORS_ORIGINS, WATCHER_API_BASE, PASSWORD_RESET_REDIRECT_URL). Use the service's https onrender.com URL for WATCHER_API_BASE.
+1. **Backend (Render):** New -> Blueprint -> pick this repo. `render.yaml` creates the `ievaluate-api` Docker service (root `backend/`, health check `/health`). Fill in the prompted values (SUPABASE_URL, SUPABASE_SERVICE_KEY, N8N_BATCH_WEBHOOK_URL, N8N_WEBHOOK_SECRET, CORS_ORIGINS, WATCHER_API_BASE, BREVO_API_KEY, BREVO_SENDER_EMAIL). Use the service's https onrender.com URL for WATCHER_API_BASE.
 2. **Frontend (Vercel):** import the repo, Root Directory `frontend`, env var `VITE_API_BASE=https://<render-url>`. The build fails unless it is https, and the Content-Security-Policy is generated from it.
 3. Set CORS_ORIGINS on Render to the Vercel URL (no trailing slash) and redeploy.
 4. Check `https://<render-url>/health` returns `{"status":"ok"}`.
@@ -171,4 +173,10 @@ also inside the zip). The package must be rebuilt after editing anything in
   auth users (`account_status = 'pending'`, `is_placeholder = true`) with a
   `department_table` row (FULL-TIME or PART-TIME). An admin activates them
   with the instructor's real email. That unbans the account, sets it
-  approved and sends a password-reset email.
+  approved. The admin types the email twice and confirms it before
+  activating. The backend then emails the instructor (Brevo, see
+  `BREVO_API_KEY`) how to set a password with "Forgot Password?" in the
+  iEvaluate phone app, using that email. Supabase's own password-reset mail
+  is never sent. If the email can't be sent (Brevo not configured or an
+  error), the activation still stands and the page shows the steps for the
+  admin to pass on in person.

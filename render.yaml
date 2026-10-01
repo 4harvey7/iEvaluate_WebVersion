@@ -27,7 +27,11 @@ services:
         sync: false
       - key: WATCHER_API_BASE               # this service's public https URL (= the frontend's VITE_API_BASE)
         sync: false
-      - key: PASSWORD_RESET_REDIRECT_URL    # e.g. https://ievaluate-scan.vercel.app/reset-password
+      # Instructor activation email: same Brevo key / sender as the Flutter app.
+      # Empty = activation still works, the website shows the steps instead.
+      - key: BREVO_API_KEY                  # secret, backend only
+        sync: false
+      - key: BREVO_SENDER_EMAIL             # a sender verified in Brevo
         sync: false
       # Optional: leave empty to derive them from N8N_BATCH_WEBHOOK_URL
       # (.../sast-batch-scan -> .../sast-manual-correction, .../import-error-correction).
@@ -41,6 +45,8 @@ services:
         value: "false"
       - key: CORS_ALLOW_LAN
         value: "false"
+      - key: BREVO_SENDER_NAME
+        value: SAO Management
       # Rate limiting uses CF-Connecting-IP (Render sits behind Cloudflare), else
       # the rightmost X-Forwarded-For entry (app/security.py client_ip).
       - key: TRUST_PROXY_HEADERS

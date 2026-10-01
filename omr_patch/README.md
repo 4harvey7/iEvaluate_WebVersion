@@ -13,7 +13,19 @@ from here.
 | `n8n_compat_check.js` | feeds real `/process` responses into the current n8n reconciler Code nodes (see "n8n compatibility") |
 | `history/` | fix B (the previous candidate, never deployed), kept for reference |
 
-`api.py`, `grid_config.py`, `grid_detect.py` and `requirements.txt` do not change.
+`api.py`, `grid_config.py`, `grid_detect.py` and `requirements.txt` do not change in fix C.
+
+**Layout evidence (2026-10-01, separate from fix C, edited directly in `C:\Projects\OMR PYTHON DEPLOYMENT`).**
+`api.py`, `grid_config.py` and `grid_detect.py` now add one response key, `layout`
+(`grid_detect.layout_evidence()`): `columns_detected` (vertical rulings counted independently of the
+grid), `column_boundaries_matched/_total`, `rows_detected` (20 + unexplained row lines inside a
+section), `boundaries_supported/_total`, `grid_source` and `structure_fit` (`row_spacing`,
+`units_per_section`, `body_units`, `units_pinned`, `score`, `score_per_boundary`). Nothing else in
+the response changes and the rows read are identical (`resolveGrid()` / `readOmrRows()` keep their
+old return values; `resolveGridWithInfo()` and `readOmrRows(..., return_layout=True)` are new).
+Fix C's two files work unchanged on top. The n8n reconcilers use it for `layout_mismatch`
+(`app/n8n/WEBSITE_BRANCH.md`, "Layout safety net"). Deploying it means copying those three files
+too; an older service without `layout` is handled (no flag).
 There are no new dependencies (only cv2/numpy, which are already used). The Flask API
 contract is unchanged: same request fields, and the same response keys (`ratings`,
 `omr_debug`, `table_found`, `grid_source`, `paper_type`, `ocr_fields`, ...).
@@ -128,7 +140,8 @@ Known remaining errors, with the same reads in ORIGINAL and fix B unless noted:
 
   Without these two sheets: long 418/420, phone 815/820.
 - **FORMS-09 m6:** a tick straddles the m6/m7 ruling almost 50/50. It reads S on the blank
-  m6. Weak score (0.020), so the website flags it `python_weak_gemini_blank`.
+  m6. Weak score (0.020), so the website flagged it `python_weak_gemini_blank` (limit 1 row at
+  the time; since 2026-10-01 the limit is 3 rows, so a single speck row alone no longer flags).
 - **FORMS-10 m5:** a tick on the F/US column boundary reads F; the label is US.
 - **img…11052100 p6:** a tick in VS plus a scribble in S; S is darker and wins. This is the
   one scanner error the website reconciler would store unflagged: Gemini disagrees by only 1
@@ -142,11 +155,13 @@ Known remaining errors, with the same reads in ORIGINAL and fix B unless noted:
 
 ## n8n compatibility (current `app/n8n/perfect-101-website.json`)
 
-Re-run on 2026-09-27 after the reconciler redesign. Both reconcilers now take ratings from Python, use Gemini only as a cross-check (`omr_agreement_below_80` when fewer than 16 of 20 rows agree, `AGREEMENT_MIN = 0.80`), and take text only from Gemini. `n8n_compat_check.js` ran every saved `/process` response of fix C (`NEW`, deployed) and ORIGINAL through the real jsCode of both reconcilers:
+Re-run on 2026-09-27 after the reconciler redesign. Both reconcilers now take ratings from Python, use Gemini only as a cross-check (`omr_agreement_below_30` when fewer than 6 of 20 rows agree, `AGREEMENT_MIN = 0.30`), and take text only from Gemini. `n8n_compat_check.js` ran every saved `/process` response of fix C (`NEW`, deployed) and ORIGINAL through the real jsCode of both reconcilers:
 - phone: `reconcile ocr and omr1`;
 - scanner: `Website Reconcile OCR OMR`.
 
 Gemini was mocked with the ground-truth letters. Results:
+
+> **2026-10-01 rule change, not re-measured.** The reconcilers now trust a confident (not weak) Python row over Gemini (`resolved_by: 'python_confident'`), ignore differences of one level (`adjacent_level`), and the website `python_weak_*` limits went from 1 to 3 rows. See `app/n8n/WEBSITE_BRANCH.md` "OMR and OCR rules". The numbers below were taken before that change; with a ground-truth Gemini the agreement flag can only get rarer, and single weak/speck rows on the website no longer flag on their own.
 
 - **Parsing.** `ratings`, `omr_debug` (weak-row counts), `table_found`, `grid_source` and `python_raw_ratings` were parsed correctly for all 96 forms. `agreement_rows` equals an independent count for every form. With Gemini's text blank, the instructor stays blank: there is no `ocr_fields` fallback any more.
 - **Fully correct forms**, by set:

@@ -112,7 +112,7 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
           </select>
           {duplicates.length === 1 && (
             <div className="error">
-              An instructor with a very similar name already exists: <strong>{duplicates[0].full_name || `${duplicates[0].first_name} ${duplicates[0].last_name}`}</strong>
+              {duplicates[0].exact ? "An instructor with this exact name already exists" : "An instructor with a very similar name already exists"}: <strong>{duplicates[0].full_name || `${duplicates[0].first_name} ${duplicates[0].last_name}`}</strong>
               {duplicates[0].department_name ? ` (${duplicates[0].department_name})` : ""}.
               {duplicates[0].eligible ? (
                 <div>
@@ -148,7 +148,8 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
               </ul>
             </div>
           )}
-          {duplicates.length > 0 && (
+          {/* Exactly the same name can't be added again (the database allows one person per full name). */}
+          {duplicates.length > 0 && !duplicates.some((d) => d.exact) && (
             <div>
               <button type="button" onClick={() => submitCreate(true)} disabled={creating}>
                 This is a different person - add "{first.trim()} {last.trim()}"

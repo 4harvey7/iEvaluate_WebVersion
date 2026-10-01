@@ -122,3 +122,5 @@ def logout(req: LogoutRequest | None = None, user: CurrentUser = Depends(require
         pass
     forget_token(user.token)
     return {"ok": True}
+
+

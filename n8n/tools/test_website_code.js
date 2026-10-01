@@ -280,6 +280,14 @@ test('Reconcile: Gemini call failure -> ai_validation_failed, Python ratings kep
 async function reconcile(py, g = geminiResp()) {
   return (await run('Website Reconcile OCR OMR', g, { 'Website Python OMR': py, 'Website AI Validation': g }))[0].json;
 }
+const QS = [...Array(10)].map((_, i) => `m${i + 1}`).concat([...Array(10)].map((_, i) => `p${i + 1}`));
+// Gemini ratings that differ from Python's default letter (letters[i % 5]) on the first n rows:
+// adjacent = exactly one level away (US -> F), far = two or more levels away
+function adjacent(n) { return Object.fromEntries(QS.slice(0, n).map((q, i) => [q, letters[i % 5 === 4 ? 3 : (i % 5) + 1]])); }
+function far(n) { return Object.fromEntries(QS.slice(0, n).map((q, i) => [q, letters[(i + 2) % 5]])); }
+const WEAK_ROW = { a: 0.5, b: 0.49 };   // margin 0.01 < WEAK_MARGIN
+const weakRows = (n, from = 0) => Object.fromEntries(Array.from({ length: n }, (_, i) => [from + i, WEAK_ROW]));
+const blankRows = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [i, '']));
 function geminiWith(ratingsOver, fields = {}) {
   const r = JSON.parse(geminiResp().candidates[0].content.parts[0].text).ratings;
   return geminiResp({ ratings: { ...r, ...ratingsOver }, ...fields });
@@ -304,10 +312,10 @@ test('Gemini-only OCR (website): Gemini unparseable -> gemini_unavailable, text 
 });
 
 // ---------------------------------------------------------------- agreement metric (AGREEMENT_MIN)
-test('Agreement: AGREEMENT_MIN = 0.80 in both reconcilers; old count-based rules are gone', async () => {
+test('Agreement: AGREEMENT_MIN = 0.30 in both reconcilers; old count-based rules are gone', async () => {
   for (const name of ['Website Reconcile OCR OMR', 'reconcile ocr and omr1']) {
     const code = codeOf(name);
-    assert.match(code, /^const AGREEMENT_MIN = 0\.80;/m, `${name}: one named constant`);
+    assert.match(code, /^const AGREEMENT_MIN = 0\.30;/m, `${name}: one named constant`);
     assert.strictEqual(code.match(/^const AGREEMENT_MIN\b/gm).length, 1);
     const noComments = code.split('\n').map((l) => l.replace(/^\s*\/\/.*$/, '')).join('\n');
     for (const old of ['omr_disagreement_', 'severe_omr_disagreement_', 'low_confidence_omr_', 'FLAG_DIFF_COUNT',
@@ -316,43 +324,91 @@ test('Agreement: AGREEMENT_MIN = 0.80 in both reconcilers; old count-based rules
     }
   }
 });
-test('Agreement: 16/20 (80%) passes, 15/20 (75%) -> omr_agreement_below_80 with rows in the note', async () => {
-  // 4 rows differ by one step (Gemini reads a neighbouring column)
-  const four = { m1: 'VS', m2: 'S', p1: 'VS', p2: 'S' };
-  const r16 = await reconcile(python(), geminiWith(four));
-  assert.strictEqual(r16.agreement_rows, 16);
-  assert.strictEqual(r16.agreement_percent, 80);
-  assert.deepStrictEqual(r16.review_reasons, [], '80% is enough');
-  const r15 = await reconcile(python(), geminiWith({ ...four, m3: 'O' }));
-  assert.strictEqual(r15.agreement_percent, 75);
-  assert.deepStrictEqual(r15.review_reasons, ['omr_agreement_below_80']);
-  assert.match(r15.review_note, /agree on only 15 of 20 rows \(75%\); at least 80% is required/);
-  assert.match(r15.review_note, /m3 \(scanner S, AI O\)/);
-  assert.strictEqual(r15.ratings.m3, 3, 'the stored rating is still Python\'s value');
-  assert.strictEqual(r15.omr_agreement.agreement_min_percent, 80);
-  assert.strictEqual(r15.comparisons.find((c) => c.question === 'm3').agree, false);
+test('Agreement: 6/20 (30%) passes, 5/20 (25%) -> omr_agreement_below_30 with only the counted rows in the note', async () => {
+  // Python blank on 14 rows that Gemini reads -> 6 agree
+  const r14 = await reconcile(python({ override: blankRows(14) }));
+  assert.strictEqual(r14.agreement_rows, 6);
+  assert.strictEqual(r14.agreement_percent, 30);
+  assert.deepStrictEqual(r14.review_reasons, [], '30% is enough');
+  const r15 = await reconcile(python({ override: blankRows(15) }));
+  assert.strictEqual(r15.agreement_percent, 25);
+  assert.deepStrictEqual(r15.review_reasons, ['omr_agreement_below_30']);
+  assert.match(r15.review_note, /clearly disagree on 15 of 20 rows .*only 5 of 20 rows \(25%\) count as agreeing; at least 30% is required/);
+  assert.match(r15.review_note, /m1 \(scanner blank, AI O\)/);
+  assert.strictEqual(r15.ratings.m1, 5, 'Gemini fills the Python blank');
+  assert.strictEqual(r15.omr_agreement.agreement_min_percent, 30);
+  assert.strictEqual(r15.omr_agreement.flag_agreement_rows, 5);
+  const m1 = r15.comparisons.find((c) => c.question === 'm1');
+  assert.strictEqual(m1.agree, false);
+  assert.strictEqual(m1.resolved_by, null, 'a blank vs a value is a real disagreement');
 });
-test('Agreement: both blank = same; one blank = different; Gemini fills a Python blank', async () => {
+test('Agreement: confident scanner vs Gemini differing on every row -> scanner kept, NOT flagged', async () => {
+  const r = await reconcile(python(), geminiWith(far(20)));
+  assert.deepStrictEqual(r.review_reasons, []);
+  assert.strictEqual(r.agreement_rows, 0, 'reported agreement is still the raw match count');
+  assert.strictEqual(r.agreement_percent, 0);
+  assert.strictEqual(r.omr_agreement.flag_agreement_rows, 20);
+  assert.strictEqual(r.omr_agreement.resolved_differences, 20);
+  assert.strictEqual(r.ratings.m1, 5, "Python's value is stored");
+  for (const c of r.comparisons) {
+    assert.strictEqual(c.agree, false);
+    assert.strictEqual(c.resolved_by, 'python_confident', c.question);
+  }
+  assert.strictEqual(r.review_note, null);
+  // Gemini blank on 15 rows a confident Python read -> scanner kept, not flagged
+  const gBlank = await reconcile(python(), geminiWith(Object.fromEntries(QS.slice(0, 15).map((q) => [q, '']))));
+  assert.strictEqual(gBlank.agreement_rows, 5);
+  assert.deepStrictEqual(gBlank.review_reasons, []);
+  assert.strictEqual(gBlank.comparisons[0].resolved_by, 'python_confident');
+  assert.strictEqual(gBlank.ratings.m1, 5);
+});
+test('Agreement: weak scanner vs far-apart Gemini -> flagged; adjacent-level differences are not', async () => {
+  const farW = await reconcile(python({ weak: weakRows(15) }), geminiWith(far(15)));
+  assert.ok(farW.review_reasons.includes('omr_agreement_below_30'), farW.review_reasons.join(','));
+  assert.ok(farW.review_reasons.includes('python_weak_disagreement_15_rows'));
+  assert.strictEqual(farW.comparisons[0].resolved_by, null);
+  const adj = await reconcile(python({ weak: weakRows(15) }), geminiWith(adjacent(15)));
+  assert.deepStrictEqual(adj.review_reasons, ['low_confidence_ocr_15_rows'], 'only the weak-row count flags it');
+  assert.strictEqual(adj.agreement_rows, 5);
+  assert.strictEqual(adj.omr_agreement.flag_agreement_rows, 20);
+  assert.strictEqual(adj.comparisons[0].resolved_by, 'adjacent_level');
+  // S vs VS on a weak row -> one level apart -> nothing
+  assert.deepStrictEqual((await reconcile(python({ weak: weakRows(3, 1) }), geminiWith({ m2: 'S', m3: 'VS', m4: 'S' }))).review_reasons, []);
+});
+test('Agreement: no confidence data for a row -> scanner not trusted over Gemini', async () => {
+  const py = { ...python(), omr_debug: [] };
+  const r = await reconcile(py, geminiWith(far(15)));
+  assert.deepStrictEqual(r.review_reasons, ['omr_agreement_below_30']);
+  assert.strictEqual(r.comparisons[0].resolved_by, null);
+});
+test('Agreement: note lists only the counted rows and mentions the scanner-kept ones', async () => {
+  // rows 0..14 Python blank (counted); p6..p10 confident Python vs far Gemini (kept)
+  const g = geminiWith(Object.fromEntries(QS.slice(15).map((q, k) => [q, letters[(15 + k + 2) % 5]])));
+  const r = await reconcile(python({ override: blankRows(15) }), g);
+  assert.deepStrictEqual(r.review_reasons, ['omr_agreement_below_30']);
+  assert.strictEqual(r.agreement_rows, 0);
+  assert.strictEqual(r.omr_agreement.flag_agreement_rows, 5);
+  assert.match(r.review_note, /only 5 of 20 rows \(25%\) count as agreeing/);
+  assert.ok(!/p6 \(/.test(r.review_note), 'a scanner-kept row is not listed as a difference');
+  assert.match(r.review_note, /5 other differing row\(s\) were kept as the scanner read them/);
+});
+test('Agreement: both blank = same; Gemini fills a Python blank', async () => {
   // rows 0..3 blank for BOTH engines -> still 100% agreement
   const bothBlank = await reconcile(python({ override: { 0: '', 1: '', 2: '', 3: '' } }),
     geminiWith({ m1: 'blank', m2: 'blank', m3: 'blank', m4: 'blank' }));
   assert.strictEqual(bothBlank.agreement_percent, 100);
   assert.strictEqual(bothBlank.ratings.m1, null);
-  // Python blank on 5 rows that Gemini reads -> 15/20, flagged; the used rating is Gemini's fill
-  const pyBlank = await reconcile(python({ override: { 0: '', 1: '', 2: '', 3: '', 4: '' } }));
-  assert.strictEqual(pyBlank.agreement_rows, 15);
-  assert.ok(pyBlank.review_reasons.includes('omr_agreement_below_80'));
+  const pyBlank = await reconcile(python({ override: blankRows(15) }));
+  assert.strictEqual(pyBlank.agreement_rows, 5);
+  assert.ok(pyBlank.review_reasons.includes('omr_agreement_below_30'));
   assert.strictEqual(pyBlank.ratings.m1, 5);
   assert.strictEqual(pyBlank.comparisons[0].source, 'gemini_fill');
-  // Gemini blank on 5 rows Python read (strong rows) -> 15/20, flagged
-  const gBlank = await reconcile(python(), geminiWith({ m1: '', m2: '', m3: '', m4: '', m5: '' }));
-  assert.strictEqual(gBlank.agreement_rows, 15);
-  assert.ok(gBlank.review_reasons.includes('omr_agreement_below_80'));
 });
 test('Agreement: flagged for another reason -> the note still states the agreement', async () => {
   const r = await reconcile(python({ grid: 'fallback' }), geminiWith({ m1: 'VS' }));
   assert.deepStrictEqual(r.review_reasons, ['omr_fallback_grid']);
   assert.match(r.review_note, /Python and Gemini agree on 19 of 20 rows \(95%\)\./);
+  assert.match(r.review_note, /1 other differing row\(s\) were kept as the scanner read them/);
 });
 test('Agreement: Python OMR failed -> omr_unavailable (Gemini alone never passes)', async () => {
   const r = await reconcile({ error: 'connect ECONNREFUSED omr-api:5000' });
@@ -366,19 +422,38 @@ test('Reconcile hardening: strong agreement -> clean', async () => {
   const r = await reconcile(python());
   assert.deepStrictEqual(r.review_reasons, []);
 });
-test('Reconcile hardening: speck (weak Python rating, Gemini blank) -> python_weak_gemini_blank_1_rows', async () => {
-  const r = await reconcile(python({ weak: { 3: { a: 0.04, b: 0.01 } } }), geminiWith({ m4: '' }));
-  assert.deepStrictEqual(r.review_reasons, ['python_weak_gemini_blank_1_rows'], '19/20 passes the agreement rule, the weak-row rule catches it');
-  assert.match(r.review_note, /m4/);
-  // same blank but a STRONG Python row is not flagged by this rule (and 95% agreement passes)
-  assert.deepStrictEqual((await reconcile(python(), geminiWith({ m4: '' }))).review_reasons, []);
+test('Reconcile hardening: WEAK_BLANK_LIMIT / WEAK_DISAGREE_LIMIT = 3 (website)', async () => {
+  const code = codeOf('Website Reconcile OCR OMR');
+  assert.match(code, /^const WEAK_BLANK_LIMIT\s+= 3;/m);
+  assert.match(code, /^const WEAK_DISAGREE_LIMIT = 3;/m);
 });
-test('Reconcile hardening: weak row, ratings differ by 1 -> python_weak_disagreement_1_rows', async () => {
-  // row 12 = p3: Python 'S' (3); Gemini 'F' (2); margin 0.01 < WEAK_MARGIN
-  const r = await reconcile(python({ weak: { 12: { a: 0.5, b: 0.49 } } }), geminiWith({ p3: 'F' }));
-  assert.deepStrictEqual(r.review_reasons, ['python_weak_disagreement_1_rows']);
+test('Reconcile hardening: specks (weak Python rating, Gemini blank) on 3 rows -> python_weak_gemini_blank_3_rows', async () => {
+  const specks = { m2: '', m3: '', m4: '' };
+  const r = await reconcile(python({ weak: weakRows(3, 1) }), geminiWith(specks));
+  assert.deepStrictEqual(r.review_reasons, ['python_weak_gemini_blank_3_rows'], '17/20 passes the agreement rule, the weak-row rule catches it');
+  assert.match(r.review_note, /m2, m3, m4/);
+  // 2 specks -> under the limit, clean and no note
+  const two = await reconcile(python({ weak: weakRows(2, 1) }), geminiWith({ m2: '', m3: '' }));
+  assert.deepStrictEqual(two.review_reasons, []);
+  assert.strictEqual(two.review_note, null);
+  // a STRONG Python row vs Gemini blank is not flagged by this rule
+  assert.deepStrictEqual((await reconcile(python(), geminiWith(specks))).review_reasons, []);
+});
+test('Reconcile hardening: weak rows, ratings 2+ levels apart on 3 rows -> python_weak_disagreement_3_rows', async () => {
+  // rows 10..12 = p1..p3: Python O / VS / S; Gemini S / F / US
+  const g = geminiWith({ p1: 'S', p2: 'F', p3: 'US' });
+  const r = await reconcile(python({ weak: weakRows(3, 10) }), g);
+  assert.deepStrictEqual(r.review_reasons, ['python_weak_disagreement_3_rows']);
+  assert.match(r.review_note, /unsure on p1, p2, p3 and the AI read a rating two or more levels away/);
+  assert.strictEqual(r.ratings.p1, 5, 'scanner value stored');
+  // 2 such rows -> under the limit
+  assert.deepStrictEqual((await reconcile(python({ weak: weakRows(2, 10) }), geminiWith({ p1: 'S', p2: 'F' }))).review_reasons, []);
+  // 3 weak rows one level apart -> not a conflict
+  const adj = await reconcile(python({ weak: weakRows(3, 10) }), geminiWith({ p1: 'VS', p2: 'S', p3: 'F' }));
+  assert.deepStrictEqual(adj.review_reasons, []);
+  assert.ok(adj.comparisons.slice(10, 13).every((c) => c.resolved_by === 'adjacent_level'));
   // weak but agreeing -> clean
-  assert.deepStrictEqual((await reconcile(python({ weak: { 12: { a: 0.5, b: 0.49 } } }))).review_reasons, []);
+  assert.deepStrictEqual((await reconcile(python({ weak: weakRows(3, 10) }))).review_reasons, []);
 });
 test('Reconcile hardening: Python unsure on >= 4 rows -> low_confidence_ocr_4_rows even when Gemini agrees', async () => {
   const weak = { 0: { a: 0.04, b: 0.0 }, 1: { a: 0.04, b: 0.0 }, 2: { a: 0.04, b: 0.0 }, 3: { a: 0.04, b: 0.0 } };
@@ -438,17 +513,25 @@ test('Phone reconcile: Gemini-only OCR -- blank Gemini text never falls back to 
   assert.strictEqual(r2.instructor, '');
   assert.strictEqual(r2.student_id, '');
 });
-test('Phone reconcile: agreement 16/20 passes, 15/20 -> omr_agreement_below_80 (replaces omr_disagreement)', async () => {
-  const four = { m1: 'VS', m2: 'S', p1: 'VS', p2: 'S' };
-  assert.deepStrictEqual((await phoneReconcile(python(), geminiWith(four))).review_reasons, []);
-  const r = await phoneReconcile(python(), geminiWith({ ...four, m3: 'O' }));
-  assert.deepStrictEqual(r.review_reasons, ['omr_agreement_below_80']);
-  assert.strictEqual(r.agreement_percent, 75);
+test('Phone reconcile: agreement 6/20 passes, 5/20 -> omr_agreement_below_30 (replaces omr_disagreement)', async () => {
+  assert.deepStrictEqual((await phoneReconcile(python({ override: blankRows(14) }))).review_reasons, []);
+  const r = await phoneReconcile(python({ override: blankRows(15) }));
+  assert.deepStrictEqual(r.review_reasons, ['omr_agreement_below_30']);
+  assert.strictEqual(r.agreement_percent, 25);
   assert.strictEqual(r.validation_status, 'flagged');
-  assert.match(r.review_note, /agree on only 15 of 20 rows \(75%\)/);
-  // 5 rows two steps apart used to be omr_disagreement_5_of_20 + severe; now one agreement reason
-  const five = await phoneReconcile(python({ override: { 0: 'US', 1: 'US', 2: 'O', 10: 'US', 11: 'US' } }));
-  assert.deepStrictEqual(five.review_reasons, ['omr_agreement_below_80']);
+  assert.match(r.review_note, /only 5 of 20 rows \(25%\) count as agreeing/);
+});
+test('Phone reconcile: confident scanner vs Gemini differing -> not flagged; weak + far apart -> flagged; adjacent -> not', async () => {
+  const conf = await phoneReconcile(python(), geminiWith(far(20)));
+  assert.deepStrictEqual(conf.review_reasons, []);
+  assert.strictEqual(conf.agreement_percent, 0);
+  assert.ok(conf.comparisons.every((c) => c.resolved_by === 'python_confident'));
+  assert.strictEqual(conf.ratings.m1, 5);
+  const farW = await phoneReconcile(python({ weak: weakRows(15) }), geminiWith(far(15)));
+  assert.deepStrictEqual(farW.review_reasons, ['omr_agreement_below_30', 'low_confidence_ocr_15_rows']);
+  const adj = await phoneReconcile(python({ weak: weakRows(15) }), geminiWith(adjacent(15)));
+  assert.deepStrictEqual(adj.review_reasons, ['low_confidence_ocr_15_rows']);
+  assert.strictEqual(adj.comparisons[0].resolved_by, 'adjacent_level');
 });
 test('Phone reconcile: Python OMR crashed -> omr_unavailable (no Gemini-only pass); weak rows still flagged', async () => {
   const r = await phoneReconcile({ error: 'Request failed with status code 400' });
@@ -472,6 +555,149 @@ test('Handle Gemini failure (phone): student id no longer taken from Python OCR'
   assert.strictEqual(r.student_id, '');
   assert.deepStrictEqual(r.review_reasons, ['ai_validation_failed']);
   assert.strictEqual(r.task_id, 'phone-1');
+});
+
+// ---------------------------------------------------------------- layout safety net (layout_check.js)
+// Python /process "layout" evidence. GOOD = a correctly read long-bond scan; OTHER = a scan of the
+// form whose rating block is printed wider (2026-10-01 set): measured values from the real OMR.
+const GOOD_LAYOUT = {
+  grid_source: 'structure-fit', expected_columns: 5, expected_rows: 20, columns_detected: 5,
+  column_rulings: [1494, 1604, 1715, 1825, 1936, 2044], column_boundaries_matched: 6, column_boundaries_total: 6,
+  rows_detected: 20, unexplained_rulings: [], boundaries_supported: 22, boundaries_total: 22,
+  structure_fit: { row_spacing: 37.1, units_per_section: [10, 12], body_units: 22, units_pinned: true, score: 21.67,
+    score_per_boundary: 0.985 },
+};
+const OTHER_LAYOUT = {
+  ...GOOD_LAYOUT, column_rulings: [1295, 1444, 1593, 1747, 1892, 2042], column_boundaries_matched: 2,
+  rows_detected: 25, unexplained_rulings: [130, 250, 610, 690, 800], boundaries_supported: 16,
+  structure_fit: { ...GOOD_LAYOUT.structure_fit, units_per_section: [12, 13], body_units: 25, score: 6.23, score_per_boundary: 0.283 },
+};
+const ORDER = ['O', 'VS', 'S', 'F', 'US'];
+const pyLayout = (layout, opts = {}) => ({ ...python(opts), layout });
+const BOTH_RECONCILERS = [['website', reconcile], ['phone', (py, g) => phoneReconcile(py, g)]];
+test('Layout: matching layout (Python evidence + Gemini column_order O..US) -> no flag, both reconcilers', async () => {
+  for (const [where, rec] of BOTH_RECONCILERS) {
+    const r = await rec(pyLayout(GOOD_LAYOUT), geminiResp({ column_order: ORDER }));
+    assert.deepStrictEqual(r.review_reasons, [], where);
+    assert.deepStrictEqual(r.layout_check, { mismatch: false, signals: [], column_order: ORDER, python_layout: GOOD_LAYOUT }, where);
+    // same order written differently: a string, full words, the printed numbers 5..1
+    for (const co of ['O, VS, S, F, US', ['o', 'v.s.', 'S', 'F', 'U.S.'], ['Outstanding', 'Very Satisfactory', 'Satisfactory', 'Fair', 'Unsatisfactory'],
+      ['5', '4', '3', '2', '1'], [5, 4, 3, 2, 1]]) {
+      const x = await rec(pyLayout(GOOD_LAYOUT), geminiResp({ column_order: co }));
+      assert.deepStrictEqual(x.review_reasons, [], `${where} ${JSON.stringify(co)}`);
+    }
+    // a confident scanner still wins over Gemini when the layout matches (rule unchanged)
+    const conf = await rec(pyLayout(GOOD_LAYOUT), geminiWith(far(20), { column_order: ORDER }));
+    assert.deepStrictEqual(conf.review_reasons, [], where);
+    assert.ok(conf.comparisons.every((c) => c.resolved_by === 'python_confident'), where);
+  }
+});
+test('Layout: reordered columns (Gemini column_order) -> layout_mismatch; the confident scanner no longer wins', async () => {
+  for (const [where, rec] of BOTH_RECONCILERS) {
+    for (const co of [['US', 'F', 'S', 'VS', 'O'], ['1', '2', '3', '4', '5'], ['VS', 'O', 'S', 'F', 'US']]) {
+      const r = await rec(pyLayout(GOOD_LAYOUT), geminiResp({ column_order: co }));
+      assert.deepStrictEqual(r.review_reasons, ['layout_mismatch'], `${where} ${co}`);
+      assert.strictEqual(r.needs_review, true);
+      assert.strictEqual(r.layout_check.mismatch, true);
+      assert.deepStrictEqual(r.layout_check.signals, [`column_order_${r.layout_check.column_order.join('_')}`]);
+      assert.match(r.review_note, /layout does not match the expected SAST form .*the AI read the column headers as /);
+    }
+    // reversed headers: Gemini reads every row by its header, the scanner by position (far apart).
+    // Without the layout check this page is clean (python_confident on all 20 rows, see above).
+    const rev = await rec(pyLayout(GOOD_LAYOUT), geminiWith(far(20), { column_order: ['US', 'F', 'S', 'VS', 'O'] }));
+    assert.ok(rev.review_reasons.includes('layout_mismatch'), `${where}: ${rev.review_reasons}`);
+    assert.ok(rev.review_reasons.includes('omr_agreement_below_30'), `${where}: no row is resolved as python_confident`);
+    assert.ok(rev.comparisons.every((c) => c.resolved_by !== 'python_confident'), where);
+    assert.strictEqual(rev.omr_agreement.resolved_differences, 0, where);
+  }
+});
+test('Layout: wrong column count (Python columns_detected, Gemini header count) -> layout_mismatch', async () => {
+  for (const [where, rec] of BOTH_RECONCILERS) {
+    for (const n of [4, 6, 0]) {
+      const r = await rec(pyLayout({ ...GOOD_LAYOUT, columns_detected: n }));
+      assert.deepStrictEqual(r.review_reasons, ['layout_mismatch'], `${where} ${n}`);
+      assert.deepStrictEqual(r.layout_check.signals, [`columns_detected_${n}`]);
+      assert.match(r.review_note, new RegExp(`found ${n} rating columns instead of 5`));
+    }
+    for (const co of [['O', 'VS', 'S', 'F'], ['O', 'VS', 'S', 'F', 'US', 'NA']]) {
+      const r = await rec(pyLayout(GOOD_LAYOUT), geminiResp({ column_order: co }));
+      assert.deepStrictEqual(r.review_reasons, ['layout_mismatch'], `${where} ${co}`);
+    }
+  }
+});
+test('Layout: the other printed layout (real measurements) -> layout_mismatch on every Python signal', async () => {
+  for (const [where, rec] of BOTH_RECONCILERS) {
+    const r = await rec(pyLayout(OTHER_LAYOUT));
+    assert.deepStrictEqual(r.review_reasons, ['layout_mismatch'], where);
+    assert.deepStrictEqual(r.layout_check.signals, ['columns_misaligned', 'rows_detected_25', 'row_rulings_missing', 'structure_fit_poor']);
+    assert.ok(r.comparisons.every((c) => c.resolved_by !== 'python_confident'));
+    // each signal alone flags; one faint column ruling (5/6) or 19/22 row lines do not
+    for (const [over, sig] of [[{ column_boundaries_matched: 4 }, 'columns_misaligned'], [{ rows_detected: 22 }, 'rows_detected_22'],
+      [{ boundaries_supported: 18 }, 'row_rulings_missing'],
+      [{ structure_fit: { ...GOOD_LAYOUT.structure_fit, score_per_boundary: 0.45 } }, 'structure_fit_poor']]) {
+      assert.deepStrictEqual((await rec(pyLayout({ ...GOOD_LAYOUT, ...over }))).layout_check.signals, [sig], `${where} ${sig}`);
+    }
+    for (const over of [{ column_boundaries_matched: 5 }, { boundaries_supported: 19 }, { structure_fit: null },
+      { structure_fit: { ...GOOD_LAYOUT.structure_fit, score_per_boundary: 0.645 } }]) {
+      assert.deepStrictEqual((await rec(pyLayout({ ...GOOD_LAYOUT, ...over }))).review_reasons, [], `${where} ${JSON.stringify(over)}`);
+    }
+  }
+});
+test('Layout: fields absent (old Python service, Gemini without column_order) -> never flags', async () => {
+  for (const [where, rec] of BOTH_RECONCILERS) {
+    for (const layout of [undefined, null, {}, { error: 'boom' }, 'weird', [], { columns_detected: '6', rows_detected: null }]) {
+      const py = layout === undefined ? python() : pyLayout(layout);
+      for (const co of [undefined, null, [], '', {}, 42]) {
+        const r = await rec(py, geminiResp(co === undefined ? {} : { column_order: co }));
+        assert.deepStrictEqual(r.review_reasons, [], `${where} layout ${JSON.stringify(layout)} order ${JSON.stringify(co)}`);
+        assert.strictEqual(r.layout_check.mismatch, false);
+      }
+    }
+    // Gemini failed / not a form: its column_order is not used
+    const bad = { candidates: [{ content: { parts: [{ text: 'no json here' }] } }] };
+    assert.ok(!(await rec(pyLayout(GOOD_LAYOUT), bad)).review_reasons.includes('layout_mismatch'), where);
+  }
+});
+test('Layout: fixed fallback grid + low row agreement -> layout_mismatch (phone too); fallback + high agreement -> no', async () => {
+  // confident Python vs Gemini far apart on 10 rows: 10/20 agree (< 80%)
+  const web = await reconcile(python({ grid: 'fallback' }), geminiWith(far(10)));
+  assert.deepStrictEqual(web.review_reasons, ['omr_fallback_grid', 'layout_mismatch']);
+  assert.deepStrictEqual(web.layout_check.signals, ['fallback_grid_low_agreement']);
+  assert.ok(web.comparisons.every((c) => c.resolved_by !== 'python_confident'));
+  const phone = await phoneReconcile(python({ grid: 'fallback' }), geminiWith(far(10)));
+  assert.deepStrictEqual(phone.review_reasons, ['layout_mismatch']);
+  assert.strictEqual(phone.validation_status, 'flagged');
+  // 16/20 agree -> enough; the website still flags the fallback grid itself
+  assert.deepStrictEqual((await reconcile(python({ grid: 'fallback' }), geminiWith(far(4)))).review_reasons, ['omr_fallback_grid']);
+  assert.deepStrictEqual((await phoneReconcile(python({ grid: 'fallback' }), geminiWith(far(4)))).review_reasons, []);
+  // same disagreement on a located grid: the confident scanner wins as before
+  assert.deepStrictEqual((await reconcile(python(), geminiWith(far(10)))).review_reasons, []);
+});
+test('Layout: phone keeps layout_mismatch even when Gemini found answers (unlike grid_not_detected)', async () => {
+  const r = await phoneReconcile(pyLayout(OTHER_LAYOUT, { table: false }));
+  assert.deepStrictEqual(r.review_reasons, ['layout_mismatch']);
+});
+test('Layout: a layout_mismatch page is never credited (Decide -> flagged)', async () => {
+  const rec = await reconcile(pyLayout(OTHER_LAYOUT));
+  const d = await decide(identity(), rec);
+  assert.strictEqual(d.decision, 'flagged');
+  assert.ok(d.review_reasons.includes('layout_mismatch'));
+  assert.match(d.review_note, /layout does not match the expected SAST form/);
+});
+test('Layout: both main Gemini prompts ask for the optional column_order; one identical layout_check.js copy per reconciler', async () => {
+  for (const name of ['ai validation ocr and omr', 'Website AI Validation']) {
+    const b = wf.nodes.find((x) => x.name === name).parameters.jsonBody;
+    assert.ok(b.includes('- Return letters, not numbers.\\n- column_order: the rating column headers exactly as printed'), name);
+    assert.ok(b.includes('"column_order": { "type": "ARRAY", "items": { "type": "STRING" } }'), name);
+    const req = b.slice(b.lastIndexOf('"required"'));
+    assert.ok(!req.includes('column_order'), `${name}: column_order is optional`);
+  }
+  const copies = ['Website Reconcile OCR OMR', 'reconcile ocr and omr1'].map((n) => {
+    const c = codeOf(n);
+    const i = c.indexOf('// layout check, from website_src/layout_check.js');
+    return c.slice(i, c.indexOf('// end of layout check', i));
+  });
+  assert.ok(copies[0].length > 100 && copies[0] === copies[1]);
 });
 
 // ---------------------------------------------------------------- Decide
@@ -730,7 +956,7 @@ test('Form check: identity_check is non-null exactly when a *_mismatch_* reason 
     ambiguous: ['computer programming', [scand(IT102, 'IT 102', 'Computer Programming 1', { ns: 0.8 }),
       scand(IT103, 'IT 103', 'Computer Programming 2', { ns: 0.8 }), BATCH_S({ ns: 0 })]],
   };
-  const extra = [['omr_agreement_below_80'], []];
+  const extra = [['omr_agreement_below_30'], []];
   let n = 0;
   for (const [im, ic] of Object.entries(instr)) {
     for (const [sm, [s, sc]] of Object.entries(subj)) {
@@ -785,9 +1011,10 @@ const REAL_S = ['Astrc Math', 'PO121', 'PCFP', 'IT1021', 'PC127', 'IT', 'ASP.NET
 // what 'Website Form Match' puts in ocr_*_norm
 const iNorm = (s) => s.toLowerCase().replace(/[^a-z]+/g, ' ').trim();
 const sNorm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-async function realDecide(ocrI, ocrS, { knownI = '', knownS = '', ic = liveIc(), sc = liveSc() } = {}) {
+// recExtra: extra reconciler fields (e.g. a stale known_instructor, which the website no longer has)
+async function realDecide(ocrI, ocrS, { knownS = '', ic = liveIc(), sc = liveSc(), recExtra = {} } = {}) {
   const batchNames = { batch_instructor_name: RODZ, batch_subject_code: 'PC121', batch_subject_name: 'Discreet Math' };
-  const rec = { ...REC, ocr_instructor: ocrI, ocr_subject: ocrS, known_instructor: knownI, known_subject: knownS };
+  const rec = { ...REC, ocr_instructor: ocrI, ocr_subject: ocrS, known_subject: knownS, ...recExtra };
   return decide(identity(batchNames), rec, formMatch({ i: iNorm(ocrI), ic, s: sNorm(ocrS), sc, ...batchNames }));
 }
 test('Real batch (Rodz Harvey D Licayan / PC121): all 8 instructor readings and every subject reading -> clean, batch credited', async () => {
@@ -845,19 +1072,21 @@ test('Real batch: a genuinely different instructor/subject on the form is still 
   // a code one off another subject's code only ever supports the batch
   assert.deepStrictEqual((await realDecide(RODZ, 'SE 202')).review_reasons, []);
 });
-test('Known-list pick from Gemini: counts for the batch; for another entry only with support from the raw reading', async () => {
-  // weak raw reading, Gemini picked the batch instructor/subject
-  let d = await realDecide('Proh Harvey D. Llegan', 'Astrc Math', { knownI: RODZ, knownS: 'PC121' });
+test('Known-list pick from Gemini (website: subjects only): counts for the batch; for another entry only with support from the raw reading', async () => {
+  // weak raw reading, Gemini picked the batch subject; the instructor is matched against the DB only
+  let d = await realDecide('Proh Harvey D. Llegan', 'Astrc Math', { knownS: 'PC121' });
   assert.strictEqual(d.partial_data.instructor_match, 'same');
-  assert.strictEqual(d.partial_data.instructor_match_confidence, 0.95);
+  assert.ok(d.partial_data.instructor_match_confidence < 0.95, 'no Gemini instructor pick boosts the score');
   assert.strictEqual(d.partial_data.subject_match, 'same');
   assert.strictEqual(d.partial_data.subject_match_confidence, 0.95);
-  assert.strictEqual(d.partial_data.known_instructor, RODZ);
+  assert.ok(!('known_instructor' in d.partial_data), 'website has no instructor pick');
   assert.strictEqual(d.partial_data.known_subject, 'PC121');
-  // another instructor that the raw reading does not support, or a name that is not on the list -> ignored
-  for (const knownI of ['Joseph King', 'Somebody Else']) {
-    d = await realDecide('Kodi Harvey D. Licayan', 'PC121', { knownI });
-    assert.strictEqual(d.partial_data.instructor_match, 'same', knownI);
+  // a stale known_instructor (e.g. an old reconciler output) is ignored by Decide
+  for (const known of [RODZ, 'Joseph King', 'Somebody Else']) {
+    const ref = await realDecide('Proh Harvey D. Llegan', 'PC121');
+    d = await realDecide('Proh Harvey D. Llegan', 'PC121', { recExtra: { known_instructor: known } });
+    assert.deepStrictEqual(d.partial_data.instructor_candidates, ref.partial_data.instructor_candidates, known);
+    assert.strictEqual(d.partial_data.instructor_match, 'same', known);
     assert.deepStrictEqual(d.review_reasons, []);
   }
   // another subject that the raw reading supports (ASP.NET ~ asp.net mvc) -> found
@@ -869,7 +1098,7 @@ test('Known-list pick from Gemini: counts for the batch; for another entry only 
   assert.strictEqual(d.partial_data.subject_match, 'same');
   assert.deepStrictEqual(d.review_reasons, []);
   // unreadable stays unreadable whatever Gemini picked
-  d = await realDecide('', '', { knownI: RODZ, knownS: 'PC121' });
+  d = await realDecide('', '', { knownS: 'PC121', recExtra: { known_instructor: RODZ } });
   assert.strictEqual(d.partial_data.instructor_match, 'unreadable');
   assert.strictEqual(d.partial_data.subject_match, 'unreadable');
 });
@@ -1036,8 +1265,8 @@ test('Spot check: ~1 in 20 otherwise-clean pages get spot_check (deterministic b
 });
 
 // ---------------------------------------------------------------- flagged path
-const REC_DISAGREE = () => ({ ...REC, review_reasons: ['omr_agreement_below_80'], agreement_percent: 75,
-  review_note: 'Python and Gemini agree on only 15 of 20 rows (75%); at least 80% is required.' });
+const REC_DISAGREE = () => ({ ...REC, review_reasons: ['omr_agreement_below_30'], agreement_percent: 25,
+  review_note: 'Python and Gemini agree on only 5 of 20 rows (25%); at least 30% is required.' });
 test('Flagged Record: passes a flagged decision through (identity_check null, agreement kept)', async () => {
   const d = await decide(identity(), REC_DISAGREE());
   const out = await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX });
@@ -1045,8 +1274,8 @@ test('Flagged Record: passes a flagged decision through (identity_check null, ag
   assert.strictEqual(out[0].json.user_id, STAFF);   // failed_scan_queue.user_id = SAO staff
   assert.strictEqual(out[0].json._source, 'website');
   assert.strictEqual(out[0].json.identity_check, null);
-  assert.strictEqual(out[0].json.partial_data.agreement_percent, 75);
-  assert.match(out[0].json.partial_data.review_note, /15 of 20 rows \(75%\)/);
+  assert.strictEqual(out[0].json.partial_data.agreement_percent, 25);
+  assert.match(out[0].json.partial_data.review_note, /5 of 20 rows \((25%)\)/);
 });
 test('Flagged Record: raw upsert found another page of the same student (saved=false) -> duplicate_student_id', async () => {
   const clean = await decide(identity());
@@ -1132,8 +1361,8 @@ test('build flagged record1: website record -> only real failed_scan_queue colum
   assert.strictEqual(rec.scan_image_id, 'img1');
   assert.strictEqual(rec.partial_data.instructor, 'Juan Dela Cruz');
   assert.strictEqual(rec.partial_data.subject, 'IT 101');
-  assert.deepStrictEqual(rec.review_reasons, ['omr_agreement_below_80']);
-  assert.strictEqual(rec.partial_data.agreement_percent, 75);
+  assert.deepStrictEqual(rec.review_reasons, ['omr_agreement_below_30']);
+  assert.strictEqual(rec.partial_data.agreement_percent, 25);
   assert.strictEqual(rec.omr_comparison.agreement_percent, 100, "omr_comparison = the reconciler's omr_agreement object");
   for (const k of FORM_PD_KEYS) assert.ok(k in rec.partial_data, k);
 });
@@ -1187,8 +1416,8 @@ test('Respond to Webhook: website -> contract (flagged / internal_error_not_save
   const wrec = (await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX }))[0].json;
   const ok = JSON.parse(evalBody({}, { 'Website Flagged Record': wrec }));
   assertContract([{ json: ok }], 'flagged');
-  assert.deepStrictEqual(ok.review_reasons, ['omr_agreement_below_80']);
-  assert.match(ok.message, /75%/);
+  assert.deepStrictEqual(ok.review_reasons, ['omr_agreement_below_30']);
+  assert.match(ok.message, /25%/);
   assert.ok(!/AY\/Semester|Mà essor/.test(ok.message), "the form's instructor/subject never appear as a problem");
   assert.ok(!ok.review_reasons.includes('internal_error_not_saved'));
   const failed = JSON.parse(evalBody({ error: 'HTTP 500' }, { 'Website Flagged Record': wrec }));
@@ -1771,6 +2000,48 @@ test('Website Gemini prompt only: optional confidence fields + header crop image
   for (const f of ['known_subject', 'instructor_confidence', 'subject_confidence', 'student_id_confidence']) {
     assert.ok(!req.includes(f), f);
   }
+});
+test('Website: no instructor name or list is sent to Gemini (Known Names SQL, AI Validation body, reconciler, Verify Remark Words)', async () => {
+  const NAMES = ['Joseph King', RODZ, 'Evangeline Caruana'];
+  // the lookup itself: subjects only, no parameters (it used to pass the batch instructor id)
+  const kn = wf.nodes.find((x) => x.name === 'Website Known Names');
+  const sql = kn.parameters.query.replace(/--[^\n]*/g, '');
+  assert.ok(!/user_info|instructor/i.test(sql), 'Website Known Names does not read or return instructors');
+  assert.ok(/\bAS\s+subject_list\b/.test(sql) && /\bAS\s+subjects\b/.test(sql), 'subject list kept');
+  assert.strictEqual(kn.parameters.options.queryReplacement, undefined, 'no query parameters');
+  const phoneKn = wf.nodes.find((x) => x.name === 'Phone Known Names').parameters.query;
+  assert.ok(/AS instructor_list/.test(phoneKn), 'phone lookup unchanged');
+  // the built request body: even if the lookup returned instructor names, none reaches Gemini
+  const src = wf.nodes.find((x) => x.name === 'Website AI Validation').parameters.jsonBody.replace(/^=/, '');
+  for (const known of [
+    { subject_list: 'PC121 = Discreet Math', subjects: [{ code: 'PC121', name: 'Discreet Math' }] },
+    { instructor_list: NAMES.join('; '), instructor_names: NAMES, subject_list: 'PC121 = Discreet Math' },
+    { error: 'timeout' }]) {
+    const nodes = { 'Website Prepare Scan': { image_base64: 'QUJD', mime_type: 'image/jpeg', header_image_base64: 'REVG' },
+      'Website Known Names': known };
+    const $ = (ref) => ({ first: () => ({ json: nodes[ref] }) });
+    // eslint-disable-next-line no-new-func
+    const text = src.replace(/\{\{([\s\S]*?)\}\}/g, (m, js) => String(new Function('$', `return (${js});`)($)));
+    const body = JSON.parse(text);
+    for (const name of NAMES) assert.ok(!text.includes(name), `${name} not in the Gemini body`);
+    assert.ok(!/known_instructor|Known instructors|instructor_list|instructor_names/.test(text));
+    assert.strictEqual(body.generationConfig.responseSchema.properties.known_instructor, undefined);
+  }
+  // reconciler: a known_instructor Gemini might still return is dropped, known_subject is kept
+  const g = geminiResp({ known_instructor: RODZ, known_subject: 'PC121' });
+  const rec = (await run('Website Reconcile OCR OMR', g, { 'Website Python OMR': python(), 'Website AI Validation': g }))[0].json;
+  assert.ok(!('known_instructor' in rec));
+  assert.strictEqual(rec.known_subject, 'PC121');
+  // remark re-check: its prompt only carries the flagged remark words
+  const rg = geminiResp({ remarks: REMARK, instructor: RODZ });
+  const item = (await run('Website Remark Check', rg, { 'Website AI Validation': rg,
+    'Website Prepare Scan': { ...CTX, received_at_ms: Date.now() } }))[0].json;
+  assert.strictEqual(item.remark_check_needed, true);
+  const vm = /^=\{\{([\s\S]*)\}\}$/.exec(wf.nodes.find((x) => x.name === 'Website Verify Remark Words').parameters.jsonBody.trim());
+  const vnodes = { 'Website Prepare Scan': CTX };
+  // eslint-disable-next-line no-new-func
+  const vbody = new Function('$', '$json', `return (${vm[1]});`)((ref) => ({ first: () => ({ json: vnodes[ref] }) }), item);
+  for (const name of NAMES) assert.ok(!vbody.includes(name), `${name} not in the re-check body`);
 });
 
 (async () => {

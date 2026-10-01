@@ -145,6 +145,10 @@ export default function Home({ stationId, profile, onSwitchStation, onStationMis
         </ol>
       )}
 
+      <p className="small">
+        Need to fix forms from an earlier batch? Open <Link to="/review">Review forms</Link>. It lists open and closed batches.
+      </p>
+
       {stationError && <div className="error" role="alert">{stationError}</div>}
       {batchError && <div className="error" role="alert">{batchError}</div>}
 

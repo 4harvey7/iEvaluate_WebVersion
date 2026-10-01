@@ -283,6 +283,13 @@ export const api = {
   // previous answer's cursor) unless the answer says full: true.
   getReviews: (batchId, since, signal) =>
     request(`/reviews/batch/${q(batchId)}${since ? `?since=${q(since)}` : ""}`, { signal }),
+  // Batches this person may review (the /review page). Pass next_before back as `before` for more.
+  listReviewBatches: ({ before, onlyPending, limit = 20 } = {}, signal) => {
+    const p = new URLSearchParams({ limit: String(limit) });
+    if (before) p.set("before", before);
+    if (onlyPending) p.set("only_pending", "true");
+    return request(`/reviews/batches?${p}`, { signal });
+  },
   claimReview: (id, release = false) => request(`/reviews/queue/${q(id)}/claim`, { method: "POST", body: { release } }),
   approveReview: (id, body) => request(`/reviews/queue/${q(id)}/approve`, { method: "POST", body }),
   rejectReview: (id, body) => request(`/reviews/queue/${q(id)}/reject`, { method: "POST", body }),

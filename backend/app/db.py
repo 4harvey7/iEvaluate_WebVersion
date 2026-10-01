@@ -74,7 +74,6 @@ class Settings:
         self.scan_image_retention_days: int = max(0, int(_float_env("SCAN_IMAGE_RETENTION_DAYS", 90)))
         self.scan_image_max_side: int = int(_float_env("SCAN_IMAGE_MAX_SIDE", 1800))
         self.scan_image_jpeg_quality: int = int(_float_env("SCAN_IMAGE_JPEG_QUALITY", 75))
-        self.password_reset_redirect_url: str = os.environ.get("PASSWORD_RESET_REDIRECT_URL", "").strip()
         # Public backend URL written into the watcher installer's watcher_config.json
         # (same value as the frontend's VITE_API_BASE). Empty = derive from the request.
         self.watcher_api_base: str = (
@@ -94,10 +93,19 @@ class Settings:
         # the rightmost X-Forwarded-For entry. Leave false for local runs (headers
         # would be spoofable); set true on Render (it sits behind Cloudflare).
         self.trust_proxy_headers: bool = _bool_env("TRUST_PROXY_HEADERS", False)
+        # Brevo (app/mailer.py): same API key and sender as the Flutter app's
+        # Supabase functions. Optional: empty = activation still works, no email.
+        self.brevo_api_key: str = os.environ.get("BREVO_API_KEY", "").strip()
+        self.brevo_sender_email: str = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
+        self.brevo_sender_name: str = os.environ.get("BREVO_SENDER_NAME", "").strip() or "SAO Management"
 
     @property
     def simulation_mode(self) -> bool:
         return self.simulate_scans and not self.n8n_batch_webhook_url
+
+    @property
+    def email_configured(self) -> bool:
+        return bool(self.brevo_api_key and self.brevo_sender_email)
 
 
 BATCH_WEBHOOK_PATH = "sast-batch-scan"

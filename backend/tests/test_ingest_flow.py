@@ -196,14 +196,46 @@ def test_n8n_auth_rejection_is_config_error_not_counted(setup):
         assert n8n.headers == {"X-Webhook-Secret": "s"}
 
 
-@pytest.mark.parametrize("exc", [httpx.ReadTimeout("t"), httpx.ConnectError("c"), httpx.RemoteProtocolError("r")])
-def test_timeout_or_transport_error_leaves_item_processing(setup, exc):
-    sb, n8n, client = setup(claimed(4), raises=exc)
+@pytest.mark.parametrize("exc,code,msg", [
+    (httpx.ReadTimeout("t"), "pipeline_timeout", logic.PIPELINE_TIMEOUT_MSG),
+    (httpx.ConnectError("c"), "pipeline_unavailable", logic.PIPELINE_UNAVAILABLE_MSG),
+    (httpx.RemoteProtocolError("r"), "pipeline_unavailable", logic.PIPELINE_UNAVAILABLE_MSG),
+])
+def test_timeout_or_transport_error_is_retryable_error(setup, exc, code, msg):
+    sb, n8n, client = setup(claimed(0), raises=exc)
     r = client.post("/scans/ingest", json=_payload())
     assert r.status_code == 502
-    assert r.json()["detail"]["code"] in ("pipeline_timeout", "pipeline_unavailable")
-    assert sb.completes() == []  # not marked error -> stale window blocks re-claim; nothing counted
+    assert r.json()["detail"]["code"] == code
     assert "n8n.invalid" not in r.text
+    # Stored as a retryable error ("Trying again" on the page), counted toward the cap.
+    (c,) = sb.completes()
+    assert c["p_status"] == "error" and c["p_retryable"] is True and c["p_count_failure"] is True
+    assert c["p_message"] == msg
+    assert logic.item_error_code({"status": "error", "retryable": True, "message": c["p_message"]}) == code
+
+
+@pytest.mark.parametrize("exc", [httpx.ReadTimeout("t"), httpx.ConnectError("c")])
+def test_timeout_or_transport_error_after_cap_is_permanent_422(setup, exc):
+    sb, n8n, client = setup(claimed(failures=4, attempts=9), raises=exc)
+    r = client.post("/scans/ingest", json=_payload())
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "failed_after_retries"
+    (c,) = sb.completes()
+    assert c["p_status"] == "error" and c["p_retryable"] is False
+
+
+def test_marking_off_and_practice_mode_unchanged(setup, monkeypatch):
+    sb, n8n, client = setup(claimed(4))
+    s = scans.get_settings()
+    s.n8n_batch_webhook_url = ""
+    r = client.post("/scans/ingest", json=_payload())
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "pipeline_not_configured"
+    (c,) = sb.completes()
+    assert c["p_retryable"] is True and c["p_count_failure"] is False and n8n.calls == 0
+    s.simulate_scans = True
+    sb.rpcs.clear()
+    r = client.post("/scans/ingest", json=_payload())
+    assert r.status_code == 200 and r.json()["simulated"] is True and n8n.calls == 0
 
 
 # ---------------------------------------------------------------- not_saved_permanent + staff_id

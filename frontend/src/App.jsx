@@ -5,6 +5,7 @@ import Home from "./pages/Home.jsx";
 import BatchSetup from "./pages/BatchSetup.jsx";
 import ScanningLive from "./pages/ScanningLive.jsx";
 import Review from "./pages/Review.jsx";
+import ReviewBatches from "./pages/ReviewBatches.jsx";
 import Activation from "./pages/Activation.jsx";
 import WatcherSetup from "./pages/WatcherSetup.jsx";
 import Help from "./pages/Help.jsx";
@@ -211,6 +212,7 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
   const onBatchPage = location.pathname.startsWith("/batch/");
   // The review page (/batch/:id/review) has its own menu entry and a wider layout.
   const onReviewPage = /^\/batch\/[^/]+\/review\/?$/.test(location.pathname);
+  const onReviewList = /^\/review\/?$/.test(location.pathname);
 
   return (
     <div className={`app-shell ${menuOpen ? "menu-open" : ""}`}>
@@ -261,9 +263,6 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
                 <span className="nav-step">3</span> Scan &amp; check
                 <span className="nav-live">open</span>
               </NavLink>
-              <NavLink to={`/batch/${openBatchId}/review`}>
-                <span className="nav-step">4</span> Review forms
-              </NavLink>
             </>
           ) : (
             <>
@@ -274,13 +273,12 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
                   <small>Start a batch first</small>
                 </span>
               </span>
-              {onReviewPage && (
-                <NavLink to={location.pathname} className="active">
-                  <span className="nav-step">4</span> Review forms
-                </NavLink>
-              )}
             </>
           )}
+          {/* Always open: every batch this person may review, open or closed. */}
+          <NavLink to="/review" className={({ isActive }) => (isActive || onReviewPage ? "active" : "")}>
+            <span className="nav-step">4</span> Review forms
+          </NavLink>
 
           {profile.is_admin && (
             <>
@@ -319,7 +317,7 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
       {menuOpen && <div className="sidebar-backdrop" onClick={() => setMenuOpen(false)} aria-hidden="true" />}
 
       <main className="main" id="main" tabIndex={-1}>
-        <div className={`card ${onReviewPage ? "card-wide" : ""}`}>{children}</div>
+        <div className={`card ${onReviewPage || onReviewList ? "card-wide" : ""}`}>{children}</div>
       </main>
     </div>
   );
@@ -447,6 +445,7 @@ export default function App() {
           <Route path="/watcher-setup" element={<Navigate to="/scanner-setup" replace />} />
           <Route path="/batch/:batchId" element={<ScanningLive stationId={stationId} />} />
           <Route path="/batch/:batchId/review" element={<Review profile={profile} />} />
+          <Route path="/review" element={<ReviewBatches profile={profile} stationId={stationId} />} />
           <Route
             path="/activate"
             element={

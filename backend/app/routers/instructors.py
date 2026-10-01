@@ -7,8 +7,9 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app import mailer
 from app.audit import audit
-from app.db import get_settings, get_supabase, is_valid_uuid, new_auth_client
+from app.db import get_supabase, is_valid_uuid
 from app.name_match import is_near_duplicate, same_name, search_words_match, surname_parts
 from app.routers.departments import department_lookup
 from app.security import INSTRUCTOR_ROLES, CurrentUser, require_admin, require_staff, role_maps
@@ -104,6 +105,12 @@ def _cleanup_placeholder(sb, user_id: str) -> None:
         sb.auth.admin.delete_user(user_id)
     except Exception:
         log.exception("cleanup: failed deleting auth user for placeholder %s", user_id)
+
+
+def _is_full_name_taken(exc: Exception) -> bool:
+    """The database's unique index on first + last name rejected the row."""
+    text = f"{getattr(exc, 'code', '')} {getattr(exc, 'message', '')} {exc}"
+    return "full_name_unique" in text
 
 
 def _near_duplicates(sb, first: str, last: str, limit: int = 5) -> list[dict]:
@@ -235,9 +242,15 @@ def create_placeholder_instructor(body: CreatePlaceholder, user: CurrentUser = D
                 "department_id": body.department_id,
                 "is_primary": True,
             }).execute()
-    except Exception:
+    except Exception as e:
         log.exception("placeholder instructor creation failed; rolling back")
         _cleanup_placeholder(sb, new_id)
+        if _is_full_name_taken(e):
+            raise HTTPException(status_code=409, detail={
+                "code": "instructor_name_taken",
+                "message": (f'Someone named "{first} {last}" already exists, and two people can\'t have exactly the '
+                            "same name. Search for them and pick them instead. Nothing was saved."),
+            })
         raise HTTPException(status_code=500, detail="Could not create the instructor. Nothing was saved; try again.")
 
     meta = {"instructor_id": new_id, "department_id": body.department_id, "employment_type": body.employment_type}
@@ -256,12 +269,22 @@ def create_placeholder_instructor(body: CreatePlaceholder, user: CurrentUser = D
     }
 
 
+def _is_blank(value) -> bool:
+    return value is None or not str(value).strip()
+
+
 class ActivateInstructor(BaseModel):
     real_email: str = Field(min_length=3, max_length=254)
 
 
 @router.post("/{instructor_id}/activate")
 def activate_instructor(instructor_id: str, body: ActivateInstructor, admin: CurrentUser = Depends(require_admin)):
+    """SAO admin only: turn a placeholder instructor into a real login with
+    their real email (same account id, so their batches and results stay).
+    Then emails them (Brevo, app/mailer.py) how to set a password with
+    "Forgot Password?" in the iEvaluate phone app. The email is best effort:
+    the activation is already saved, so a mail failure only comes back as
+    email_sent: false for the admin to pass the steps on in person."""
     if not is_valid_uuid(instructor_id):
         raise HTTPException(status_code=404, detail="Instructor not found")
     email = body.real_email.strip().lower()
@@ -269,7 +292,7 @@ def activate_instructor(instructor_id: str, body: ActivateInstructor, admin: Cur
         raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "Enter a valid email address."})
 
     sb = get_supabase()
-    res = sb.table("user_info").select("id, first_name, last_name, email, is_placeholder").eq("id", instructor_id).limit(1).execute()
+    res = sb.table("user_info").select("id, first_name, last_name, email, is_placeholder, university_id, address").eq("id", instructor_id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Instructor not found")
     existing = res.data[0]
@@ -304,18 +327,19 @@ def activate_instructor(instructor_id: str, body: ActivateInstructor, admin: Cur
             log.exception("activation: auth revert failed")
         raise HTTPException(status_code=500, detail="Activation failed. Nothing was changed; try again.")
 
-    email_sent = True
-    try:
-        opts = {}
-        redirect = get_settings().password_reset_redirect_url
-        if redirect:
-            opts["redirect_to"] = redirect
-        new_auth_client().auth.reset_password_for_email(email, opts)
-    except Exception:
-        email_sent = False
-        log.exception("activation: password reset email failed")
+    # Activation is saved. Now tell the instructor how to set a password ("Forgot
+    # Password?" in the phone app). Never raises and never rolls back: a mail
+    # failure is reported (email_sent false) and the admin passes the steps on.
+    subject, html = mailer.activation_email(
+        existing.get("first_name"),
+        email,
+        missing_id=_is_blank(existing.get("university_id")),
+        missing_address=_is_blank(existing.get("address")),
+    )
+    email_sent, email_error = mailer.send_email(email, subject, html)
 
-    audit(admin.id, "instructor_account_activated", {
-        "instructor_id": instructor_id, "new_email": email, "reset_email_sent": email_sent,
-    })
-    return {"ok": True, "email_sent": email_sent, "email": email}
+    meta = {"instructor_id": instructor_id, "new_email": email, "email_sent": email_sent}
+    if not email_sent:
+        meta["email_error"] = email_error
+    audit(admin.id, "instructor_account_activated", meta)
+    return {"ok": True, "activated": True, "email": email, "email_sent": email_sent}

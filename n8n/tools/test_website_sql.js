@@ -179,7 +179,8 @@ function filterCorpus() {
 // ------------------------------------------------------------------ helpers
 let db;
 function evalReplacement(n, $json, nodes) {
-  const raw = n.parameters.options.queryReplacement;
+  const raw = (n.parameters.options || {}).queryReplacement;
+  if (raw === undefined) return [];   // a query without parameters ('Website Known Names')
   const m = /^=\{\{([\s\S]*)\}\}$/.exec(raw.trim());
   if (!m) throw new Error(`${n.name}: unexpected queryReplacement ${raw}`);
   const $ = (ref) => {
@@ -300,8 +301,9 @@ function decideItem(over = {}) {
 
 // Python /process and Gemini responses for the end-to-end tests (letters cycle O VS S F US).
 const LETTERS = ['O', 'VS', 'S', 'F', 'US'];
-function pyResp(ocr = {}) {
-  const cell = (i) => ({ detected: true, rating_name: LETTERS[i % 5] });
+// blankRows = rows 0..n-1 Python reads blank (Gemini fills them: a disagreement the agreement rule counts)
+function pyResp(ocr = {}, { blankRows = 0 } = {}) {
+  const cell = (i) => (i < blankRows ? { detected: false, rating_name: null } : { detected: true, rating_name: LETTERS[i % 5] });
   return {
     table_found: true, grid_source: 'structure-fit',
     ratings: { management: [...Array(10)].map((_, i) => cell(i)), performance: [...Array(10)].map((_, i) => cell(i + 10)) },
@@ -310,6 +312,7 @@ function pyResp(ocr = {}) {
     ocr_fields: { instructor: 'AY/Semester: L U', subject: 'Mà essor', student_id: 'PY-999', remarks: 'py', ...ocr },
   };
 }
+const QS = [...Array(10)].map((_, i) => `m${i + 1}`).concat([...Array(10)].map((_, i) => `p${i + 1}`));
 function gemResp(fields = {}, ratingOver = {}) {
   const ratings = {};
   for (let i = 0; i < 10; i++) { ratings[`m${i + 1}`] = LETTERS[i % 5]; ratings[`p${i + 1}`] = LETTERS[(i + 10) % 5]; }
@@ -584,7 +587,7 @@ async function suite(rawIdType) {
     const webRec = {
       _source: 'website', task_id: 'web:f1', user_id: ID.staff, term_id: ID.term, batch_id: ID.batch,
       table_found: true, grid_source: 'corners', validation_status: 'flagged',
-      review_reasons: ['omr_agreement_below_80', "it's"], omr_agreement: null,
+      review_reasons: ['omr_agreement_below_30', "it's"], omr_agreement: null,
       partial_data: { instructor: 'Juan Dela Cruz', subject: 'IT 101', remarks: "multi\nline -- 'quoted'", ratings: { m1: 5 } },
       scan_image: 'QUJD',
     };
@@ -601,7 +604,7 @@ async function suite(rawIdType) {
     await db.none(`INSERT INTO public.failed_scan_queue ($1:name)
       SELECT $1:name FROM jsonb_populate_record(NULL::public.failed_scan_queue, $2::jsonb)`, [Object.keys(record), JSON.stringify(record)]);
     const row = await db.one('SELECT * FROM public.failed_scan_queue');
-    assert.deepStrictEqual(row.review_reasons, ['omr_agreement_below_80', "it's"]);
+    assert.deepStrictEqual(row.review_reasons, ['omr_agreement_below_30', "it's"]);
     assert.strictEqual(row.status, 'pending');
     assert.strictEqual(row.validation_status, 'flagged');
     assert.strictEqual(row.user_id, ID.staff);
@@ -622,27 +625,27 @@ async function suite(rawIdType) {
       SELECT $1:name FROM jsonb_populate_record(NULL::public.failed_scan_queue, $2::jsonb)`, [Object.keys(record), JSON.stringify(record)]);
     return db.one('SELECT * FROM public.failed_scan_queue WHERE task_id = $1', [record.task_id]);
   }
-  test('website end to end: batch name on the form + 75% agreement -> flagged ONLY omr_agreement_below_80', async () => {
-    const gem = gemResp({ instructor: 'Dr. Juan A. Dela Cruz, MIT', subject: 'IT 101' },
-      { m1: 'VS', m2: 'S', m3: 'O', p1: 'VS', p2: 'S' });   // 15 of 20 rows agree
-    const { ctx, d } = await websiteDecide('web:e2e-flag', gem);
+  test('website end to end: batch name on the form + (25%) agreement -> flagged ONLY omr_agreement_below_30', async () => {
+    const gem = gemResp({ instructor: 'Dr. Juan A. Dela Cruz, MIT', subject: 'IT 101' });
+    // Python blank on 15 rows Gemini reads -> 5 of 20 rows agree (a confident scanner would win instead)
+    const { ctx, d } = await websiteDecide('web:e2e-flag', gem, pyResp({}, { blankRows: 15 }));
     assert.strictEqual(d.decision, 'flagged');
-    assert.deepStrictEqual(d.review_reasons, ['omr_agreement_below_80']);
+    assert.deepStrictEqual(d.review_reasons, ['omr_agreement_below_30']);
     assert.strictEqual(d.identity_check, null);
     const [wrec] = await runCode('Website Flagged Record', [d], { 'Website Prepare Scan': ctx });
     const [record] = await runCode('build flagged record1', [{}], { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: null }] });
     const row = await insertFlagged(record);
-    assert.deepStrictEqual(row.review_reasons, ['omr_agreement_below_80']);
+    assert.deepStrictEqual(row.review_reasons, ['omr_agreement_below_30']);
     assert.strictEqual(row.partial_data.instructor, 'Juan Dela Cruz', 'the batch instructor DB name, not the OCR text');
     assert.strictEqual(row.partial_data.subject, 'IT 101');
     assert.strictEqual(row.partial_data.ocr_instructor, 'Dr. Juan A. Dela Cruz, MIT');
     assert.strictEqual(row.partial_data.instructor_match, 'same');
     assert.strictEqual(row.partial_data.subject_match, 'same');
-    assert.strictEqual(row.partial_data.agreement_percent, 75);
+    assert.strictEqual(row.partial_data.agreement_percent, 25);
     assert.strictEqual(row.partial_data.student_id, '2021-7777', 'student id from Gemini, not Python OCR');
-    assert.match(row.partial_data.review_note, /15 of 20 rows \(75%\)/);
+    assert.match(row.partial_data.review_note, /5 of 20 rows \((25%)\)/);
     assert.ok(!('identity_check' in row.partial_data));
-    assert.strictEqual(row.omr_comparison.agreement_percent, 75);
+    assert.strictEqual(row.omr_comparison.agreement_percent, 25);
     assert.strictEqual(row.omr_comparison.comparisons.length, 20);
   });
   test('website end to end: garbage OCR instructor/subject -> not found, NOT flagged, credited to the batch', async () => {
@@ -675,16 +678,16 @@ async function suite(rawIdType) {
   });
   test('phone end to end: new reconciler record (agreement, Gemini-only text) fits failed_scan_queue', async () => {
     const hook = { body: { task_id: 'phone-e2e', user_id: ID.staff, term_id: ID.term, image: 'data:image/jpeg;base64,QUJD' } };
-    const gem = gemResp({ instructor: '', subject: '' }, { m1: 'VS', m2: 'S', m3: 'O', p1: 'VS', p2: 'S' });
+    const gem = gemResp({ instructor: '', subject: '' });
     const [rec] = await runCode('reconcile ocr and omr1', [{}],
-      { 'image to ocr and omr python': pyResp(), 'ai validation ocr and omr': gem, 'SAST image from phone': hook });
-    assert.deepStrictEqual(rec.review_reasons, ['missing_instructor', 'missing_subject', 'omr_agreement_below_80']);
+      { 'image to ocr and omr python': pyResp({}, { blankRows: 15 }), 'ai validation ocr and omr': gem, 'SAST image from phone': hook });
+    assert.deepStrictEqual(rec.review_reasons, ['missing_instructor', 'missing_subject', 'omr_agreement_below_30']);
     assert.strictEqual(rec.instructor, '', 'no Python OCR fallback');
     const [record] = await runCode('build flagged record1', [{}], { 'reconcile ocr and omr1': rec, 'Save scan error image': [{ id: null }] });
     const row = await insertFlagged(record);
-    assert.strictEqual(row.partial_data.agreement_percent, 75);
+    assert.strictEqual(row.partial_data.agreement_percent, 25);
     assert.strictEqual(row.partial_data.student_id, '2021-7777');
-    assert.strictEqual(row.omr_comparison.agreement_min_percent, 80);
+    assert.strictEqual(row.omr_comparison.agreement_min_percent, 30);
     assert.strictEqual(row.batch_id, null);
   });
   test('flagged: Get staff FCM for flagged scan reads user_id from build flagged record1 (queue POST has no body)', async () => {
@@ -974,19 +977,28 @@ async function suite(rawIdType) {
         assert.deepStrictEqual(d.review_reasons, ['subject_mismatch_found'], s);
         assert.strictEqual(d.partial_data.suggested_subject_id, want, s);
       }
-      // Gemini's pick from the known list (reconciler output known_instructor / known_subject)
+      // Gemini's subject pick from the known list (reconciler output known_subject); the website
+      // has no instructor pick, so a stale known_instructor is ignored by Decide
       const { d } = await decideForm('Proh Harvey D. Llegan', 'Astrc Math', batch,
         { known_instructor: 'Rodz Harvey d Licayan', known_subject: 'PC121' });
-      assert.strictEqual(d.partial_data.instructor_match_confidence, 0.95);
+      const { d: ref } = await decideForm('Proh Harvey D. Llegan', 'Astrc Math', batch, { known_subject: 'PC121' });
+      assert.strictEqual(d.partial_data.instructor_match, ref.partial_data.instructor_match);
+      assert.strictEqual(d.partial_data.instructor_match_confidence, ref.partial_data.instructor_match_confidence);
+      assert.deepStrictEqual(d.partial_data.instructor_candidates, ref.partial_data.instructor_candidates);
+      assert.ok(!('known_instructor' in d.partial_data));
       assert.strictEqual(d.partial_data.subject_match_confidence, 0.95);
-      // the known lists for the prompt: creditable instructors + placeholders, sorted, the batch not singled out
+      // the known lists for the prompt. Phone: creditable instructors + placeholders, sorted, plus
+      // subjects. Website: subjects only -- no instructor names are looked up or sent to Gemini.
       const [kw] = await runNode('Website Known Names', {}, { 'Website Prepare Scan': batch });
       const [kp] = await runNode('Phone Known Names', {}, {});
-      assert.deepStrictEqual(kp, kw, 'same lists on both branches (the batch instructor is creditable anyway)');
-      assert.deepStrictEqual(kw.instructor_names, ['Ana Dela Cruz', 'Banjiee Caruana', 'Carlo Mendoza', 'Evangeline Caruana', 'Juan Carlos Santos',
+      assert.deepStrictEqual(Object.keys(kw).sort(), ['known_names_version', 'subject_list', 'subjects']);
+      assert.deepStrictEqual(kw.subjects, kp.subjects, 'same subject list on both branches');
+      assert.strictEqual(kw.subject_list, kp.subject_list);
+      assert.deepStrictEqual(kp.instructor_names, ['Ana Dela Cruz', 'Banjiee Caruana', 'Carlo Mendoza', 'Evangeline Caruana', 'Juan Carlos Santos',
         'Juan Dela Cruz', 'Maria Santos', 'Nora Villanueva', 'Pedro Reyes', 'Rodz Harvey d Licayan', 'Ronald Kinggg licayan']);
-      assert.ok(kw.instructor_list.startsWith('Ana Dela Cruz; Banjiee Caruana; '));
-      assert.ok(!/Rosa|Liza|Sam Staff/.test(kw.instructor_list), 'pending / SAO accounts are not listed');
+      assert.ok(kp.instructor_list.startsWith('Ana Dela Cruz; Banjiee Caruana; '));
+      assert.ok(!/Rosa|Liza|Sam Staff/.test(kp.instructor_list), 'pending / SAO accounts are not listed');
+      assert.ok(!kp.instructor_names.some((n) => JSON.stringify(kw).includes(n)), 'no instructor name in the website lookup');
       assert.deepStrictEqual(kw.subjects.map((x) => x.code), ['ASP 101', 'DDMGT-3', 'GE 104', 'IT 101', 'IT 102', 'PC121']);
       assert.ok(kw.subject_list.includes('PC121 = Discreet Math'));
     } finally {

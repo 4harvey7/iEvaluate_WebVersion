@@ -5,7 +5,7 @@ const BATCH_MARGIN        = 0.20;   // and must beat the batch by this (the staf
 const BATCH_SAME_MIN      = 0.40;   // batch instructor score that counts as the same person
 const SUBJECT_SAME_MIN    = 0.35;   // batch subject score that counts as the same subject
 const BATCH_BEST_MIN      = 0.25;   // batch is also the same when it is the best match with at least this
-const KNOWN_SCORE         = 0.95;   // Gemini picked this entry from the known list
+const KNOWN_SCORE         = 0.95;   // Gemini picked this subject from the known subject list
 const MIN_NAME_LETTERS    = 3;      // fewer letters means unreadable
 const SUBJECT_MATCH_MIN   = 0.60;   // subject name score; a code hit is 1.0
 const SUBJECT_NAME_COVER  = 0.75;   // share of a subject title the form must show to name it
@@ -80,8 +80,8 @@ const notes = [];   // shown to the reviewer
 
 const ocrI = String(rec.ocr_instructor || '');
 const ocrS = String(rec.ocr_subject || '');
-// Gemini's closest entry from the known lists (may be blank)
-const knownI = String(rec.known_instructor || '');
+// Gemini's closest entry from the known subject list (may be blank). There is no instructor
+// pick: the website sends no instructor list to Gemini, the reading is matched against the DB.
 const knownS = String(rec.known_subject || '');
 // optional: how sure Gemini was of its own instructor/subject reading (website prompt only).
 // A low-confidence reading can never produce a *_mismatch_* flag; it becomes a note instead.
@@ -124,17 +124,13 @@ function matchInstructor() {
     return { match: 'unreadable', pick: null, confidence: null, candidates: [], contenders: [] };
   }
   const formToks = nmNameTokens(norm);
-  const knownKey = nmNameTokens(knownI).join(' ');
   const cands = arr(fm.instructor_candidates)
     .map((c) => {
       const name = String(c.name || '').trim();
       const toks = nmNameTokens(name);
-      const raw = Math.max(num(c.score), nmScore(toks, formToks).score);
-      const isBatch = c.is_batch === true;
-      // Gemini's pick counts for the batch, for others only with support from the raw reading
-      const known = knownKey !== '' && toks.join(' ') === knownKey && (isBatch || raw >= NM_KNOWN_RAW_MIN - EPS);
-      return { id: String(c.id || '').toLowerCase(), name, score: known ? Math.max(raw, KNOWN_SCORE) : raw,
-        is_placeholder: c.is_placeholder === true, is_batch: isBatch };
+      const score = Math.max(num(c.score), nmScore(toks, formToks).score);
+      return { id: String(c.id || '').toLowerCase(), name, score,
+        is_placeholder: c.is_placeholder === true, is_batch: c.is_batch === true };
     })
     .sort((a, b) => (b.score - a.score) || (Number(b.is_batch) - Number(a.is_batch)) || a.name.localeCompare(b.name));
   const shown = cands.filter((c) => c.score >= CANDIDATE_MIN_SCORE - EPS).slice(0, MAX_CANDIDATES)
@@ -356,7 +352,6 @@ return [{
       review_note: reviewNote,
       ocr_instructor: ocrI,
       ocr_subject: ocrS,
-      known_instructor: knownI,
       known_subject: knownS,
       instructor_confidence: instrConfidence || null,
       subject_confidence: subjConfidence || null,

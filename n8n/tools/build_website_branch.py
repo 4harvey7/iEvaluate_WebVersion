@@ -22,9 +22,11 @@ What it does
      its instructor/subject text is unreadable); a form naming another instructor/subject is
      flagged with the matched one pre-filled as the suggestion, and nothing is credited until
      staff approve it (decide.js). The batch wins unless another instructor/subject clearly beats
-     it (token fuzzy scoring in name_match.js); a form that matches nobody is not flagged. Both
-     main Gemini prompts get the known instructors/subjects ('Website Known Names' / 'Phone Known
-     Names', known_names.sql) and return known_instructor / known_subject. OMR ratings come from Python, cross-checked by Gemini (row
+     it (token fuzzy scoring in name_match.js); a form that matches nobody is not flagged. The
+     phone Gemini prompt gets the known instructors/subjects ('Phone Known Names', known_names.sql)
+     and returns known_instructor / known_subject; the website prompt gets the known SUBJECTS only
+     ('Website Known Names', website_known_names.sql: no instructor names are sent to Gemini) and
+     returns known_subject. OMR ratings come from Python, cross-checked by Gemini (row
      agreement >= AGREEMENT_MIN, see reconcile.js); all text comes only from Gemini.
   2. Clean pages: 'Website Raw Upsert' stores the raw row (same row/key as the shared
      upsert, never over another page's row), 'Website Respond Saved' answers the website
@@ -90,6 +92,10 @@ What it does
          JavaScript', 'build flagged record1', 'Format error for import_errors', the three
          mappers, and the two remark-AI parse nodes (a profane/masked wordcloud keyword is
          dropped). Both main Gemini prompts: transcribe without censoring.
+       * Layout safety net (website_src/layout_check.js, one copy in each reconciler):
+         layout_mismatch when the OMR's optional 'layout' evidence or Gemini's optional
+         column_order (both main prompts ask for it) disagree with 5 columns O, VS, S, F, US x
+         20 rows; the confident-scanner rule is then off for the page.
   5. Removes every hardcoded Supabase key: HTTP Request nodes that sent
      apikey/Authorization headers use the credential "Supabase iEvaluate (secret key)"
      (type Supabase API). Credentials are referenced by name AND by the live credential id
@@ -214,9 +220,11 @@ HELPER_HEADERS = {
     "profanity.js": "sexual-word filter",
     "remark_verify.js": "remark re-check",
     "name_match.js": "name matcher",
+    "layout_check.js": "layout check",
 }
-# Known instructors/subjects for the main Gemini OCR prompt (phone + website): a new Postgres node
-# right before the Gemini call; Gemini returns the raw reading plus its closest known entry.
+# Known names for the main Gemini OCR prompt: a new Postgres node right before the Gemini call;
+# Gemini returns the raw reading plus its closest known entry. Phone: instructors + subjects
+# (known_names.sql). Website: subjects only (website_known_names.sql), no instructor names.
 WEB_KNOWN_NAMES = "Website Known Names"
 PHONE_KNOWN_NAMES = "Phone Known Names"
 PHONE_OMR_NODE = "image to ocr and omr python"
@@ -231,7 +239,19 @@ KNOWN_HEAD = (
     "The lists only help to read messy handwriting: instructor and subject above stay exactly as written.\n"
 )
 KNOWN_SCHEMA_ANCHOR = '"document_check": {'
-KNOWN_SCHEMA_ADD = '"known_instructor": { "type": "STRING" },\n        "known_subject": { "type": "STRING" },\n        '
+# Layout safety net (both main Gemini prompts): Gemini also reports the rating column headers as
+# printed, left to right; the reconcilers flag layout_mismatch when they are not O, VS, S, F, US
+# (website_src/layout_check.js). Optional: an answer without it never flags. The prompt text is
+# authored with literal backslash-n, like the rest of the prompt (see HEADER_BUBBLE_ANCHOR).
+COLUMN_ORDER_ANCHOR = "- Return letters, not numbers."
+COLUMN_ORDER_ADD = (
+    r"\n- column_order: the rating column headers exactly as printed above the bubbles, left to right "
+    r"(normally O, VS, S, F, US; a header printed as a number is returned as that number). Leave it "
+    r"empty if you cannot read the headers. Report each row's rating by the header of the column its "
+    r"mark is in, not by its position."
+)
+COLUMN_ORDER_SCHEMA_ADD = '"column_order": { "type": "ARRAY", "items": { "type": "STRING" } },\n        '
+KNOWN_SCHEMA_ADD ='"known_instructor": { "type": "STRING" },\n        "known_subject": { "type": "STRING" },\n        '
 PHONE_IMAGE_ITEM = "$('SAST image from phone').item.json.body.image"
 PHONE_IMAGE_FIRST = "$('SAST image from phone').first().json.body.image"
 INCLUDE_RE = re.compile(r"^// @@include ([\w.]+)\n", re.M)
@@ -268,8 +288,12 @@ def prepend_filter(code: str, where: str) -> str:
 
 def patch_gemini_prompt(body: str, where: str) -> str:
     """Main Gemini OCR prompt (phone + website): transcribe remarks without censoring, so the
-    deterministic filter and the re-check see what the student wrote. Schema unchanged."""
-    return replace_once(body, GEMINI_PROMPT_ANCHOR, GEMINI_PROMPT_ANCHOR + GEMINI_PROMPT_ADD, where)
+    deterministic filter and the re-check see what the student wrote; and ask for the optional
+    column_order (the rating headers left to right, layout safety net: layout_check.js). The only
+    schema change is that one optional field."""
+    body = replace_once(body, GEMINI_PROMPT_ANCHOR, GEMINI_PROMPT_ANCHOR + GEMINI_PROMPT_ADD, where)
+    body = replace_once(body, COLUMN_ORDER_ANCHOR, COLUMN_ORDER_ANCHOR + COLUMN_ORDER_ADD, where)
+    return replace_once(body, KNOWN_SCHEMA_ANCHOR, COLUMN_ORDER_SCHEMA_ADD + KNOWN_SCHEMA_ANCHOR, where)
 
 
 def known_names_expression(node_name: str) -> str:
@@ -409,8 +433,15 @@ def few_shot_contents_prefix(examples: list[tuple[bytes, str, dict]]) -> str:
 
 
 def known_names_node(name, pos, params_js):
-    """Known instructors/subjects for the prompt. A failure goes on with an empty list."""
+    """Phone: known instructors/subjects for the prompt. A failure goes on with an empty list."""
     return pg_node(name, pos, read("known_names.sql"), "={{ [ " + params_js + " ] }}", "continueRegularOutput",
+                   always_output=True)
+
+
+def website_known_names_node(name, pos):
+    """Website: known SUBJECTS only (no instructor names reach Gemini), no query parameters. A
+    failure goes on with an empty list."""
+    return pg_node(name, pos, read("website_known_names.sql"), None, "continueRegularOutput",
                    always_output=True)
 
 
@@ -514,7 +545,7 @@ def pg_node(name, pos, sql, replacement, on_error, always_output=False):
         "parameters": {
             "operation": "executeQuery",
             "query": sql,
-            "options": {"queryReplacement": replacement},
+            "options": {"queryReplacement": replacement} if replacement is not None else {},
         },
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.6,
@@ -583,7 +614,7 @@ def build_website_nodes(orig_by_name):
         "onError": "continueRegularOutput",
     })
 
-    nodes.append(known_names_node(WEB_KNOWN_NAMES, [-52752, 12192], P + ".instructor_id ?? null"))
+    nodes.append(website_known_names_node(WEB_KNOWN_NAMES, [-52752, 12192]))
     gem = copy.deepcopy(orig_by_name[PHONE_GEMINI_NODE])
     body = gem["parameters"]["jsonBody"]
     old_img = "{{ $('SAST image from phone').item.json.body.image }}"

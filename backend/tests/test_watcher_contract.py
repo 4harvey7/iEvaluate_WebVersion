@@ -382,7 +382,12 @@ def test_item_error_codes():
     assert f({"status": "error", "message": logic.PIPELINE_REJECTED_MSG, "retryable": False}) == "pipeline_rejected_request"
     assert f({"status": "error", "message": logic.UNSAVED_REVIEW_MSG + " (5 automatic tries: x)",
               "retryable": False}) == "not_saved_needs_review"
+    assert f({"status": "error", "message": logic.PIPELINE_TIMEOUT_MSG, "retryable": True}) == "pipeline_timeout"
+    assert f({"status": "error", "message": logic.PIPELINE_UNAVAILABLE_MSG, "retryable": True}) == "pipeline_unavailable"
+    assert f({"status": "error", "message": "Failed after 5 attempts: " + logic.PIPELINE_TIMEOUT_MSG,
+              "retryable": False}) == "failed_after_retries"
     assert set(logic.ITEM_ERROR_CODES) == {"pipeline_not_configured", "pipeline_misconfigured", "pipeline_error",
+                                            "pipeline_timeout", "pipeline_unavailable",
                                             "not_saved_needs_review", "failed_after_retries", "pipeline_rejected_request"}
 
 

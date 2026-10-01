@@ -1,18 +1,19 @@
 // Same rules as 'Website Reconcile OCR OMR', for phone scans.
-const AGREEMENT_MIN = 0.80;   // rows Python and Gemini must agree on
+const AGREEMENT_MIN = 0.30;   // rows that must not clearly conflict (see conflictRows)
 // @@include profanity.js
 // @@include remark_verify.js
 // @@include name_match.js
+// @@include layout_check.js
 
 const QUESTIONS         = 10;
 const TOTAL_ROWS        = QUESTIONS * 2;
 const MAX_AGREED_BLANKS = 10;
-const FLAG_DIFF_MARGIN  = 2;  // only used for poor_scan_quality
+const FLAG_DIFF_MARGIN  = 2;  // levels apart for a real conflict (S vs VS is not one)
 const WEAK_TOP_SCORE    = 0.05;
 const WEAK_MARGIN       = 0.02;
 const WEAK_ROW_LIMIT    = 4;  // review if Python is unsure on this many rows
 const CRITICAL_QUALITY_ISSUES = ['low_light', 'scribbled_grid', 'damaged_form']; // both engines can agree on the same wrong answer
-const AGREEMENT_MIN_ROWS = Math.ceil(AGREEMENT_MIN * TOTAL_ROWS - 1e-9);   // 0.80 -> 16 of 20
+const AGREEMENT_MIN_ROWS = Math.ceil(AGREEMENT_MIN * TOTAL_ROWS - 1e-9);   // 0.30 -> 6 of 20
 const AGREEMENT_MIN_PCT  = Math.round(AGREEMENT_MIN * 100);
 
 const LETTER_TO_SCORE = { O: 5, VS: 4, S: 3, F: 2, US: 1 };
@@ -78,6 +79,16 @@ function geminiScore(key) {
   return toScore(gemini.ratings?.[key]);
 }
 
+// layout safety net (layout_check.js): decided BEFORE the rows are compared, because on a form
+// with another layout a confident scanner row is confidently wrong and must not win over Gemini
+const layoutSignals = lcLayoutSignals(py, gemini, geminiOk);
+let exactAgreeRows = 0;
+for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
+  for (let i = 0; i < QUESTIONS; i++) if (pythonScore(section, i) === geminiScore(`${prefix}${i + 1}`)) exactAgreeRows++;
+}
+if (lcFallbackSignal(py, geminiOk && pythonOk, exactAgreeRows, TOTAL_ROWS)) layoutSignals.push('fallback_grid_low_agreement');
+const layoutMismatch = layoutSignals.length > 0;
+
 const scores         = {};
 const comparisons    = [];
 let agreedBlanks     = 0;
@@ -85,7 +96,8 @@ let filledByGemini   = 0;
 let realDifferences  = 0;
 let agreeRows        = 0;
 let weakRows         = 0;
-const differRows     = [];
+const conflictRows   = [];   // differ AND count against the agreement rule
+const resolvedRows   = [];   // differ, but kept as the scanner read them
 
 for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
   for (let i = 0; i < QUESTIONS; i++) {
@@ -97,7 +109,16 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
     const g = geminiScore(key);
     const agree = p === g;   // both blank counts as agreeing
     if (agree) agreeRows++;
-    else differRows.push(`${key} (scanner ${letterOf(p)}, AI ${letterOf(g)})`);
+    // scanner sure of a mark -> its reading wins; no confidence data or a layout mismatch -> not sure
+    const pythonConfident = !layoutMismatch && p !== null && confByRow[rowIndex] !== undefined && !conf.weak;
+    const bothRead = p !== null && g !== null;
+    const farApart = bothRead && Math.abs(p - g) >= FLAG_DIFF_MARGIN;
+    let resolvedBy = null;
+    if (!agree) {
+      if (pythonConfident) resolvedBy = 'python_confident';
+      else if (bothRead && !farApart) resolvedBy = 'adjacent_level';
+      (resolvedBy ? resolvedRows : conflictRows).push(`${key} (scanner ${letterOf(p)}, AI ${letterOf(g)})`);
+    }
 
     if (p !== null && conf.weak) weakRows++;
 
@@ -107,7 +128,7 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
     if (p !== null) {
       used = p;
       source = 'python';
-      if (g !== null && Math.abs(p - g) >= FLAG_DIFF_MARGIN) realDifferences++;
+      if (farApart) realDifferences++;
     } else if (g !== null) {
       // Python saw blank, Gemini saw a mark
       used = g;
@@ -120,14 +141,21 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
     }
 
     scores[key] = used;
-    comparisons.push({ question: key, python: p, gemini: g, used, source, agree, python_weak: p !== null && conf.weak });
+    comparisons.push({ question: key, python: p, gemini: g, used, source, agree, python_weak: p !== null && conf.weak,
+      resolved_by: resolvedBy });
   }
 }
 
 const agreementKnown = geminiOk && pythonOk;
 const agreementPercent = agreementKnown ? Math.round((agreeRows / TOTAL_ROWS) * 100) : null;
+// confident-scanner and one-level differences count as agreeing for the flag
+const flagAgreeRows = TOTAL_ROWS - conflictRows.length;
+const flagAgreePercent = Math.round((flagAgreeRows / TOTAL_ROWS) * 100);
+const resolvedText = resolvedRows.length
+  ? ` ${resolvedRows.length} other differing row(s) were kept as the scanner read them (scanner confident, or only one level apart).`
+  : '';
 const agreementText = agreementKnown
-  ? `Python and Gemini agree on ${agreeRows} of ${TOTAL_ROWS} rows (${agreementPercent}%).`
+  ? `Python and Gemini agree on ${agreeRows} of ${TOTAL_ROWS} rows (${agreementPercent}%).${resolvedText}`
   : null;
 
 // text fields come only from Gemini
@@ -169,11 +197,14 @@ if (geminiOk && gemini.scan_quality && gemini.scan_quality.poor_quality === true
   reasons.push('poor_scan_quality');
 }
 
-if (agreementKnown && agreeRows < AGREEMENT_MIN_ROWS) reasons.push(`omr_agreement_below_${AGREEMENT_MIN_PCT}`);
+if (agreementKnown && flagAgreeRows < AGREEMENT_MIN_ROWS) reasons.push(`omr_agreement_below_${AGREEMENT_MIN_PCT}`);
 
 if (weakRows >= WEAK_ROW_LIMIT) reasons.push(`low_confidence_ocr_${weakRows}_rows`);
 
 if (agreedBlanks > MAX_AGREED_BLANKS) reasons.push(`too_many_blanks_${agreedBlanks}_of_20`);
+
+// never dropped (unlike grid_not_detected below)
+if (layoutMismatch) reasons.push('layout_mismatch');
 
 // phone only: drop grid_not_detected when Gemini found answers
 if (geminiOk && Object.values(scores).some(s => s !== null)) {
@@ -189,7 +220,7 @@ if (reasons.includes('poor_scan_quality')) {
   noteParts.push(gemini.scan_quality.reason || 'The scan quality looked poor.');
 }
 if (reasons.some((r) => r.startsWith('omr_agreement_below_'))) {
-  noteParts.push(`Python and Gemini agree on only ${agreeRows} of ${TOTAL_ROWS} rows (${agreementPercent}%); at least ${AGREEMENT_MIN_PCT}% is required. They differ on ${differRows.join(', ')}. Check those answers.`);
+  noteParts.push(`Python and Gemini clearly disagree on ${conflictRows.length} of ${TOTAL_ROWS} rows where the scanner was unsure or read nothing, so only ${flagAgreeRows} of ${TOTAL_ROWS} rows (${flagAgreePercent}%) count as agreeing; at least ${AGREEMENT_MIN_PCT}% is required. They differ on ${conflictRows.join(', ')}. Check those answers.${resolvedText}`);
 }
 if (reasons.some((r) => r.startsWith('low_confidence_ocr_'))) {
   noteParts.push(`The scanner itself was unsure of its reading on ${weakRows} row(s), even where it matched the AI's read. Please double-check those answers.`);
@@ -201,6 +232,7 @@ if (py.table_found === false) {
       : 'Table corners were not found in the scan, so an estimated crop was used. All data needs verification.'
   );
 }
+if (layoutMismatch) noteParts.push(lcNote(layoutSignals, geminiOk ? lcColumnOrder(gemini) : null));
 if (!pythonOk) noteParts.push('The OMR scanner returned no ratings for this scan, so the answers shown come from the AI only. Verify every rating.');
 if (!resolvedInstructor) noteParts.push('No instructor name could be read from this form.');
 if (!resolvedSubject) noteParts.push('No subject or course code could be read from this form.');
@@ -265,6 +297,8 @@ return [{
       agreement_rows:        agreementKnown ? agreeRows : null,
       agreement_percent:     agreementPercent,
       agreement_min_percent: AGREEMENT_MIN_PCT,
+      flag_agreement_rows:   agreementKnown ? flagAgreeRows : null,   // what the agreement rule checks
+      resolved_differences:  resolvedRows.length,
       real_differences:      realDifferences,
       filled_from_gemini:    filledByGemini,
       comparisons,   // Flutter review screen lists these
@@ -272,6 +306,12 @@ return [{
 
     // read by 'build flagged record1'
     grid_source: py.grid_source ?? null,
+    layout_check: {
+      mismatch:      layoutMismatch,
+      signals:       layoutSignals,
+      column_order:  geminiOk ? lcColumnOrder(gemini) : null,   // Gemini's header reading, if any
+      python_layout: py.layout ?? null,                         // the OMR's layout evidence, if any
+    },
     review_note: reviewNote,
     comparisons,
     python_raw_ratings: py.ratings ?? null,
