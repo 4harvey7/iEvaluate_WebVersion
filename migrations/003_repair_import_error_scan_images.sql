@@ -2,7 +2,7 @@
 -- Repairs import errors created from a corrected flagged scan (webhook
 -- sast-manual-correction) that show no scan image in the Flutter app.
 --
--- Cause (fixed in n8n/perfect-101-website.json, build_website_branch.py
+-- Cause (fixed in n8n/perfect-2.1.json, build_website_branch.py
 -- serialize_correction_image_lookups / guard_scan_image_save): the correction flow
 -- looked up the original scan image AFTER it had already written the import error,
 -- so it saved a NEW scan_error_images row with image_base64 = NULL and pointed

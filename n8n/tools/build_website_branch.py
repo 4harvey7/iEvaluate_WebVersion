@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build n8n/perfect-101-website.json from the original n8n export.
+"""Build n8n/perfect-2.1.json from the original n8n export.
 
 Re-runnable:  python build_website_branch.py [INPUT_JSON] [OUTPUT_JSON] [LAYOUT_JSON]
 Live export:  python build_website_branch.py --live LIVE_EXPORT_JSON [OUTPUT_JSON]
@@ -8,7 +8,7 @@ Live export:  python build_website_branch.py --live LIVE_EXPORT_JSON [OUTPUT_JSO
 
 Defaults:
   INPUT  = C:\\Users\\rodzh\\Downloads\\perfect 101 (4).json   (read only, never modified)
-  OUTPUT = ../perfect-101-website.json (next to this tools/ folder)
+  OUTPUT = ../perfect-2.1.json (next to this tools/ folder)
   LAYOUT = C:\\Users\\rodzh\\Downloads\\perfect 101 (5).json   (optional, read only): the LIVE
            export. Only the canvas positions of same-named nodes are taken from it, so a
            re-import keeps the layout the user arranged by hand. INPUT stays the patch base:
@@ -128,7 +128,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "website_src"
 DEFAULT_INPUT = Path(r"C:\Users\rodzh\Downloads\perfect 101 (4).json")
-DEFAULT_OUTPUT = HERE.parent / "perfect-101-website.json"
+DEFAULT_OUTPUT = HERE.parent / "perfect-2.1.json"
 DEFAULT_LAYOUT = Path(r"C:\Users\rodzh\Downloads\perfect 101 (5).json")   # live export (positions only)
 
 POSTGRES_CRED = {"postgres": {"id": "BEB0zDVaiSFMfjaE", "name": "Postgres account"}}
@@ -1130,7 +1130,7 @@ def apply_main_flow_aggregate_fix(out):
       are fed by 'Raw Upsert Done' on the "done" output of 'Loop Over Items3'.
     * The aggregate chain itself is replaced afterwards by apply_sast_recompute_flow
       (Raw Upsert Done -> Code in JavaScript8 -> recompute_sast -> If28); the old
-      'send to ...' nodes (recompute_aggregates.sql) are removed there.
+      'send to ...' nodes (the old aggregate SQL) are removed there.
     """
     by_name = {n["name"]: n for n in out["nodes"]}
     for name in [*MAIN_RECOMPUTE_NODES, RAW_LOOP, "If1", "Insert or update rows in a table1", *AGG_CHAIN_HEADS]:

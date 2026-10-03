@@ -1,6 +1,6 @@
 # Website batch branch (`sast-batch-scan`)
 
-`perfect-101-website.json` is the full "perfect 101" workflow with:
+`perfect-2.1.json` is the full "perfect 2.1" workflow with:
 
 1. **The draft "SAST from Website" branch replaced** by a website front end of 26 nodes (all named `Website …`). The front end only does what is website specific: payload validation, duplicate check, OCR/OMR (same Python + Gemini calls as the phone), not-a-form reject, reconcile, batch integrity check, the check of the form's instructor/subject against the database, the clean/flagged decision, and storing the clean page's raw row so the backend can be answered. A page is credited automatically to the instructor and subject the staff member picked for the batch **only when the form agrees with them**. A blank/unreadable instructor, subject or student id is held for review (`instructor_missing`, `subject_missing`, `student_id_missing`), and so is an image file already marked in another batch (`reused_image`). When the form names another instructor/subject that is in the database, the page is flagged with that instructor/subject **pre-filled as the suggestion**; nothing is credited until staff approve it (see "Batch check and the form's instructor/subject").
 2. **No duplicated calculation nodes.** After the raw row is stored and the webhook answered, a clean page goes through `Website Map to Target Format` into the **existing `If19`**, the same entry `Map to Target Format3` uses for phone scans. The `recompute_sast` aggregate step (management/performance results, overall totals, question means), `If28` alerts and the remark AI path exist once and are shared by phone, website, Google Sheet and correction executions. A flagged page reuses the **phone flagged path** (`Save scan error image` → `build flagged record1` → `save flagged to failed_scan_queue1` → `Respond to Webhook`).
@@ -16,7 +16,7 @@ Rebuild or verify at any time. The input files are never modified:
 - `C:\Users\rodzh\Downloads\perfect 101 (5).json` (optional): the **live** export. Only the canvas positions of same-named nodes are taken from it, so a re-import keeps the layout arranged by hand in n8n. It cannot be the patch base: it already contains this build (the draft nodes and every patch anchor are gone).
 
 ```
-python tools/build_website_branch.py      # regenerates perfect-101-website.json (byte-identical on every run)
+python tools/build_website_branch.py --live "<path to live export>.json" ../perfect-2.1.json   # regenerates perfect-2.1.json from the live export
 python tools/validate_workflow.py         # static + path-simulation checks (optional: pip install pglast for SQL parsing)
 node   tools/test_website_code.js         # runs the website Code nodes and the edited shared nodes with mocked inputs
 node   tools/test_website_sql.js          # runs the SQL (and migrations/004) on a THROWAWAY local Postgres (needs pg-promise; see file header)
@@ -273,7 +273,7 @@ Used by the website review page (backend `POST /reviews/queue/{id}/approve`, `co
 
 ## Updating the LIVE n8n
 
-The live n8n runs the workflow **"perfect 101"** (id `vOMBjDtz15QB4k4u`, active). The live export `perfect 101 (5).json` (2026-09-27) matches the previous build of this file except for:
+The live n8n runs the workflow **"perfect 2.1"** (id `vOMBjDtz15QB4k4u`, active). The live export `perfect 101 (5).json` (2026-09-27) matches the previous build of this file except for:
 
 - `Website Prepare Scan` still hardcodes `paper_size: 'LONG'` (it predates the paper-size change);
 - the credential ids are filled in;
@@ -290,7 +290,7 @@ Update (2026-09-28, matching fix): adds `Website Known Names` and `Phone Known N
 
 This release (2026-09-28) adds two nodes, `Website Form Match` (Postgres, credential `Postgres account`) and `After Correction Response` (Code), and changes `Website Decide`, `Website Flagged Record`, `Website Reconcile OCR OMR` (comments), `Respond to Webhook`, `get instructor id7`, `get subject id6` and `Map target`, plus the connections Identity Check → Form Match → Decide and Map target → Mark Queue Validated1 → Respond to Webhook5 → After Correction Response → If19. The new nodes are placed next to their neighbours on the live canvas. No database migration is needed on the n8n side (pages use only existing `failed_scan_queue` columns; the new data is in `partial_data`).
 
-1. Open **perfect 101** → **⋯** menu (top right) → **Import from File…** → choose `n8n/perfect-101-website.json`. This replaces the canvas of the existing workflow, keeping its id and webhook URLs.
+1. Open **perfect 2.1** → **⋯** menu (top right) → **Import from File…** → choose `n8n/perfect-2.1.json`. This replaces the canvas of the existing workflow, keeping its id and webhook URLs.
 2. The credentials are referenced by their live ids **and** names (`Supabase iEvaluate (secret key)` = `t8WKxORo7BHCziqr`, `iEvaluate website webhook secret` = `cGPn1nyAiZqSUx40`, `Postgres account`, `Google Gemini(PaLM) Api account`, …), so they stay linked. If any node shows a red "issues" marker, open it and pick the credential from the dropdown.
 3. Click **Save**. Check that the **Active** toggle is on. The file is saved with `active: false`, so switch it on if the import turned it off.
 4. Optional smoke test: scan one page whose form names the batch instructor (expect `success`) and one naming another instructor of the database (expect `flagged` with `instructor_mismatch_found`, the other instructor pre-filled in the queue row). Then approve the flagged page from the website review page or correct it in Flutter.
@@ -309,7 +309,7 @@ This release (2026-09-28) adds two nodes, `Website Form Match` (Postgres, creden
 1. **Rotate the Supabase secret key first.** The old key was hardcoded in the previous export, so treat it as leaked. Supabase dashboard → Project Settings → API Keys → create a new secret key, then revoke the old one. Put the new key only in the n8n credential and the backend `.env`.
 2. n8n → **Credentials** → **Add credential** → *Header Auth*. Name it exactly `iEvaluate website webhook secret`; Name = `X-Webhook-Secret`, Value = the backend's `N8N_WEBHOOK_SECRET`. Save.
 3. n8n → **Credentials** → **Add credential** → *Supabase API* (skip if it already exists; the live instance already has it). Name it exactly `Supabase iEvaluate (secret key)`; Host = `https://lyorziqedepfsgblqewv.supabase.co`, Service Role Secret = the new secret key. Save.
-4. Import `perfect-101-website.json` (Workflows → Import from File). If the old "perfect 101" is active in the same instance, import over it or deactivate it first; both use the same webhook paths.
+4. Import `perfect-2.1.json` (Workflows → Import from File). If the old "perfect 101" is active in the same instance, import over it or deactivate it first; both use the same webhook paths.
 5. Open each of the 9 nodes listed above. If the credential field is empty or red, pick the credential from the dropdown. Save the workflow. The "issues" markers disappear.
 6. Activate the workflow. Production URL: `https://<n8n-host>/webhook/sast-batch-scan`.
 7. Scanned JPEGs must stay under n8n's body limit (`N8N_PAYLOAD_SIZE_MAX`, 16 MB by default). The backend sends about 0.6–0.9 MB of base64: 1468×2174 px for long bond, 1870×2370 px for short, greyscale JPEG.
@@ -390,7 +390,6 @@ A wrong or missing secret gets n8n's own 403 before the workflow runs.
 - **Math.** A blank rating is NULL and is left out of both the sum and the count. Each question mean is `ROUND(AVG, 2)`. The management and performance means are each the `ROUND` of the average of their non-null rounded question means. Combined = `ROUND((management + performance) / 2, 2)`; if one side is null, the other is used. The instructor-level tables pool all subjects.
 - **Blanks stay NULL on every path.** The shared `rating()` helper in `tools/website_src/rating.js` keeps an integer 1..5 and turns anything else into null, so a blank is never stored as 0. The database also has CHECK constraints: each rating is null or 1..5.
 - **If28.** It alerts only when `combined_score_mean` is a number below 3. NULL never alerts. A website batch is one execution per page, so a low-scoring instructor gets one push per page, the same as phone scans.
-- `tools/website_src/recompute_aggregates.sql` is **obsolete**: the build no longer uses it. It can be deleted.
 
 **Ordering.** n8n `executionOrder: v1` runs If1's branches one at a time, in canvas order from top to bottom. Before this change the raw upsert (`Code in JavaScript` → `Loop Over Items3` → `Insert or update rows in a table1`) ran before the aggregation branches only because it sat highest on the canvas. That depends on layout. The order is now enforced by the connections:
 

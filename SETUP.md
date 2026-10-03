@@ -79,7 +79,7 @@ backend notices it within about 5 minutes, no restart needed.
 Crediting forms from the review page uses the n8n correction webhooks. For
 website approvals to be credited to the **batch's** term and to use the
 instructor/subject **ids** the reviewer picked, re-import the updated n8n
-workflow (`n8n/perfect-101-website.json`, see `n8n/WEBSITE_BRANCH.md`). With
+workflow (`n8n/perfect-2.1.json`, see `n8n/WEBSITE_BRANCH.md`). With
 an older workflow the correction still works, but n8n finds the instructor by
 name and uses the current term.
 
@@ -92,7 +92,7 @@ flags such a page `reused_image` for review instead of saving it again. Review
 it and run it in the Supabase SQL Editor after 011 (safe to run again). Until
 it is applied the lookup still works, only slower; a failed lookup never fails
 a scan. The flag itself needs the re-imported n8n workflow
-(`n8n/perfect-101-website.json`).
+(`n8n/perfect-2.1.json`).
 
 ## 2. Backend environment
 

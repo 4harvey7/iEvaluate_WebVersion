@@ -153,7 +153,7 @@ Known remaining errors, with the same reads in ORIGINAL and fix B unless noted:
 - **Phone:** 4 single-row wrong-column reads (the same in ORIGINAL). The website/phone
   reconcilers catch 3 of the 5 wrong phone forms; the others differ by one column.
 
-## n8n compatibility (current `app/n8n/perfect-101-website.json`)
+## n8n compatibility (current `app/n8n/perfect-2.1.json`)
 
 Re-run on 2026-09-27 after the reconciler redesign. Both reconcilers now take ratings from Python, use Gemini only as a cross-check (`omr_agreement_below_30` when fewer than 6 of 20 rows agree, `AGREEMENT_MIN = 0.30`), and take text only from Gemini. `n8n_compat_check.js` ran every saved `/process` response of fix C (`NEW`, deployed) and ORIGINAL through the real jsCode of both reconcilers:
 - phone: `reconcile ocr and omr1`;
@@ -240,7 +240,7 @@ one phone scan and one website batch page, and check that the n8n executions rea
 
 ### 3. n8n (only for paper-size pass-through)
 
-Re-import `app/n8n/perfect-101-website.json` over the live "perfect 101" workflow
+Re-import `app/n8n/perfect-2.1.json` over the live "perfect 2.1" workflow
 (id `vOMBjDtz15QB4k4u`), or paste `app/n8n/tools/website_src/prepare_scan.js` into
 "Website Prepare Scan". See `app/n8n/WEBSITE_BRANCH.md`. Earlier fixes in that file
 also still wait for a re-import.

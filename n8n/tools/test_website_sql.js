@@ -31,7 +31,7 @@ if (!['127.0.0.1', 'localhost', '::1'].includes(u.hostname)) {
   process.exit(2);
 }
 const TEST_DB = 'ievaluate_n8n_website_test';
-const wfPath = process.argv[2] || path.join(__dirname, '..', 'perfect-101-website.json');
+const wfPath = process.argv[2] || path.join(__dirname, '..', 'perfect-2.1.json');
 const wf = JSON.parse(fs.readFileSync(wfPath, 'utf8'));
 const node = (name) => {
   const n = wf.nodes.find((x) => x.name === name);

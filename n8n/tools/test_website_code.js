@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Behavioural tests for the website-branch Code nodes, executed straight from
-// n8n/perfect-101-website.json with a small mock of n8n's $ / $input / helpers.
-// Usage: node test_website_code.js [path/to/perfect-101-website.json] [--print-profanity-patterns]
+// n8n/perfect-2.1.json with a small mock of n8n's $ / $input / helpers.
+// Usage: node test_website_code.js [path/to/perfect-2.1.json] [--print-profanity-patterns]
 //   --print-profanity-patterns  prints the SQL pattern lines of migrations/004_mask_existing_profanity.sql
 //                               (generated from the filter in the workflow) instead of running the tests
 'use strict';
@@ -10,7 +10,7 @@ const path = require('path');
 const assert = require('assert');
 
 const ARGS = process.argv.slice(2);
-const wfPath = ARGS.find((a) => !a.startsWith('--')) || path.join(__dirname, '..', 'perfect-101-website.json');
+const wfPath = ARGS.find((a) => !a.startsWith('--')) || path.join(__dirname, '..', 'perfect-2.1.json');
 const wf = JSON.parse(fs.readFileSync(wfPath, 'utf8'));
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 

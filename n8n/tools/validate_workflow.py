@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static checks for n8n/perfect-101-website.json.
+"""Static checks for n8n/perfect-2.1.json.
 
 Usage:  python validate_workflow.py [OUTPUT_JSON] [ORIGINAL_JSON]
 
@@ -68,7 +68,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BACKEND_DB_PY = HERE.parent.parent / "backend" / "app" / "db.py"   # N8N_TIMEOUT_SECONDS default
-DEFAULT_OUTPUT = HERE.parent / "perfect-101-website.json"
+DEFAULT_OUTPUT = HERE.parent / "perfect-2.1.json"
 DEFAULT_INPUT = Path(r"C:\Users\rodzh\Downloads\perfect 101 (4).json")
 WEBHOOK = "SAST from Website"
 SHARED_ENTRIES = {"If19", "Save scan error image"}

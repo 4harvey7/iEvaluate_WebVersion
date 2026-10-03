@@ -6,7 +6,7 @@
 //      (the harness keeps each full /process response, image dropped, OCR text masked)
 //   2. node n8n_compat_check.js --results phone=PHONE.json --results long=LONG.json \
 //          --results short=SHORT.json --labels GT.json --labels phone_labels.csv \
-//          [--version NEW] [--compare ORIGINAL] [--workflow ../n8n/perfect-101-website.json] \
+//          [--version NEW] [--compare ORIGINAL] [--workflow ../n8n/perfect-2.1.json] \
 //          [--noise 0.02,0.05,0.10 --trials 200 --seed 1]
 //
 // A set named "phone*" goes through 'reconcile ocr and omr1' (phone branch), any other
@@ -36,7 +36,7 @@ const path = require('path');
 const assert = require('assert');
 
 const args = { results: [], labels: [], version: 'NEW', compare: null, noise: '', trials: '200', seed: '1',
-  workflow: path.join(__dirname, '..', 'n8n', 'perfect-101-website.json') };
+  workflow: path.join(__dirname, '..', 'n8n', 'perfect-2.1.json') };
 for (let i = 2; i < process.argv.length; i++) {
   const k = process.argv[i].replace(/^--/, '');
   const v = process.argv[++i];
