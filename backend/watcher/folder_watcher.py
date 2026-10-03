@@ -15,7 +15,7 @@ prefilled, from the website's "Scanner setup" page):
     }
 
 "folder" is optional (default C:/Scans). The folder set on the website for
-this station is picked up automatically within ~30 s (no restart needed) and
+this station is picked up automatically within ~15 s (no restart needed) and
 saved back into watcher_config.json.
 
 Optional keys: "processed_dir", "skipped_dir", "poll_seconds".
@@ -26,6 +26,7 @@ them to the open batch or to set them aside for good (skipped/discarded/<date>/,
 never deleted).
 
 Run:  py -3 folder_watcher.py            (or: py -3 folder_watcher.py --config other.json)
+      py -3 folder_watcher.py --offline  tell the website this laptop stopped (UNINSTALL does this)
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -55,14 +57,16 @@ except ImportError:  # pragma: no cover
     print("Pillow is not installed. Run:  py -3 -m pip install -r requirements.txt")
     raise
 
-VERSION = "2.4.3"
+VERSION = "2.4.4"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
 STABLE_POLLS_REQUIRED = 2          # size+mtime unchanged for this many polls
 DEFAULT_POLL_SECONDS = 2.0
-HEARTBEAT_SECONDS = 30.0
+HEARTBEAT_SECONDS = 15.0           # the website shows "Offline" ~40 s after the last one
 HEARTBEAT_SECONDS_WAITING = 10.0   # faster while files wait for a batch
+KEEPALIVE_CHECK_SECONDS = 5.0      # background keep-alive while a slow upload blocks heartbeats
+OFFLINE_TIMEOUT = (5, 10)          # connect, read: "going offline" notice at UNINSTALL / Ctrl+C
 TARGET_DPI = 200
 MAX_LONG_EDGE = 2200
 JPEG_QUALITY = 85
@@ -1056,12 +1060,40 @@ class Watcher:
         log.warning("%s: server error HTTP %s (%s) - will retry", page_name, resp.status_code, message)
         return None
 
+    def keepalive_due(self, now: float, last_sent: float) -> bool:
+        """True when the main loop has missed a heartbeat (busy) and no keep-alive
+        went out in the last HEARTBEAT_SECONDS."""
+        return (now - self.last_heartbeat >= HEARTBEAT_SECONDS + KEEPALIVE_CHECK_SECONDS
+                and now - last_sent >= HEARTBEAT_SECONDS and now >= self.auth_failed_until)
+
+    def _keepalive_loop(self) -> None:
+        """Background thread. The main loop sends one page at a time and can wait
+        minutes on the marking pipeline, with no heartbeat meanwhile; the website
+        would show "Offline". While that happens, send a minimal heartbeat (only
+        last_seen / version; no folder status, commands are left for the main
+        loop). Does nothing while regular heartbeats flow. Own session: the main
+        one is busy in the other thread."""
+        session = requests.Session()
+        session.headers.update({"X-Station-Key": self.cfg.station_key, "User-Agent": f"ievaluate-watcher/{VERSION}"})
+        last_sent = 0.0
+        while True:
+            time.sleep(KEEPALIVE_CHECK_SECONDS)
+            now = time.monotonic()
+            if not self.keepalive_due(now, last_sent):
+                continue
+            last_sent = now
+            try:
+                session.post(f"{self.cfg.api_base}/scans/heartbeat", json={"version": VERSION}, timeout=(5, 15))
+            except requests.RequestException:
+                pass  # the main loop logs connection problems
+
     # ------------------------------------------------------------ main loop
     def run(self) -> None:
         log.info("iEvaluate watcher %s | folder=%s | server=%s", VERSION, self.cfg.folder, self.cfg.api_base)
         log.info("Processed files -> %s | skipped -> %s", self.cfg.processed_dir, self.cfg.skipped_dir)
         self.check_folder(create=True)
         self.heartbeat(force=True)
+        threading.Thread(target=self._keepalive_loop, name="keepalive", daemon=True).start()
         while True:
             try:
                 self.heartbeat()
@@ -1073,9 +1105,30 @@ class Watcher:
             time.sleep(self.cfg.poll_seconds)
 
 
+def send_offline(cfg: Config) -> bool:
+    """Tell the website this laptop stopped watching (UNINSTALL, Ctrl+C), so its
+    light turns red now instead of ~40 s later. Best effort, never raises.
+    Servers without this endpoint answer 404; nothing changes then."""
+    try:
+        resp = requests.post(
+            f"{cfg.api_base}/scans/offline", json={"version": VERSION}, timeout=OFFLINE_TIMEOUT,
+            headers={"X-Station-Key": cfg.station_key, "User-Agent": f"ievaluate-watcher/{VERSION}"},
+        )
+    except requests.RequestException as e:
+        log.warning("could not tell the website this laptop is offline: %s", type(e).__name__)
+        return False
+    if resp.status_code != 200:
+        log.warning("going offline: HTTP %s", resp.status_code)
+        return False
+    log.info("Told the website this laptop is offline.")
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="iEvaluate scan folder watcher")
     parser.add_argument("--config", default=os.path.join(SCRIPT_DIR, "watcher_config.json"))
+    parser.add_argument("--offline", action="store_true",
+                        help="only tell the website this laptop stopped watching, then exit (used by UNINSTALL)")
     args = parser.parse_args()
     setup_logging()
     try:
@@ -1086,10 +1139,13 @@ def main() -> None:
     except Exception:
         log.exception("Could not read %s", args.config)
         sys.exit(2)
+    if args.offline:
+        sys.exit(0 if send_offline(cfg) else 1)
     try:
         Watcher(cfg).run()
     except KeyboardInterrupt:
         log.info("Stopped.")
+        send_offline(cfg)
 
 
 if __name__ == "__main__":

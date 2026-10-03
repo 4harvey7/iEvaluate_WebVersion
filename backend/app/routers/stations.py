@@ -21,7 +21,7 @@ from app.batch_access import (
 )
 from app.db import get_settings, get_supabase, is_valid_uuid
 from app.folder_safety import DEFAULT_FOLDER, check_folder_for_server, is_network_path
-from app.logic import generate_station_key, hash_station_key, parse_ts
+from app.logic import generate_station_key, hash_station_key
 from app.routers.watcher_download import ZIP_PATH
 from app.security import CurrentUser, require_staff
 from app.station_status import (
@@ -32,6 +32,7 @@ from app.station_status import (
     apply_public_watcher_fields,
     select_stations,
     set_command,
+    watcher_presence,
 )
 
 router = APIRouter()
@@ -87,8 +88,7 @@ def _decorate(stations: list[dict]) -> list[dict]:
     open_by_station = {r["station_id"]: r["id"] for r in open_rows}
 
     for s in stations:
-        seen = parse_ts(s.get("last_seen_at"))
-        s["watcher_online"] = bool(seen and (now - seen).total_seconds() <= settings.watcher_online_seconds)
+        s.update(watcher_presence(s, now, settings.watcher_online_seconds))
         s["has_key"] = bool(s.pop("key_created_at", None))
         s["current_staff_name"] = names.get(s.get("current_staff_id"))
         s["open_batch_id"] = open_by_station.get(s["id"])
@@ -243,12 +243,14 @@ def download_installer(
 
 
 @router.get("")
-def list_stations(user: CurrentUser = Depends(require_staff)):
+def list_stations(response: Response, user: CurrentUser = Depends(require_staff)):
+    response.headers["Cache-Control"] = "no-store"  # live online light
     return _decorate(select_stations(get_supabase(), STATION_COLUMNS, lambda q: q.order("label")))
 
 
 @router.get("/{station_id}")
-def get_station(station_id: str, user: CurrentUser = Depends(require_staff)):
+def get_station(station_id: str, response: Response, user: CurrentUser = Depends(require_staff)):
+    response.headers["Cache-Control"] = "no-store"  # live online light
     return _decorate([_get_station_row(station_id)])[0]
 
 

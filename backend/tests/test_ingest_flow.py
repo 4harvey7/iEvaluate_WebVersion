@@ -287,3 +287,84 @@ def test_is_permanent_not_saved():
     assert logic.is_permanent_not_saved(logic.validate_n8n_response(PERMANENT))
     assert not logic.is_permanent_not_saved(logic.validate_n8n_response(UNSAVED))
     assert not logic.is_unsaved_internal_error(logic.validate_n8n_response(PERMANENT))
+
+
+# ---------------------------------------------------------------- same image in another batch
+class _ItemsQuery(_Query):
+    """scan_batch_items: records the filters, can fail like a real query."""
+    def __init__(self, data, calls, raises=None):
+        super().__init__(data)
+        self._calls, self._raises = calls, raises
+
+    def __getattr__(self, name):
+        def chain(*a, **k):
+            self._calls.append((name, a))
+            return self
+        return chain
+
+    def execute(self):
+        if self._raises:
+            raise self._raises
+        return super().execute()
+
+
+class ReusedSB(FakeSB):
+    def __init__(self, claim_row, items, raises=None):
+        super().__init__(claim_row)
+        self.items, self.raises, self.item_calls = items, raises, []
+
+    def table(self, name):
+        if name == "scan_batch_items":
+            return _ItemsQuery(self.items, self.item_calls, self.raises)
+        return super().table(name)
+
+
+class _CaptureN8n(FakeN8n):
+    def post(self, url, json=None, headers=None):
+        self.payload = json
+        return super().post(url, json=json, headers=headers)
+
+
+OTHER_BATCH = "22222222-2222-2222-2222-222222222222"
+REUSED_FLAGGED = {"status": "flagged", "flagged": True, "review_reasons": ["reused_image"], "message": "Flagged"}
+
+
+def test_image_already_marked_in_another_batch_is_sent_as_reused_image(setup, monkeypatch):
+    _, _, client = setup(claimed(), REUSED_FLAGGED)
+    sb = ReusedSB(claimed(), [{"batch_id": OTHER_BATCH, "status": "success"}])
+    cap = _CaptureN8n(REUSED_FLAGGED)
+    monkeypatch.setattr(scans, "get_supabase", lambda: sb)
+    monkeypatch.setattr(scans, "_n8n", lambda: cap)
+    body = _payload()
+    r = client.post("/scans/ingest", json=body)
+    assert r.status_code == 200 and r.json()["status"] == "flagged"
+    assert cap.payload["reused_image"] == {"batch_id": OTHER_BATCH, "status": "success"}
+    # same file, OTHER batches only, final statuses that counted (not rejected / error)
+    calls = sb.item_calls
+    assert ("eq", ("file_sha256", body["sha256"])) in calls
+    assert ("neq", ("batch_id", BATCH["id"])) in calls
+    (statuses,) = [a[1] for n, a in calls if n == "in_"]
+    assert sorted(statuses) == ["duplicate", "flagged", "success"]
+    assert sb.completes()[0]["p_status"] == "flagged"
+
+
+def test_no_earlier_batch_no_reused_image(setup, monkeypatch):
+    _, _, client = setup(claimed(), {"status": "success"})
+    sb = ReusedSB(claimed(), [])
+    cap = _CaptureN8n({"status": "success"})
+    monkeypatch.setattr(scans, "get_supabase", lambda: sb)
+    monkeypatch.setattr(scans, "_n8n", lambda: cap)
+    assert client.post("/scans/ingest", json=_payload()).status_code == 200
+    assert "reused_image" not in cap.payload
+
+
+def test_reused_image_lookup_error_never_fails_the_scan(setup, monkeypatch):
+    _, _, client = setup(claimed(), {"status": "success"})
+    sb = ReusedSB(claimed(), [], raises=RuntimeError("statement timeout"))
+    cap = _CaptureN8n({"status": "success"})
+    monkeypatch.setattr(scans, "get_supabase", lambda: sb)
+    monkeypatch.setattr(scans, "_n8n", lambda: cap)
+    r = client.post("/scans/ingest", json=_payload())
+    assert r.status_code == 200 and r.json()["status"] == "success"
+    assert "reused_image" not in cap.payload
+    assert sb.completes()[0]["p_status"] == "success"

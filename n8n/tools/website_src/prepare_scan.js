@@ -48,6 +48,14 @@ const mime = mimeRaw === 'image/png' ? 'image/png' : 'image/jpeg';
 const filename = (str(body.filename).replace(/[\\/\r\n]/g, '_') || 'scan.jpg').slice(0, 200);
 const paperRaw = str(body.paper_size).toUpperCase();
 const paperSize = (paperRaw === 'SHORT' || paperRaw === 'LONG') ? paperRaw : 'LONG';
+// optional: the backend found this image file already marked in another batch -> held for review
+// (decide.js). Only a batch id and a final status; anything else -> dropped, never blocks the request
+const REUSED_STATUSES = ['success', 'flagged', 'rejected', 'duplicate'];
+const reusedIn = (body.reused_image && typeof body.reused_image === 'object') ? body.reused_image : {};
+const reusedBatchId = uuidOrNull(reusedIn.batch_id);
+const reusedStatus = str(reusedIn.status).toLowerCase();
+const reusedImage = (reusedBatchId && reusedBatchId !== batchId && REUSED_STATUSES.includes(reusedStatus))
+  ? { batch_id: reusedBatchId, status: reusedStatus } : null;
 
 return [{
   json: {
@@ -66,6 +74,8 @@ return [{
     image_base64: image,
     // zoomed header crop (base64 JPEG), '' when not sent or invalid
     header_image_base64: headerImage,
+    // { batch_id, status } of an earlier batch with the same image file, null when none
+    reused_image: reusedImage,
     // used by the remark re-check time budget
     received_at_ms: Date.now(),
   },

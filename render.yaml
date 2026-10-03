@@ -74,8 +74,8 @@ services:
         value: "4"
       - key: PREDATE_GRACE_SECONDS
         value: "30"
-      - key: WATCHER_ONLINE_SECONDS
-        value: "90"
+      - key: WATCHER_ONLINE_SECONDS         # watcher 2.4.4+; older watchers get 90
+        value: "40"
       - key: PAD_FOR_OMR
         value: "true"
       - key: PAD_PERCENT

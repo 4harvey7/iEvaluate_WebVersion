@@ -34,7 +34,13 @@ echo   Step 1 of 2:  Stopping the Scan Watcher
 echo  --------------------------------------------------------------
 call "%TOOLS%\watcher_process.bat" stop
 call "%TOOLS%\watcher_process.bat" check
-if errorlevel 1 (echo   [OK] Stopped.) else (echo   [!] It is still running. Restart the computer to stop it.)
+if not errorlevel 1 goto still_running
+echo   [OK] Stopped.
+call :tell_website
+goto stopped_done
+:still_running
+echo   [!] It is still running. Restart the computer to stop it.
+:stopped_done
 echo.
 
 echo  --------------------------------------------------------------
@@ -71,6 +77,24 @@ echo.
 echo   Press any key to close this window.
 pause >nul
 exit /b 1
+
+:tell_website
+REM Watcher 2.4.4+: tell the website now, so its light turns red right away
+REM instead of after ~40 s. Best effort (a few seconds at most); without
+REM internet, or with an older watcher, the light still turns red by itself.
+set "SW_CFG=%DEST%\watcher_config.json"
+if not exist "%SW_CFG%" set "SW_CFG=%HERE%watcher_config.json"
+set "SW_PYFILE=%HERE%folder_watcher.py"
+if not exist "%SW_PYFILE%" set "SW_PYFILE=%TOOLS%\folder_watcher.py"
+if not exist "%SW_CFG%" goto :eof
+if not exist "%SW_PYFILE%" goto :eof
+set "PY="
+if exist "%TOOLS%\find_python.bat" (call "%TOOLS%\find_python.bat") else if exist "%HERE%find_python.bat" call "%HERE%find_python.bat"
+if not defined PY goto :eof
+%PY% "%SW_PYFILE%" --offline --config "%SW_CFG%" >nul 2>&1
+if errorlevel 1 goto :eof
+echo   [OK] The website now shows this laptop as offline.
+goto :eof
 
 :missing_files
 color 4F

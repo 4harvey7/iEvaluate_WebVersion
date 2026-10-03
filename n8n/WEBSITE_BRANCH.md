@@ -2,7 +2,7 @@
 
 `perfect-101-website.json` is the full "perfect 101" workflow with:
 
-1. **The draft "SAST from Website" branch replaced** by a website front end of 26 nodes (all named `Website …`). The front end only does what is website specific: payload validation, duplicate check, OCR/OMR (same Python + Gemini calls as the phone), not-a-form reject, reconcile, batch integrity check, the check of the form's instructor/subject against the database, the clean/flagged decision, and storing the clean page's raw row so the backend can be answered. A page is credited automatically to the instructor and subject the staff member picked for the batch **only when the form agrees with them** (or its instructor/subject text is blank/unreadable). When the form names another instructor/subject that is in the database, the page is flagged with that instructor/subject **pre-filled as the suggestion**; nothing is credited until staff approve it (see "Batch check and the form's instructor/subject").
+1. **The draft "SAST from Website" branch replaced** by a website front end of 26 nodes (all named `Website …`). The front end only does what is website specific: payload validation, duplicate check, OCR/OMR (same Python + Gemini calls as the phone), not-a-form reject, reconcile, batch integrity check, the check of the form's instructor/subject against the database, the clean/flagged decision, and storing the clean page's raw row so the backend can be answered. A page is credited automatically to the instructor and subject the staff member picked for the batch **only when the form agrees with them**. A blank/unreadable instructor, subject or student id is held for review (`instructor_missing`, `subject_missing`, `student_id_missing`), and so is an image file already marked in another batch (`reused_image`). When the form names another instructor/subject that is in the database, the page is flagged with that instructor/subject **pre-filled as the suggestion**; nothing is credited until staff approve it (see "Batch check and the form's instructor/subject").
 2. **No duplicated calculation nodes.** After the raw row is stored and the webhook answered, a clean page goes through `Website Map to Target Format` into the **existing `If19`**, the same entry `Map to Target Format3` uses for phone scans. The management/performance recompute, overall totals, question means, `If28` alerts and the remark AI path exist once and are shared by phone, website, Google Sheet and correction executions. A flagged page reuses the **phone flagged path** (`Save scan error image` → `build flagged record1` → `save flagged to failed_scan_queue1` → `Respond to Webhook`).
 3. **Every hardcoded Supabase key removed.** 8 HTTP Request nodes now use the n8n credential **Supabase iEvaluate (secret key)** (type *Supabase API*), referenced by name and by the live credential id (taken from the live export), so a re-import into the same n8n keeps it linked. That credential sends both the `apikey` and `Authorization: Bearer` headers. The `Content-Type`/`Prefer` headers stay as they were.
 4. **Aggregate fix in the shared main flow.** See the last section.
@@ -220,14 +220,18 @@ An other candidate is **strong** when it scores ≥ `NAME_MATCH_MIN` (instructor
 | `ambiguous` (not flagged) | a strong other candidate that does not beat a weak batch (batch < the minimum): the batch is among the contenders | none | batch |
 | `same` | nobody beats the batch and the batch scores ≥ 0.40 (subject ≥ 0.35), or it is the best match with ≥ 0.25; the batch subject code (or one off it) on the form | none | batch |
 | `not_found` | nobody beats the batch and the batch scores too little | none (noted in `review_note` / `partial_data` only) | batch |
-| `unreadable` | blank, a placeholder word (`N/A`, `unknown`, …), fewer than 3 letters (subject: fewer than 2 letters/digits) | none (the batch is authoritative) | batch |
+| `unreadable` | blank, a placeholder word (`N/A`, `unknown`, …), fewer than 3 letters (subject: fewer than 2 letters/digits) | `instructor_missing` / `subject_missing` (held for review, never saved silently) | batch (pre-selected) |
 | `unchecked` | `Website Form Match` failed (its error output) | `form_match_failed` (held for review) | batch |
 
 A course code on the form that belongs to no subject ("IT1021") never lets a title make another subject `found`, and a code one off another subject's code only ever supports the batch. The reason codes are unchanged; `instructor_mismatch_not_found` / `subject_mismatch_not_found` are simply no longer raised. `identity_check` shows `mismatch` only for a flagged side (`match` for same / not-flagged ambiguous, `unreadable` otherwise).
 
-When the suggestion differs from the batch (`found`), a `duplicate_student_id` computed against the batch instructor/subject is dropped (the review note says so); the backend re-checks duplicates against the real target when the page is approved.
+When the suggestion differs from the batch (`found`), a `duplicate_student_id` computed against the batch instructor/subject is dropped (the review note says so); the backend re-checks duplicates against the real target when the page is approved. The `*_missing` reasons are never dropped.
 
-A page is credited automatically (to the batch) only when all of these hold: the reconciliation raised no reason; the batch references are valid; the form names no other instructor/subject that clearly beats the batch; no other stored form of the same student exists.
+**Student id.** Blank, no letter/digit, or a placeholder word (`N/A`, `none`, `illegible`, …) → `student_id_missing`, stored as NULL (never a `duplicate_student_id`). The reviewer types it from the sheet, or approves without one.
+
+**Same image in another batch.** Dedupe (watcher state, `claim_batch_item`, `task_id`) is per batch, so a copy of an already-scanned picture pasted into a new batch gets a new `task_id`. The backend looks up `scan_batch_items` with the same `file_sha256` in **another** batch with status `success`, `flagged` or `duplicate` (`rejected` = not a form, nothing stored) and sends `reused_image: {batch_id, status}`; `Website Decide` flags `reused_image` (not rejected, not saved) and staff decide. A failed lookup is logged and the page is marked without it (migration 012 indexes `file_sha256`).
+
+A page is credited automatically (to the batch) only when all of these hold: the reconciliation raised no reason; the batch references are valid; the instructor, subject and student id on the form are readable; the form names no other instructor/subject that clearly beats the batch; no other stored form of the same student exists; the image file was not already marked in another batch. Only such a page can be picked for the random `spot_check` (about 1 in 20, held for a quick staff check).
 
 Removed reasons (earlier designs; the validator keeps them forbidden): `batch_instructor_mismatch`, `instructor_not_verified`, `batch_subject_mismatch`, `subject_not_verified`, `identity_check_failed`.
 
@@ -334,10 +338,11 @@ The phone node `ai validation ocr and omr` keeps its timing: no explicit timeout
 { "batch_id": "uuid", "instructor_id": "uuid", "subject_id": "uuid", "term_id": "uuid",
   "station_id": "uuid", "staff_id": "uuid", "filename": "str", "file_sha256": "hex",
   "task_id": "web:<batch_id>:<first 16 hex of sha256>", "image": "<base64 JPEG, no data: prefix>",
-  "mime_type": "image/jpeg", "paper_size": "SHORT|LONG" }
+  "mime_type": "image/jpeg", "paper_size": "SHORT|LONG",
+  "reused_image": { "batch_id": "uuid", "status": "success|flagged|duplicate" } }
 ```
 
-`paper_size` is optional (the backend sends it for scanner pages after detecting the bond size); anything missing or unknown means `LONG`. Other optional extras (`orientation_applied`, `orientation_confidence`, `preprocess`) are ignored.
+`paper_size` is optional (the backend sends it for scanner pages after detecting the bond size); anything missing or unknown means `LONG`. `reused_image` is optional (only when the same image file was already marked in another batch); anything invalid is dropped. Other optional extras (`orientation_applied`, `orientation_confidence`, `preprocess`) are ignored.
 
 A wrong or missing secret gets n8n's own 403 before the workflow runs.
 
@@ -360,7 +365,8 @@ A wrong or missing secret gets n8n's own 403 before the workflow runs.
   - OMR and quality: `ai_validation_failed`, `gemini_unavailable`, `omr_unavailable`, `omr_agreement_below_30`, `grid_not_detected`, `omr_fallback_grid`, `layout_mismatch`, `python_weak_gemini_blank_N_rows`, `python_weak_disagreement_N_rows`, `poor_scan_quality`, `low_confidence_ocr_N_rows`, `too_many_blanks_N_of_20`
   - batch: `batch_reference_invalid` (instructor/subject deleted or disabled, no term), `batch_check_failed` (the query failed)
   - the form's instructor/subject: `instructor_mismatch_found`, `instructor_mismatch_not_found`, `instructor_mismatch_ambiguous`, `subject_mismatch_found`, `subject_mismatch_not_found`, `subject_mismatch_ambiguous`, `form_match_failed` (the two `*_not_found` codes are no longer raised; see "Batch check and the form's instructor/subject"; nothing is credited, the suggestion is in `partial_data`)
-  - duplicates: `duplicate_student_id` (another stored form of the same student for this instructor, subject and term)
+  - blank/unreadable on the form: `instructor_missing`, `subject_missing` (the batch value is pre-selected), `student_id_missing` (can be approved without one)
+  - duplicates: `duplicate_student_id` (another stored form of the same student for this instructor, subject and term), `reused_image` (the same image file was already marked in another batch)
   - internal errors, still queued: `internal_error_reconcile`, `internal_error_decide`
 - Two reasons mean the page was **NOT stored anywhere**:
   - **`internal_error_not_saved`**: retryable. Covers database errors (duplicate check, raw upsert) and a failed queue insert. The backend should send the page again later, not treat it as a final result.

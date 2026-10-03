@@ -45,6 +45,10 @@ class _Q:
         self.filters.append(lambda r: r.get(col) == val)
         return self
 
+    def gt(self, col, val):
+        self.filters.append(lambda r: r.get(col) is not None and logic.parse_ts(r.get(col)) > logic.parse_ts(val))
+        return self
+
     def in_(self, col, vals):
         vals = list(vals)
         self.filters.append(lambda r: r.get(col) in vals)
@@ -466,3 +470,69 @@ def test_set_folder_saves_full_path(env):
     r = client.put(f"/stations/{SID}/folder", json={"folder_path": r"C:\scan"})
     assert r.status_code == 200 and r.json()["folder_path"] == "C:/scan"
     assert sb.tables["stations"][0]["folder_path"] == "C:/scan"
+
+
+# ---------------------------------------------------------------- 7. online light
+def test_online_threshold_depends_on_watcher_version():
+    f = station_status.online_seconds_for
+    assert f("2.4.4", 40) == 40 and f("2.5.0", 40) == 40 and f("2.10", 40) == 40 and f("3.0.0-beta", 40) == 40
+    # Older watchers heartbeat every 30 s with none during a slow upload: never below 90 s.
+    assert f("2.4.3", 40) == 90 and f("2.3", 40) == 90 and f(None, 40) == 90 and f("garbage", 40) == 90
+    assert f("2.4.3", 120) == 120 and f("2.4.4", 120) == 120
+
+
+@pytest.mark.parametrize("version,age,online", [
+    ("2.4.4", 10, True), ("2.4.4", 40, True), ("2.4.4", 41, False),
+    ("2.4.3", 41, True), ("2.4.3", 89, True), ("2.4.3", 91, False),
+])
+def test_watcher_presence(version, age, online):
+    row = {"watcher_version": version, "last_seen_at": (NOW - timedelta(seconds=age)).isoformat()}
+    p = station_status.watcher_presence(row, NOW, 40)
+    assert p["watcher_online"] is online
+    assert p["watcher_seen_seconds_ago"] == pytest.approx(age, abs=0.1)
+    assert p["watcher_online_seconds"] == (40 if version == "2.4.4" else 90)
+
+
+def test_watcher_presence_never_seen():
+    p = station_status.watcher_presence({"last_seen_at": None, "watcher_version": None}, NOW, 40)
+    assert p == {"watcher_online": False, "watcher_seen_seconds_ago": None, "watcher_online_seconds": 90.0}
+
+
+def _online_env(env, monkeypatch, **station):
+    sb = MemSB({"scan_batches": [], "stations": [_station(**station)], "user_info": []})
+    client = env(sb)
+    settings = SimpleNamespace(watcher_online_seconds=40.0)
+    for mod in (stations, scans):
+        monkeypatch.setattr(mod, "get_settings", lambda: settings)
+    return client, sb
+
+
+def test_station_endpoint_online_light_is_fresh(env, monkeypatch):
+    seen = (NOW - timedelta(seconds=50)).isoformat()
+    client, _ = _online_env(env, monkeypatch, watcher_version="2.4.4", last_seen_at=seen)
+    r = client.get(f"/stations/{SID}")
+    assert r.headers["cache-control"] == "no-store"
+    s = r.json()
+    assert s["watcher_online"] is False and s["watcher_online_seconds"] == 40
+    assert s["watcher_seen_seconds_ago"] >= 50
+    assert client.get("/stations").headers["cache-control"] == "no-store"
+
+
+def test_going_offline_turns_the_light_red_until_the_next_heartbeat(env, monkeypatch):
+    client, sb = _online_env(env, monkeypatch, watcher_version="2.4.4",
+                             last_seen_at=datetime.now(timezone.utc).isoformat())
+    assert client.get(f"/stations/{SID}").json()["watcher_online"] is True
+    r = client.post("/scans/offline", json={"version": "2.4.4"})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    s = client.get(f"/stations/{SID}").json()
+    assert s["watcher_online"] is False
+    assert 40 < s["watcher_seen_seconds_ago"] < 45  # backdated just past the threshold, not erased
+    _hb(client, version="2.4.4")
+    assert client.get(f"/stations/{SID}").json()["watcher_online"] is True
+
+
+def test_going_offline_never_moves_last_seen_forward(env, monkeypatch):
+    old = (NOW - timedelta(hours=1)).isoformat()
+    client, sb = _online_env(env, monkeypatch, watcher_version="2.4.4", last_seen_at=old)
+    assert client.post("/scans/offline", json={"version": "2.4.4"}).status_code == 200
+    assert sb.tables["stations"][0]["last_seen_at"] == old

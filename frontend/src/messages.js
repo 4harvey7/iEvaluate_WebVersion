@@ -88,6 +88,12 @@ const REASON_TEXT = {
   subject_mismatch_ambiguous: "The subject written on the sheet could be more than one subject.",
   form_match_failed: "The instructor and subject on the sheet couldn't be checked, so this batch's are used. Please check them.",
   duplicate_student_id: "Another form from this student is already saved for this instructor and subject.",
+  // Blank or unreadable on the sheet: this batch's values are pre-selected; check them and approve.
+  instructor_missing: "The instructor on the sheet is blank or couldn't be read. Check it; this batch's instructor is pre-selected.",
+  subject_missing: "The subject on the sheet is blank or couldn't be read. Check it; this batch's subject is pre-selected.",
+  student_id_missing: "The student ID on the sheet is blank or couldn't be read. Type it in if it's on the sheet.",
+  reused_image:
+    "This exact picture was already scanned in another batch. Check it isn't the same form counted twice before approving.",
   batch_reference_invalid: "This batch's instructor, subject or term is no longer valid.",
   batch_check_failed: "The batch check couldn't run for this page. Please check it.",
   internal_error_decide: "Automatic checking stopped part-way for this page. Please check every field.",

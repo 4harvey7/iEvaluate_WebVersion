@@ -66,7 +66,9 @@ class Settings:
         # Grace window (seconds) for the "file predates batch" check, on top of
         # the watcher clock-skew correction.
         self.predate_grace_seconds: float = _float_env("PREDATE_GRACE_SECONDS", 30.0)
-        self.watcher_online_seconds: float = _float_env("WATCHER_ONLINE_SECONDS", 90.0)
+        # A watcher (2.4.4+, heartbeat every 15 s) counts as online this long after
+        # its last heartbeat. Older watchers keep 90 s (app/station_status.py).
+        self.watcher_online_seconds: float = _float_env("WATCHER_ONLINE_SECONDS", 40.0)
         # Page viewer (migration 010, app/page_images.py): a viewing copy of every
         # scanned page in this PRIVATE Supabase Storage bucket. Empty = don't keep pictures.
         self.scan_image_bucket: str = os.environ.get("SCAN_IMAGE_BUCKET", "scan-pages").strip()

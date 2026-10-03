@@ -269,7 +269,7 @@ async function decideForm(instructor, subject, batch = {}, page = {}) {
   const ratings = {};
   for (let i = 1; i <= 10; i++) { ratings[`m${i}`] = 5; ratings[`p${i}`] = 4; }
   const rec = { _stage: 'reconciled', ocr_instructor: instructor, ocr_subject: subject, review_reasons: [], review_note: null,
-    ratings, student_id: '', remarks: 'Good', agreement_percent: 100, comparisons: [], ...page };
+    ratings, student_id: 'S-FORM', remarks: 'Good', agreement_percent: 100, comparisons: [], ...page };
   const [idRow] = await runNode('Website Identity Check', rec, { 'Website Prepare Scan': ctx });
   const [fm] = await runNode('Website Form Match', idRow, { 'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': rec });
   const [d] = await runCode('Website Decide', [fm], { 'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': rec,
@@ -664,12 +664,17 @@ async function suite(rawIdType) {
       subject: 'IT-101 Intro to Computing' }));
     assert.strictEqual(d.decision, 'clean');
     assert.deepStrictEqual(d.review_reasons, []);
-    // blank / unreadable text on the form -> batch authoritative, no flag
+    // blank / unreadable text on the form -> held for review with the batch pre-selected
     for (const [i, sj] of [['', ''], ['N/A', 'N/A'], ['J.', '-']]) {
       const b = await websiteDecide('web:e2e-blank', gemResp({ instructor: i, subject: sj }));
-      assert.deepStrictEqual(b.d.review_reasons, [], `${i} / ${sj}`);
+      assert.deepStrictEqual(b.d.review_reasons, ['instructor_missing', 'subject_missing'], `${i} / ${sj}`);
       assert.strictEqual(b.d.partial_data.instructor_match, 'unreadable');
+      assert.strictEqual(b.d.partial_data.suggested_instructor_id, ID.juan);
     }
+    // blank student id -> student_id_missing
+    const noId = await websiteDecide('web:e2e-noid', gemResp({ student_id: '', instructor: 'Sir J. Dela Cruz', subject: 'IT-101' }));
+    assert.deepStrictEqual(noId.d.review_reasons, ['student_id_missing']);
+    assert.strictEqual(noId.d.student_id, null);
     const r = await websiteToRaw(d);
     assert.strictEqual(r.saved, true);
     assert.strictEqual(r.row.instructor, 'Juan Dela Cruz');
@@ -894,10 +899,10 @@ async function suite(rawIdType) {
       assert.strictEqual(d.partial_data.instructor, 'Juan Dela Cruz');
     }
   });
-  test('form match: blank / placeholder / too short -> unreadable, no flag', async () => {
+  test('form match: blank / placeholder / too short -> unreadable, instructor_missing + subject_missing', async () => {
     for (const [i, sj] of [['', ''], ['N/A', 'N/A'], ['J.', 'X'], ['Instructor', 'Subject'], ['Dr.', ' - '], ['unknown', 'none']]) {
       const { d } = await decideForm(i, sj);
-      assert.deepStrictEqual(d.review_reasons, [], `${i} / ${sj}`);
+      assert.deepStrictEqual(d.review_reasons, ['instructor_missing', 'subject_missing'], `${i} / ${sj}`);
       assert.strictEqual(d.partial_data.instructor_match, 'unreadable', i);
       assert.strictEqual(d.partial_data.subject_match, 'unreadable', sj);
       assert.strictEqual(d.identity_check, null);

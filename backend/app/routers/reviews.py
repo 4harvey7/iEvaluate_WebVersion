@@ -1346,7 +1346,9 @@ def _run_unsaved_retry(row_id: str, batch: dict, user_id: str) -> None:
         row = rows[0] if rows else None
         if not row or row.get("status") != uv.SENDING:
             return
-        payload = uv.retry_payload(batch, row, user_id)
+        sha = str(uv.as_dict(row.get("page_meta")).get("file_sha256") or "")
+        reused = scans_router.find_reused_image(sb, sha, batch["id"]) if sha else None
+        payload = uv.retry_payload(batch, row, user_id, reused_image=reused)
         headers = {"X-Webhook-Secret": getattr(settings, "n8n_webhook_secret", "") or ""}
         meta = {"unsaved_id": row_id, "task_id": row.get("task_id"), "batch_id": row.get("batch_id")}
         try:

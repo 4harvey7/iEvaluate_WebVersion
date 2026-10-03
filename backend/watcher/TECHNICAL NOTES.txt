@@ -20,6 +20,10 @@ WHAT IT IS
   allowed"); set one by hand in watcher_config.json if really needed. A
   "server busy" reply (HTTP 503 + Retry-After, too many pages at once) is
   retried after the time the server asks for.
+  2.4.4+: heartbeat every 15 s (was 30 s), plus a small keep-alive while a
+  slow page upload blocks the main loop, so the website's light can turn red
+  ~40 s after the watcher stops (older watchers: 90 s). UNINSTALL (and Ctrl+C
+  in the watcher window) tells the website at once (POST /scans/offline).
 
 THE PACKAGE (ScanWatcher-<station>.zip, top folder ScanWatcher\)
   INSTALL.bat          one-click installer (see below)
@@ -72,8 +76,8 @@ FOLDER HANDLING
     (\\server\share\..., //server/share/...) are refused by the website, never
     sent in a heartbeat, and ignored by watcher 2.4.3+ if they arrive anyway.
     Only a hand-edited watcher_config.json may point at a folder inside a share.
-  - Folder set on the website: every heartbeat (30 s; 10 s while files wait)
-    returns the station's folder. The watcher hot-switches within ~30 s, no
+  - Folder set on the website: every heartbeat (15 s; 10 s while files wait)
+    returns the station's folder. The watcher hot-switches within ~15 s, no
     restart, and saves the new folder into watcher_config.json.
   - Unsafe folders are refused (drive roots, the user folder, root of
     Desktop/Documents/Downloads/OneDrive, Windows, Program Files). If the local
@@ -84,8 +88,10 @@ FOLDER HANDLING
     "Folder not found". No permission: "Can't open the folder".
 
 STATUS LIGHT ON THE WEBSITE (from heartbeats)
-  green "Online - watching <folder>" | red "Offline" (no heartbeat recently:
-  laptop off, no internet, watcher not running, key rejected) | amber
+  green "Online - watching <folder>" | red "Offline" (no heartbeat for 40 s,
+  WATCHER_ONLINE_SECONDS on the server; 90 s for watchers before 2.4.4: laptop
+  off, no internet, watcher not running, key rejected; at once after
+  UNINSTALL) | amber
   "Folder not found" / "That folder isn't allowed" / "Can't open the folder".
 
 DE-DUPLICATION / RE-SEND RULE

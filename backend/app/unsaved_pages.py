@@ -299,14 +299,14 @@ def item_back_to_review(sb, item_id: str, reasons: list | None, count_failure: b
 
 
 # ---------------------------------------------------------------- retry
-def retry_payload(batch: dict, row: dict, staff_id: str | None) -> dict:
+def retry_payload(batch: dict, row: dict, staff_id: str | None, reused_image: dict | None = None) -> dict:
     """The same body the ingest sent (contract in n8n/WEBSITE_BRANCH.md),
     rebuilt from the kept copy."""
     meta = as_dict(row.get("page_meta"))
     sha = str(meta.get("file_sha256") or "")
     b = {**batch, "created_by": batch.get("created_by") or staff_id}
     payload = build_n8n_payload(b, meta.get("station_id") or batch.get("station_id"), row.get("filename") or "scan.jpg",
-                                sha, row.get("image_base64") or "")
+                                sha, row.get("image_base64") or "", reused_image=reused_image)
     payload["task_id"] = row.get("task_id") or payload["task_id"]
     for k in ("orientation_applied", "orientation_confidence", "preprocess"):
         if k in meta:

@@ -38,7 +38,7 @@ def test_malformed_bearer_rejected():
     assert r.status_code == 401
 
 
-@pytest.mark.parametrize("path", ["/scans/ingest", "/scans/heartbeat"])
+@pytest.mark.parametrize("path", ["/scans/ingest", "/scans/heartbeat", "/scans/offline"])
 def test_watcher_endpoints_require_station_key(path):
     r = client.post(path, json={})
     assert r.status_code in (401, 422)

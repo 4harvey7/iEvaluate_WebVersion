@@ -1,4 +1,5 @@
-// Auto-credit unless OMR fails or the form clearly names another instructor/subject.
+// Auto-credit unless OMR fails, a header field is blank/unreadable, the image was already scanned in
+// another batch, or the form clearly names another instructor/subject.
 const NAME_MATCH_MIN      = 0.70;   // another instructor needs this score to be a match
 const MATCH_MARGIN        = 0.10;   // best other match must beat the second by this
 const BATCH_MARGIN        = 0.20;   // and must beat the batch by this (the staff picked the batch)
@@ -250,8 +251,33 @@ if (reasons.some((r) => MISMATCH_RE.test(r))) {
   notes.push('Nothing was credited: approve the suggestion or choose the right instructor/subject.');
 }
 
-// duplicate check ran against the batch instructor/subject/term
-if (idOk && id.duplicate_student_exists === true) {
+// a blank/unreadable header field is held for review, never filled in silently from the batch
+if (instr.match === 'unreadable') {
+  reasons.push('instructor_missing');
+  notes.push(`The instructor on the form is blank or could not be read${ocrI.trim() ? ` (${quote(ocrI)})` : ''}. Check the sheet; the batch instructor ${batchInstrLabel} is pre-selected.`);
+}
+if (subj.match === 'unreadable') {
+  reasons.push('subject_missing');
+  notes.push(`The subject on the form is blank or could not be read${ocrS.trim() ? ` (${quote(ocrS)})` : ''}. Check the sheet; the batch subject ${batchSubjLabel} is pre-selected.`);
+}
+// blank -> null so it never collides; a placeholder (N/A, none, ...) or no letter/digit counts as blank
+const studentIdIn = String(rec.student_id || '').trim();
+const studentIdNorm = studentIdIn.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const studentId = (studentIdNorm && !NAME_PLACEHOLDERS.has(studentIdNorm)) ? studentIdIn : null;
+if (!studentId) {
+  reasons.push('student_id_missing');
+  notes.push(`The student ID on the form is blank or could not be read${studentIdIn ? ` (${quote(studentIdIn)})` : ''}. Type it from the sheet if it is there; the page can also be approved without one.`);
+}
+
+// the same image file was already marked in another batch (backend lookup by sha256)
+const reused = ctx.reused_image;
+if (reused) {
+  reasons.push('reused_image');
+  notes.push(`This exact image file was already scanned in another batch (${reused.batch_id}, result: ${reused.status}). Check that it is not the same student's form counted twice before approving.`);
+}
+
+// duplicate check ran against the batch instructor/subject/term (a placeholder student ID is no duplicate)
+if (idOk && id.duplicate_student_exists === true && studentId) {
   const who = String(rec.student_id || '').trim();
   if (targetDiffers) {
     // suggested elsewhere, so the batch duplicate doesn't apply
@@ -289,7 +315,6 @@ for (const prefix of ['m', 'p']) {
 }
 const answered = Object.values(ratings).filter((v) => v !== null).length;
 
-const studentId = String(rec.student_id || '').trim() || null;   // blank -> null so it never collides
 const remarkIn = String(rec.remarks || '').trim();
 const remark = maskProfanity(remarkIn);
 const remarksMasked = rec.remarks_masked === true || remark !== remarkIn;

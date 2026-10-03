@@ -309,7 +309,49 @@ def test_kept_for_review_counts_as_delivered(make):
 
 
 def test_version():
-    assert fw.VERSION == "2.4.3"
+    assert fw.VERSION == "2.4.4"
+
+
+# ---------------------------------------------------------------- online light (2.4.4)
+def test_heartbeat_often_enough_for_the_online_light():
+    # The website shows "Offline" 40 s after the last heartbeat (WATCHER_ONLINE_SECONDS).
+    assert fw.HEARTBEAT_SECONDS * 2 + 10 <= 40
+
+
+def test_keepalive_only_while_the_main_loop_is_busy(make):
+    make_w, _ = make
+    w = make_w(FakeServer())
+    now = time.monotonic()
+    w.last_heartbeat = now - 5
+    assert not w.keepalive_due(now, 0.0)  # regular heartbeats are flowing
+    w.last_heartbeat = now - 60           # stuck in a slow upload
+    assert w.keepalive_due(now, 0.0)
+    assert not w.keepalive_due(now, now - 3)  # one went out just now
+    w.auth_failed_until = now + 30
+    assert not w.keepalive_due(now, 0.0)  # key rejected: don't hammer the server
+
+
+def test_send_offline(make, monkeypatch):
+    make_w, _ = make
+    cfg = make_w(FakeServer()).cfg
+    calls = []
+
+    def post(url, json=None, headers=None, timeout=None):
+        calls.append((url, json, headers))
+        return Resp(200, {"ok": True})
+    monkeypatch.setattr(fw.requests, "post", post, raising=False)
+    assert fw.send_offline(cfg) is True
+    url, body, headers = calls[-1]
+    assert url == "http://server/scans/offline" and body == {"version": fw.VERSION}
+    assert headers["X-Station-Key"] == "k"
+
+    monkeypatch.setattr(fw.requests, "post", lambda *a, **k: Resp(404, {}), raising=False)
+    assert fw.send_offline(cfg) is False  # older server: nothing happens
+
+    def down(*a, **k):
+        raise fw.requests.RequestException("no network")
+    monkeypatch.setattr(fw.requests, "post", down, raising=False)
+    assert fw.send_offline(cfg) is False  # never raises
 
 
 @pytest.mark.parametrize("shortcut", ["%USERPROFILE%/Scans", "~/Scans"])

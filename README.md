@@ -16,6 +16,7 @@ migrations/003_repair_import_error_scan_images.sql
 migrations/004_watcher_folder_status.sql  # watcher folder status columns (run manually; optional)
 migrations/005_scan_review_queue.sql      # review page: versions + live cursor on failed_scan_queue / import_errors (run manually)
 migrations/010_scan_page_images.sql       # page viewer: score + picture of every page, private bucket scan-pages (run manually, after 008/009)
+migrations/012_scan_items_sha_index.sql   # index for the "same image in another batch" lookup (reused_image; run manually, after 011)
 backend/                            # FastAPI (service-role Supabase client)
   app/main.py                       # app, CORS, error handling
   app/security.py                   # bearer-token + station-key auth, rate limiting

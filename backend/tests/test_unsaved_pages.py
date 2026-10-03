@@ -806,3 +806,18 @@ def test_queue_row_shape_matches_n8n_internal_error_rows():
     p = q["partial_data"]
     assert p["instructor_match"] == "unchecked" and p["suggested_instructor_id"] == JUAN and p["ratings"] is None
     assert "omr_agreement_below_80" in p["review_note"]
+
+
+def test_retry_sends_reused_image_when_the_file_was_marked_in_another_batch(env):
+    other = "b7000000-0000-0000-0000-000000000007"
+    items = [_item(), _item(id="f1000000-0000-0000-0000-000000000099", batch_id=other, status="success",
+                            task_id=f"web:{other}:ffff000000000001")]
+    db, n8n, client = env(items=items)
+    r = client.post(f"/reviews/unsaved/{U1}/retry", json={"expected_version": 2})
+    assert r.status_code == 200, r.text
+    (_, payload, _) = n8n.calls[0]
+    assert payload["reused_image"] == {"batch_id": other, "status": "success"}
+    # the plain retry (no other batch) carries none
+    db2, n8n2, client2 = env()
+    assert client2.post(f"/reviews/unsaved/{U1}/retry", json={"expected_version": 2}).status_code == 200
+    assert "reused_image" not in n8n2.calls[0][1]

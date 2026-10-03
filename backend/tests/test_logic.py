@@ -170,3 +170,17 @@ def test_subject_normalization_and_ranking():
 
 def test_clean_search_text_strips_filter_syntax():
     assert logic.clean_search_text("a,b(c)%_*") == "a b c"
+
+
+def test_n8n_payload_reused_image_only_when_found():
+    batch = {"id": "b", "instructor_id": "i", "subject_id": "s", "term_id": "t", "created_by": "u"}
+    info = logic.reused_image_info({"batch_id": "b0", "status": "success", "filename": "x.jpg", "task_id": "web:b0:x"})
+    assert info == {"batch_id": "b0", "status": "success"}  # nothing else (no personal data)
+    p = logic.build_n8n_payload(batch, "st", "f.jpg", "c" * 64, "QUJD", reused_image=info)
+    assert p["reused_image"] == info
+    assert "reused_image" not in logic.build_n8n_payload(batch, "st", "f.jpg", "c" * 64, "QUJD", reused_image=None)
+    for st in ("flagged", "duplicate"):
+        assert logic.reused_image_info({"batch_id": "b0", "status": st}) == {"batch_id": "b0", "status": st}
+    for row in (None, {}, {"batch_id": "b0", "status": "rejected"}, {"batch_id": "b0", "status": "error"},
+                {"batch_id": "b0", "status": "processing"}, {"batch_id": None, "status": "success"}):
+        assert logic.reused_image_info(row) is None

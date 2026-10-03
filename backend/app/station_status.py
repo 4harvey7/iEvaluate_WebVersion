@@ -17,8 +17,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from postgrest.exceptions import APIError
@@ -46,6 +47,14 @@ COMMANDS = {CMD_RESEND, CMD_DISCARD}
 # A command the watcher has not picked up within this time is dropped (the
 # laptop was off); the staff member can click again.
 COMMAND_TTL_SECONDS = 900.0
+
+# Online light. Watcher 2.4.4+ sends a heartbeat every 15 s (plus a keep-alive
+# while a slow page upload blocks it) and tells the server when it is stopped
+# by UNINSTALL; WATCHER_ONLINE_SECONDS (default 40 s = two missed heartbeats +
+# 10 s) applies to it. Older watchers send one every 30 s and none during an
+# upload, so they keep the old 90 s to avoid a false "Offline" mid-scan.
+FAST_HEARTBEAT_VERSION = (2, 4, 4)
+LEGACY_ONLINE_SECONDS = 90.0
 
 # Undefined column / PostgREST "column not in schema cache".
 _MISSING_COLUMN_CODES = {"42703", "PGRST204"}
@@ -133,6 +142,38 @@ def _first(res) -> dict | None:
     if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0]
     return None
+
+
+# ------------------------------------------------------------------ online light
+def _version_tuple(version) -> tuple[int, ...] | None:
+    m = re.match(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?", str(version or ""))
+    return tuple(int(p or 0) for p in m.groups()) if m else None
+
+
+def online_seconds_for(version, configured: float) -> float:
+    """Seconds since the last heartbeat for which a watcher counts as online."""
+    v = _version_tuple(version)
+    if v is None or v < FAST_HEARTBEAT_VERSION:
+        return max(float(configured), LEGACY_ONLINE_SECONDS)
+    return float(configured)
+
+
+def watcher_presence(row: dict, now: datetime, configured: float) -> dict:
+    """watcher_online plus what the website needs to let a cached answer expire
+    by itself: the heartbeat's age (server clock, so browser clock skew does not
+    matter) and the threshold that applies to this watcher."""
+    limit = online_seconds_for(row.get("watcher_version"), configured)
+    seen = parse_ts(row.get("last_seen_at"))
+    if seen is None:
+        return {"watcher_online": False, "watcher_seen_seconds_ago": None, "watcher_online_seconds": limit}
+    age = max(0.0, (now - seen).total_seconds())
+    return {"watcher_online": age <= limit, "watcher_seen_seconds_ago": round(age, 1), "watcher_online_seconds": limit}
+
+
+def offline_last_seen(now: datetime, configured: float, version) -> datetime:
+    """A last_seen_at that already reads as offline: used when the watcher says
+    it is stopping, so the light turns red now instead of after the timeout."""
+    return now - timedelta(seconds=online_seconds_for(version, configured) + 1.0)
 
 
 # ------------------------------------------------------------------ commands

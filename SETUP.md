@@ -83,6 +83,17 @@ workflow (`n8n/perfect-101-website.json`, see `n8n/WEBSITE_BRANCH.md`). With
 an older workflow the correction still works, but n8n finds the instructor by
 name and uses the current term.
 
+## 1d. Apply migration 012 (same image in another batch)
+
+`migrations/012_scan_items_sha_index.sql` adds one index,
+`scan_batch_items (file_sha256)`. Before calling n8n the backend now looks for
+the same image file in another batch (success / flagged / duplicate), and n8n
+flags such a page `reused_image` for review instead of saving it again. Review
+it and run it in the Supabase SQL Editor after 011 (safe to run again). Until
+it is applied the lookup still works, only slower; a failed lookup never fails
+a scan. The flag itself needs the re-imported n8n workflow
+(`n8n/perfect-101-website.json`).
+
 ## 2. Backend environment
 
 Copy `backend/.env.example` to `backend/.env` (or set these on your host):

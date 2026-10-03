@@ -41,7 +41,7 @@ export function folderCheckStatus(station, check, now = Date.now()) {
   if (!hasBeenOnline(station)) {
     return { kind: "not_installed", tone: "warn", text: `Saved. When the scan program is installed on the scanner laptop, it will watch ${f}.` };
   }
-  if (!isOnline(station)) {
+  if (!isOnline(station, now)) {
     return {
       kind: "offline",
       tone: "warn",
@@ -89,9 +89,25 @@ export function folderCheckStatus(station, check, now = Date.now()) {
   return { kind: "slow", tone: "warn", text: `Saved, but the scanner laptop hasn't switched to ${f} yet. Check the status above in a minute.` };
 }
 
-export function isOnline(station) {
+// The server's "online" is only true when it answered. A fetched station
+// carries the heartbeat's age and the threshold (server clock), so the light
+// turns red on its own once that time runs out, even if no new answer arrives
+// (tab asleep, network down). Stations without these fields: server's answer.
+export function isOnline(station, now = Date.now()) {
   if (!station) return false;
-  return Boolean(station.watcher_online ?? station.online);
+  if (!(station.watcher_online ?? station.online)) return false;
+  const ago = station.watcher_seen_seconds_ago;
+  const limit = station.watcher_online_seconds;
+  const fetchedAt = station._fetched_at;
+  if (typeof ago === "number" && typeof limit === "number" && typeof fetchedAt === "number") {
+    return ago + Math.max(0, now - fetchedAt) / 1000 <= limit;
+  }
+  return true;
+}
+
+// Stamp a station from the server with the time it arrived (see isOnline).
+function stampFetched(s) {
+  return s && typeof s === "object" ? { ...s, _fetched_at: Date.now() } : s;
 }
 
 export function hasBeenOnline(station) {
@@ -103,7 +119,7 @@ export function hasBeenOnline(station) {
 // tone: green | red | amber | grey | unknown
 export function getScannerState(station, now = Date.now()) {
   if (!station) return { tone: "unknown", key: "unknown", title: "Checking...", message: "" };
-  const online = isOnline(station);
+  const online = isOnline(station, now);
   const folder = toWindowsPath(station.watcher_folder || station.folder_path || "");
   const err = station.watcher_folder_error || null;
 
@@ -159,22 +175,25 @@ export function isSwitchingFolder(station) {
 }
 
 // Loads a station and refreshes it every `intervalMs` while the page is open
-// (skips refreshes while the browser tab is hidden).
+// (skips refreshes while the browser tab is hidden; refreshes at once when the
+// tab or window comes back).
 export function useStation(stationId, { intervalMs = STATUS_POLL_MS, onMissing } = {}) {
   const [station, setStationState] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(Boolean(stationId));
   const seq = useRef(0);
+  const lastRefresh = useRef(0);
   const onMissingRef = useRef(onMissing);
   onMissingRef.current = onMissing;
 
   const refresh = useCallback(async () => {
     if (!stationId) return null;
     const id = ++seq.current;
+    lastRefresh.current = Date.now();
     try {
       const s = await api.getStation(stationId);
       if (id !== seq.current) return null;
-      setStationState(s);
+      setStationState(stampFetched(s));
       setError("");
       return s;
     } catch (err) {
@@ -190,7 +209,7 @@ export function useStation(stationId, { intervalMs = STATUS_POLL_MS, onMissing }
   // A local update (e.g. after saving) wins over any refresh still in flight.
   const setStation = useCallback((s) => {
     seq.current += 1;
-    setStationState(s);
+    setStationState(stampFetched(s));
     setLoading(false);
   }, []);
 
@@ -201,13 +220,16 @@ export function useStation(stationId, { intervalMs = STATUS_POLL_MS, onMissing }
     const timer = setInterval(() => {
       if (!document.hidden) refresh();
     }, intervalMs);
-    const onVisible = () => {
-      if (!document.hidden) refresh();
+    // Tab shown again / window focused: refresh now (once, both events often fire together).
+    const onBack = () => {
+      if (!document.hidden && Date.now() - lastRefresh.current > 1000) refresh();
     };
-    document.addEventListener("visibilitychange", onVisible);
+    document.addEventListener("visibilitychange", onBack);
+    window.addEventListener("focus", onBack);
     return () => {
       clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
+      document.removeEventListener("visibilitychange", onBack);
+      window.removeEventListener("focus", onBack);
     };
   }, [stationId, intervalMs, refresh]);
 

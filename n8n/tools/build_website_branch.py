@@ -18,8 +18,9 @@ What it does
      check, OCR/OMR (same as phone), not-a-form reject, reconcile, batch integrity check,
      the form's instructor/subject vs the database ('Website Form Match') and the
      clean/flagged decision. Code/SQL live in ./website_src/. A page is credited
-     automatically to the batch instructor/subject only when the form agrees with them (or
-     its instructor/subject text is unreadable); a form naming another instructor/subject is
+     automatically to the batch instructor/subject only when the form agrees with them (a
+     blank/unreadable instructor, subject or student id, or an image already marked in another
+     batch, is held for review: *_missing / reused_image); a form naming another instructor/subject is
      flagged with the matched one pre-filled as the suggestion, and nothing is credited until
      staff approve it (decide.js). The batch wins unless another instructor/subject clearly beats
      it (token fuzzy scoring in name_match.js); a form that matches nobody is not flagged. The

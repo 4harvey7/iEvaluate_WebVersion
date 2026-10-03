@@ -12,7 +12,7 @@ from app.db import get_settings, get_supabase, is_valid_uuid
 from app.logic import UNSAVED_REVIEW_MSG, item_error_code, last_activity, parse_ts
 from app.routers.instructors import get_instructor_if_eligible
 from app.security import CurrentUser, require_staff
-from app.station_status import public_watcher_fields, select_stations
+from app.station_status import public_watcher_fields, select_stations, watcher_presence
 
 router = APIRouter()
 log = logging.getLogger("ievaluate.batches")
@@ -243,7 +243,6 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
     )
 
     now = _now()
-    seen = parse_ts(st.get("last_seen_at"))
     instructor = people.get(b["instructor_id"], {})
     c = {
         "processed": b.get("processed_count") or 0,
@@ -275,7 +274,7 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
             "id": b["station_id"],
             "label": st.get("label"),
             "last_seen_at": st.get("last_seen_at"),
-            "watcher_online": bool(seen and (now - seen).total_seconds() <= settings.watcher_online_seconds),
+            **watcher_presence(st, now, settings.watcher_online_seconds),  # watcher_online + its age
             "watcher_version": st.get("watcher_version"),
             "folder_path": st.get("folder_path"),
             **public_watcher_fields(st, now),  # incl. watcher_skipped_files, watcher_command

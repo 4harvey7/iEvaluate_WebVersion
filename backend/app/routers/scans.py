@@ -20,6 +20,7 @@ from app.logic import (
     PIPELINE_REJECTED_MSG,
     PIPELINE_TIMEOUT_MSG,
     PIPELINE_UNAVAILABLE_MSG,
+    REUSED_IMAGE_STATUSES,
     SHA256_RE,
     UNSAVED_REVIEW_MSG,
     ImageValidationError,
@@ -35,13 +36,14 @@ from app.logic import (
     prepare_page,
     parse_ts,
     retries_exhausted,
+    reused_image_info,
     safe_filename,
     sha256_hex,
     validate_n8n_response,
 )
 from app.omr_prep import OmrPrepConfig
 from app.security import require_station
-from app.station_status import FOLDER_ERRORS, command_for_heartbeat, update_station_status
+from app.station_status import FOLDER_ERRORS, command_for_heartbeat, offline_last_seen, update_station_status
 
 router = APIRouter()
 log = logging.getLogger("ievaluate.scans")
@@ -180,6 +182,21 @@ def _keep_failed_page(sb, item_id: str, keep: KeepFn) -> bool:
     return True
 
 
+def find_reused_image(sb, file_sha256: str, batch_id: str) -> dict | None:
+    """The same image file already marked in ANOTHER batch (dedupe is per batch:
+    a copy pasted into a new batch gets a new task_id). Best effort: a failed
+    lookup is logged and the page is marked as usual (migration 012 indexes it)."""
+    try:
+        rows = (sb.table("scan_batch_items").select("batch_id, status")
+                .eq("file_sha256", file_sha256).neq("batch_id", batch_id)
+                .in_("status", list(REUSED_IMAGE_STATUSES))
+                .order("created_at").limit(1).execute().data or [])
+    except Exception:
+        log.exception("reused-image lookup failed (batch %s); marking without it", batch_id)
+        return None
+    return reused_image_info(rows[0] if rows else None)
+
+
 def _omr_prep_config(settings) -> OmrPrepConfig | None:
     cfg = OmrPrepConfig(
         pad=bool(getattr(settings, "pad_for_omr", True)),
@@ -307,7 +324,8 @@ def ingest_scan(body: IngestScan, station: dict = Depends(require_station)):
             raise _err(503, "pipeline_not_configured", "The scoring pipeline is not configured on the server. Will retry.")
 
         # 6b. Forward to n8n. URL + raw errors stay server-side.
-        payload = build_n8n_payload(batch, station_id, filename, sha, jpeg_b64, orientation=page)
+        payload = build_n8n_payload(batch, station_id, filename, sha, jpeg_b64, orientation=page,
+                                    reused_image=find_reused_image(sb, sha, batch["id"]))
         headers = {"X-Webhook-Secret": settings.n8n_webhook_secret}  # required at startup when a URL is set
         try:
             resp = _n8n().post(settings.n8n_batch_webhook_url, json=payload, headers=headers)
@@ -456,3 +474,23 @@ def heartbeat(body: Heartbeat | None = None, station: dict = Depends(require_sta
         "command": command,
         "command_id": command_id,
     }
+
+
+class GoingOffline(BaseModel):
+    version: str | None = Field(default=None, max_length=40)
+
+
+@router.post("/offline")
+def going_offline(body: GoingOffline | None = None, station: dict = Depends(require_station)):
+    """Watcher 2.4.4+ is being stopped (UNINSTALL, Ctrl+C): make the website's
+    light red now instead of after WATCHER_ONLINE_SECONDS. Moves last_seen_at
+    back just past the online threshold (never forward, so a laptop that was
+    already offline keeps its real time). The next heartbeat sets it to now."""
+    now = datetime.now(timezone.utc)
+    version = body.version if body else None
+    seen = offline_last_seen(now, get_settings().watcher_online_seconds, version).isoformat()
+    update = {"last_seen_at": seen}
+    if version:
+        update["watcher_version"] = version  # the threshold above is the one for this version
+    get_supabase().table("stations").update(update).eq("id", station["id"]).gt("last_seen_at", seen).execute()
+    return {"ok": True}

@@ -36,6 +36,9 @@ except ImportError:  # pragma: no cover
 
 N8N_STATUSES = ("success", "flagged", "rejected", "duplicate")
 IDENTITY_VALUES = ("match", "unreadable", "mismatch", "unverified")
+# An item in another batch with one of these final statuses means the image was
+# already counted or is waiting for review (rejected = not a form, nothing stored).
+REUSED_IMAGE_STATUSES = ("success", "flagged", "duplicate")
 
 
 # ---------------------------------------------------------------- station keys
@@ -315,8 +318,16 @@ def validate_n8n_response(body: Any) -> dict:
     }
 
 
+def reused_image_info(row: dict | None) -> dict | None:
+    """{batch_id, status} of an earlier batch's item with the same image file
+    (see REUSED_IMAGE_STATUSES), or None. Nothing else: no personal data."""
+    if not row or not row.get("batch_id") or row.get("status") not in REUSED_IMAGE_STATUSES:
+        return None
+    return {"batch_id": str(row["batch_id"]), "status": row["status"]}
+
+
 def build_n8n_payload(batch: dict, station_id: str, filename: str, file_sha256: str, jpeg_b64: str,
-                      orientation: "PreparedPage | None" = None) -> dict:
+                      orientation: "PreparedPage | None" = None, reused_image: dict | None = None) -> dict:
     payload = {
         "batch_id": batch["id"],
         "instructor_id": batch["instructor_id"],
@@ -343,6 +354,10 @@ def build_n8n_payload(batch: dict, station_id: str, filename: str, file_sha256: 
             # Optional: cropped/upscaled header for a clearer OCR read of instructor/subject.
             # Backward compatible -- n8n ignores it when absent.
             payload["header_image"] = base64.b64encode(orientation.header_jpeg).decode("ascii")
+    if reused_image:
+        # Optional: the same image file was already marked in another batch.
+        # n8n flags the page 'reused_image' for staff to decide (never saved silently).
+        payload["reused_image"] = reused_image
     return payload
 
 

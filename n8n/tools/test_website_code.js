@@ -57,6 +57,8 @@ const IDENTITY_REASONS = ['batch_instructor_mismatch', 'instructor_not_verified'
 const MISMATCH_REASONS = ['instructor_mismatch_found', 'instructor_mismatch_not_found', 'instructor_mismatch_ambiguous',
   'subject_mismatch_found', 'subject_mismatch_not_found', 'subject_mismatch_ambiguous'];
 const MISMATCH_RE = /^(instructor|subject)_mismatch_/;
+// Blank/unreadable header fields ('Website Decide'): held for review, never saved silently.
+const MISSING_REASONS = ['instructor_missing', 'subject_missing', 'student_id_missing'];
 function assertContract(out, expectStatus) {
   assert.ok(Array.isArray(out) && out.length === 1, 'exactly one item');
   const r = out[0].json;
@@ -843,13 +845,17 @@ test('Form check: shared surname -> instructor_mismatch_ambiguous (batch pre-sel
   const beat = await decide(identity(), REC, formMatch({ i: 'some name', ic: [icand(PEDRO, 'Pedro Reyes', 0.95), BATCH_I(0.72)] }));
   assert.deepStrictEqual(beat.review_reasons, ['instructor_mismatch_found']);
 });
-test('Form check: blank / placeholder / too short instructor or subject -> unreadable, no flag, batch credited', async () => {
+test('Form check: blank / placeholder / too short instructor or subject -> unreadable, instructor_missing + subject_missing, batch pre-selected', async () => {
   const cases = [['', ''], ['n a', 'n a'], ['j c', 'x'], ['unknown', 'subject'], ['illegible', 'none']];
   for (const [i, s] of cases) {
     const d = await decide(identity(), { ...REC, ocr_instructor: i, ocr_subject: s },
       formMatch({ i, ic: [BATCH_I(0), icand(PEDRO, 'Pedro Reyes', 0.9)], s, sc: [BATCH_S({ ns: 0 }), scand(IT102, 'IT 102', 'x', { hit: true })] }));
-    assert.strictEqual(d.decision, 'clean', `${i} / ${s}`);
-    assert.deepStrictEqual(d.review_reasons, []);
+    assert.strictEqual(d.decision, 'flagged', `${i} / ${s}`);
+    assert.deepStrictEqual(d.review_reasons, ['instructor_missing', 'subject_missing']);
+    assert.match(d.review_note, /instructor on the form is blank or could not be read.*batch instructor Juan Dela Cruz is pre-selected/);
+    assert.match(d.review_note, /subject on the form is blank or could not be read.*batch subject IT 101 is pre-selected/);
+    assert.strictEqual(d.partial_data.instructor, 'Juan Dela Cruz');
+    assert.strictEqual(d.partial_data.subject, 'IT 101');
     assert.strictEqual(d.partial_data.instructor_match, 'unreadable');
     assert.strictEqual(d.partial_data.subject_match, 'unreadable');
     assert.strictEqual(d.partial_data.instructor_match_confidence, null);
@@ -943,6 +949,83 @@ test('Form check: duplicate_student_id (vs the batch) dropped when the suggestio
   const nf = formMatch({ i: 'jose rizal', ic: [BATCH_I(0.04)] });
   assert.deepStrictEqual((await decide(dupRow, REC, nf)).review_reasons, ['duplicate_student_id']);
 });
+test('Missing header fields: blank / placeholder student ID -> student_id_missing (stored NULL), never a duplicate; instructor/subject only when unreadable', async () => {
+  for (const sid of ['', '   ', 'N/A', 'n.a.', 'none', 'illegible', '-', '?']) {
+    const d = await decide(identity({ duplicate_student_exists: true, duplicate_student_task_id: 'web:other' }), { ...REC, student_id: sid });
+    assert.strictEqual(d.decision, 'flagged', `student id ${JSON.stringify(sid)}`);
+    assert.deepStrictEqual(d.review_reasons, ['student_id_missing'], `a placeholder ID is no duplicate (${JSON.stringify(sid)})`);
+    assert.strictEqual(d.student_id, null);
+    assert.strictEqual(d.partial_data.student_id, '');
+    assert.match(d.review_note, /student ID on the form is blank or could not be read/);
+    assert.match(d.review_note, /can also be approved without one/);
+    assert.strictEqual(d.identity_check, null);
+    assert.strictEqual(d.instructor_id, INSTR);
+  }
+  // a real ID is kept as read; a real duplicate still flags
+  const ok = await decide(identity(), { ...REC, student_id: '2021-0001' });
+  assert.deepStrictEqual(ok.review_reasons, []);
+  assert.strictEqual(ok.student_id, '2021-0001');
+  const dup = await decide(identity({ duplicate_student_exists: true }), { ...REC, student_id: '2021-0001' });
+  assert.deepStrictEqual(dup.review_reasons, ['duplicate_student_id']);
+  // all three blank -> all three reasons, nothing saved
+  const all = await decide(identity(), { ...REC, ocr_instructor: '', ocr_subject: '', student_id: '' },
+    formMatch({ i: '', ic: [BATCH_I(0)], s: '', sc: [BATCH_S({ ns: 0 })] }));
+  assert.strictEqual(all.decision, 'flagged');
+  assert.deepStrictEqual(all.review_reasons, ['instructor_missing', 'subject_missing', 'student_id_missing']);
+  // only the unreadable one: a readable batch instructor + unreadable subject
+  const subjOnly = await decide(identity(), { ...REC, ocr_subject: '' }, formMatch({ s: '', sc: [BATCH_S({ ns: 0 })] }));
+  assert.deepStrictEqual(subjOnly.review_reasons, ['subject_missing']);
+  // never suppressed by a suggestion elsewhere: unreadable instructor + another subject found
+  const withFound = await decide(identity({ duplicate_student_exists: true }), { ...REC, ocr_instructor: '' },
+    formMatch({ i: '', ic: [BATCH_I(0)], s: 'it 102', sc: [scand(IT102, 'IT 102', 'Computer Programming 1', { hit: true }), BATCH_S({ ns: 0.04 })] }));
+  assert.deepStrictEqual(withFound.review_reasons, ['subject_mismatch_found', 'instructor_missing'], 'duplicate dropped (target differs), missing kept');
+  // the form check could not run: form_match_failed, not *_missing (nothing was checked)
+  const unchecked = (await run('Website Decide', { error: { message: 'boom' } }, {
+    'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': { ...REC, ocr_instructor: '' }, 'Website Identity Check': identity(),
+  }))[0].json;
+  assert.deepStrictEqual(unchecked.review_reasons, ['form_match_failed']);
+  // a page with a missing field is never also a spot check
+  for (let i = 0; i < 200; i++) {
+    const out = (await run('Website Decide', formMatch(), {
+      'Website Prepare Scan': { ...CTX, task_id: `spot-check-${i}` }, 'Website Reconcile OCR OMR': { ...REC, student_id: '' }, 'Website Identity Check': identity(),
+    }))[0].json;
+    assert.deepStrictEqual(out.review_reasons, ['student_id_missing']);
+  }
+});
+test('Reused image: Prepare passes a valid reused_image through (else null); Decide flags reused_image, never rejects or saves it', async () => {
+  const OLD = '99999999-9999-4999-8999-999999999999';
+  const prep = async (v) => (await run('Website Prepare Scan', { body: { ...body, reused_image: v } }))[0].json.reused_image;
+  assert.deepStrictEqual(await prep({ batch_id: OLD.toUpperCase(), status: 'Success', student_id: 'S1', extra: 'x' }), { batch_id: OLD, status: 'success' }, 'only batch_id + status kept');
+  for (const st of ['flagged', 'duplicate']) assert.deepStrictEqual(await prep({ batch_id: OLD, status: st }), { batch_id: OLD, status: st });
+  for (const v of [undefined, null, '', 'x', [], {}, { batch_id: 'nope', status: 'success' }, { batch_id: OLD, status: 'error' },
+    { batch_id: OLD, status: 'processing' }, { batch_id: BATCH, status: 'success' }]) {
+    assert.strictEqual(await prep(v), null, JSON.stringify(v));
+  }
+  assert.strictEqual(CTX.reused_image, null, 'no reused_image -> null (backward compatible)');
+  const ctx = { ...CTX, reused_image: { batch_id: OLD, status: 'success' } };
+  const d = (await run('Website Decide', formMatch(), {
+    'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': REC, 'Website Identity Check': identity(),
+  }))[0].json;
+  assert.strictEqual(d.decision, 'flagged');
+  assert.deepStrictEqual(d.review_reasons, ['reused_image']);
+  assert.ok(d.review_note.includes(`already scanned in another batch (${OLD}, result: success)`), d.review_note);
+  assert.strictEqual(d.identity_check, null);
+  assert.strictEqual(d.partial_data.instructor, 'Juan Dela Cruz', 'pre-filled with the batch values');
+  assert.strictEqual(d.partial_data.student_id, REC.student_id);
+  const w = (await run('Website Flagged Record', d, { 'Website Prepare Scan': ctx }))[0].json;
+  assert.deepStrictEqual(w.review_reasons, ['reused_image']);
+  // combined with other reasons; never a spot check
+  const both = (await run('Website Decide', formMatch(), {
+    'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': { ...REC, student_id: '' }, 'Website Identity Check': identity(),
+  }))[0].json;
+  assert.deepStrictEqual(both.review_reasons, ['student_id_missing', 'reused_image']);
+  for (let i = 0; i < 200; i++) {
+    const out = (await run('Website Decide', formMatch(), {
+      'Website Prepare Scan': { ...ctx, task_id: `spot-check-${i}` }, 'Website Reconcile OCR OMR': REC, 'Website Identity Check': identity(),
+    }))[0].json;
+    assert.deepStrictEqual(out.review_reasons, ['reused_image']);
+  }
+});
 test('Form check: identity_check is non-null exactly when a *_mismatch_* reason exists (every combination)', async () => {
   const instr = {
     same: formMatch().instructor_candidates, unreadable: null,
@@ -968,9 +1051,12 @@ test('Form check: identity_check is non-null exactly when a *_mismatch_* reason 
         assertIdentity(d.identity_check, d.review_reasons);
         const w = (await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX }))[0].json;
         assert.deepStrictEqual(w.identity_check, d.identity_check, 'Flagged Record passes identity_check through');
-        // only a clear other match flags (not_found keeps the batch)
+        // only a clear other match flags (not_found keeps the batch); a blank/unreadable one is held as *_missing
         const mismatch = ['found', 'ambiguous'].includes(im) || ['found', 'ambiguous'].includes(sm);
-        assert.strictEqual(d.flagged, mismatch || recReasons.length > 0);
+        const missing = im === 'unreadable' || sm === 'unreadable';
+        assert.strictEqual(d.flagged, mismatch || missing || recReasons.length > 0);
+        assert.strictEqual(d.review_reasons.includes('instructor_missing'), im === 'unreadable');
+        assert.strictEqual(d.review_reasons.includes('subject_missing'), sm === 'unreadable');
         n++;
       }
     }
@@ -979,7 +1065,7 @@ test('Form check: identity_check is non-null exactly when a *_mismatch_* reason 
   // the old removed identity reasons never come back
   const code = codeOf('Website Decide');
   for (const r of IDENTITY_REASONS) assert.ok(!code.includes(`'${r}'`), `Decide still emits ${r}`);
-  for (const r of [...MISMATCH_REASONS, 'form_match_failed']) assert.ok(code.includes(`'${r}'`), `Decide lacks ${r}`);
+  for (const r of [...MISMATCH_REASONS, 'form_match_failed', ...MISSING_REASONS, 'reused_image']) assert.ok(code.includes(`'${r}'`), `Decide lacks ${r}`);
 });
 // ---------------------------------------------------------------- real batch from the live site (2026-09-28)
 // Batch Rodz Harvey D Licayan / PC121 Discreet Math, 8 pages of the same instructor/subject; every page

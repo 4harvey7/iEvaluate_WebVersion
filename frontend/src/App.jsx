@@ -185,7 +185,8 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
   const location = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [openBatchId, setOpenBatchId] = useState(null);
-  const { station, refresh } = useStation(stationId, { intervalMs: 30000, onMissing: onStationMissing });
+  // 15 s: the sidebar light shows "Offline" soon after the scan program stops.
+  const { station, refresh } = useStation(stationId, { intervalMs: 15000, onMissing: onStationMissing });
 
   // On every page change: close the phone menu, scroll up, refresh the batch + status.
   useEffect(() => {
