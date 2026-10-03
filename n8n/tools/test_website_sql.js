@@ -13,6 +13,8 @@
 // expression (with mocked $json / $('...')), formats the query with pg-promise
 // exactly like the n8n Postgres node does, and runs it. It runs twice: once with
 // uuid id columns in sast_all_raw_data_survey and once with text id columns.
+// The schema gets migrations/013_sast_null_aware_means.sql (public.recompute_sast, rating CHECKs),
+// which the recompute nodes call; it is also tested directly (blank answers left out of the means).
 // It also runs the optional clean-up migrations/004_mask_existing_profanity.sql on synthetic
 // rows (preview, apply, student_remarks duplicates, idempotency) and checks that its SQL filter
 // masks exactly like the n8n JS filter (profanity.js) on a large synthetic corpus.
@@ -80,18 +82,21 @@ function schemaSql(rawIdType) {
     manually_corrected boolean, task_id text,
     UNIQUE (subject_id, term_id, "instructor_ID", student_id));
   CREATE TABLE public.management_results (instructor_id uuid, term_id uuid, subject_id uuid, total_responses numeric,
-    ${qs('m', '_total', 'numeric')}, grand_total numeric, ${qs('m', '_mean', 'numeric')},
+    ${qs('m', '_total', 'numeric')}, grand_total numeric, ${qs('m', '_mean', 'numeric NOT NULL')},
     overall_management_mean numeric, average_per_response_management numeric,
     UNIQUE (instructor_id, term_id, subject_id));
   CREATE TABLE public.performance_results (instructor_id uuid, term_id uuid, subject_id uuid, total_responses numeric,
-    ${qs('p', '_total', 'numeric')}, grand_total numeric, ${qs('p', '_mean', 'numeric')},
+    ${qs('p', '_total', 'numeric')}, grand_total numeric, ${qs('p', '_mean', 'numeric NOT NULL')},
     overall_performance_mean numeric, average_per_response_performance numeric,
     UNIQUE (instructor_id, term_id, subject_id));
   CREATE TABLE public.overall_total_survey (instructor_id uuid, term_id uuid, total_responses numeric,
     management_total numeric, performance_total numeric, combined_total numeric, management_mean numeric,
-    performance_mean numeric, combined_score_mean numeric, UNIQUE (instructor_id, term_id));
+    performance_mean numeric, combined_score_mean numeric,
+    overall_mean numeric GENERATED ALWAYS AS (round((management_mean + performance_mean) / 2::numeric, 2)) STORED,
+    UNIQUE (instructor_id, term_id));
   CREATE TABLE public.overall_question_means (instructor_id uuid, term_id uuid, category text, question_number int,
-    mean_score numeric, updated_at timestamptz DEFAULT now(), UNIQUE (instructor_id, term_id, category, question_number));
+    mean_score numeric NOT NULL DEFAULT 0, updated_at timestamptz DEFAULT now(),
+    UNIQUE (instructor_id, term_id, category, question_number));
   CREATE TABLE public.scan_error_images (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), task_id text, image_base64 text,
     created_at timestamptz DEFAULT now());
   CREATE TABLE public.failed_scan_queue (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), task_id text UNIQUE,
@@ -134,6 +139,9 @@ function schemaSql(rawIdType) {
   INSERT INTO public.system_settings (id, current_term_id) VALUES (1, '${ID.term}');
   `;
 }
+
+// ------------------------------------------------------------------ migration 013 (null-aware SAST means)
+const MIG013 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '013_sast_null_aware_means.sql'), 'utf8');
 
 // ------------------------------------------------------------------ sexual-word filter / migration 004
 const MIG_PATH = path.join(__dirname, '..', '..', 'migrations', '004_mask_existing_profanity.sql');
@@ -438,29 +446,42 @@ async function suite(rawIdType) {
     assert.strictEqual(Number(b.m1), 5);
     await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE "instructor_ID"::text = $1`, [ID.maria]);
   });
-  test('recompute aggregates (shared send nodes) from ALL raw rows (4 forms, one with 2 blanks)', async () => {
+  test('recompute (update to overall total2 -> recompute_sast) from ALL raw rows (4 forms, one with 2 blanks)', async () => {
     const item = { instructor_id: ID.juan, term_id: ID.term, subject_id: ID.it101 };
-    const agg = await runNode('send to managment table1', item);
+    const agg = await runNode('update to overall total2', item);
     assert.strictEqual(Number(agg[0].total_responses), 4);
     const m = await db.one('SELECT * FROM public.management_results');
     const p = await db.one('SELECT * FROM public.performance_results');
     assert.strictEqual(Number(m.total_responses), 4);
-    assert.strictEqual(Number(m.m1_total), 15);          // 5+5+5+blank(0)
-    assert.strictEqual(Number(m.m1_mean), 3.75);
+    assert.strictEqual(Number(m.m1_total), 15);          // 5+5+5, the blank is skipped
+    assert.strictEqual(Number(m.m1_count), 3);
+    assert.strictEqual(Number(m.m1_mean), 5);            // 15/3 (was 15/4 = 3.75: blank counted as 0)
     assert.strictEqual(Number(m.grand_total), 195);
-    assert.strictEqual(Number(m.overall_management_mean), 4.88); // 195/40
+    assert.strictEqual(Number(m.overall_management_mean), 5); // mean of the 10 question means (was 195/40 = 4.88)
+    assert.strictEqual(Number(m.average_per_response_management), 48.75); // 195 / 4 forms
     assert.strictEqual(Number(p.p10_total), 12);
+    assert.strictEqual(Number(p.p10_count), 3);
+    assert.strictEqual(Number(p.p10_mean), 4);
     assert.strictEqual(Number(p.grand_total), 156);
+    assert.strictEqual(Number(p.overall_performance_mean), 4);
+    const o = await db.one('SELECT * FROM public.overall_total_survey');
+    assert.deepStrictEqual([o.total_responses, o.management_mean, o.performance_mean, o.combined_score_mean, o.overall_mean].map(Number),
+      [4, 5, 4, 4.5, 4.5]);
+    const q = await db.any(`SELECT category, question_number AS n, mean_score, response_count FROM public.overall_question_means
+      ORDER BY category, question_number`);
+    assert.strictEqual(q.length, 20);
+    assert.deepStrictEqual([q[0].n, Number(q[0].mean_score), q[0].response_count], [1, 5, 3]);    // M1
+    assert.deepStrictEqual([q[19].n, Number(q[19].mean_score), q[19].response_count], [10, 4, 3]); // P10
     const link = await db.any('SELECT * FROM public.instructor_subjects');
     assert.strictEqual(link.length, 1);
-    await runNode('send to performance node1', item);   // idempotent, no double counting
+    await runNode('update to overall total2', item);   // idempotent, no double counting
     assert.strictEqual(Number((await db.one('SELECT total_responses FROM public.management_results')).total_responses), 4);
   });
   test('recompute holds a transaction advisory lock (a concurrent recompute waits)', async () => {
     const item = { instructor_id: ID.juan, term_id: ID.term, subject_id: ID.it101 };
     await db.tx(async (t) => {
       await t.any("SELECT pg_advisory_xact_lock(hashtext('ievaluate:recompute_aggregates'))");
-      const n = node('send to managment table1');
+      const n = node('update to overall total2');
       const values = evalReplacement(n, item, {});
       const q = pgp.helpers.concat([{ query: n.parameters.query, values }]);
       await assert.rejects(db.tx(async (t2) => {
@@ -469,7 +490,7 @@ async function suite(rawIdType) {
       }), /statement timeout|canceling statement/);
     });
     // lock released at commit: runs normally now, and the DO statement adds no output row
-    const out = await runNode('send to managment table1', item);
+    const out = await runNode('update to overall total2', item);
     assert.strictEqual(out.length, 1);
     assert.strictEqual(Number(out[0].total_responses), 4);
   });
@@ -533,7 +554,7 @@ async function suite(rawIdType) {
     await db.none('DELETE FROM public.failed_scan_queue');
     await db.none('DELETE FROM public.scan_error_images');
   });
-  test('main flow (phone/sheet/correction): send nodes recompute from ALL raw rows, ignoring per-execution totals', async () => {
+  test('main flow (phone/sheet/correction): recompute from ALL raw rows, ignoring per-execution totals', async () => {
     // Three forms for Pedro / IT 102 stored by earlier executions (phone upsert,
     // sheet import, manual correction). Ratings: all 3s, all 4s, m=5 with p blank.
     const mc = Array.from({ length: 10 }, (_, i) => `m${i + 1}`);
@@ -552,7 +573,7 @@ async function suite(rawIdType) {
     const mItem = { instructor_id: ID.pedro, term_id: ID.term, subject_id: ID.it102, total_responses: 1, grand_total: 50,
       overall_management_mean: 5, average_per_response_management: 50 };
     for (let i = 1; i <= 10; i++) { mItem[`m${i}_total`] = 5; mItem[`m${i}_mean`] = 5; }
-    const r1 = await runNode('send to managment table1', mItem);
+    const r1 = await runNode('update to overall total2', mItem);
     assert.strictEqual(Number(r1[0].total_responses), 3);
     const expectAll = async () => {
       const m = await db.one('SELECT * FROM public.management_results WHERE subject_id = $1', [ID.it102]);
@@ -563,25 +584,150 @@ async function suite(rawIdType) {
       assert.strictEqual(Number(m.grand_total), 120);
       assert.strictEqual(Number(m.overall_management_mean), 4);
       assert.strictEqual(Number(m.average_per_response_management), 40);
-      assert.strictEqual(Number(p.total_responses), 3);
-      assert.strictEqual(Number(p.p1_total), 7);           // 3 + 4 + blank(0)
-      assert.strictEqual(Number(p.p1_mean), 2.33);
-      assert.strictEqual(Number(p.overall_performance_mean), 2.33);
+      assert.strictEqual(Number(p.total_responses), 2);    // the form with all P blank does not count
+      assert.strictEqual(Number(p.p1_total), 7);           // 3 + 4, blank skipped
+      assert.strictEqual(Number(p.p1_count), 2);
+      assert.strictEqual(Number(p.p1_mean), 3.5);          // 7/2 (was 7/3 = 2.33)
+      assert.strictEqual(Number(p.overall_performance_mean), 3.5);
+      assert.strictEqual(Number(p.average_per_response_performance), 35);
     };
     await expectAll();
-    // 'send to performance node1' runs the same statement: idempotent.
+    // a second run (another item of the same pair) is idempotent.
     const pItem = { instructor_id: ID.pedro, term_id: ID.term, subject_id: ID.it102, total_responses: 1, p1_total: 4 };
-    await runNode('send to performance node1', pItem);
+    await runNode('update to overall total2', pItem);
     await expectAll();
     // Other (instructor, term, subject) aggregates are untouched.
     const after = await db.one('SELECT total_responses FROM public.management_results WHERE subject_id = $1', [ID.it101]);
     assert.strictEqual(Number(after.total_responses), Number(before.total_responses));
     // calculate nodes emit term_id = null when the row had no term: nothing is written, no NULL-term link.
-    await runNode('send to managment table1', { instructor_id: ID.pedro, term_id: null, subject_id: ID.it102 });
+    await runNode('update to overall total2', { instructor_id: ID.pedro, term_id: null, subject_id: ID.it102 });
     const nulls = await db.one(`SELECT
       (SELECT count(*) FROM public.management_results WHERE term_id IS NULL)::int AS m,
       (SELECT count(*) FROM public.instructor_subjects WHERE term_id IS NULL)::int AS l`);
     assert.deepStrictEqual(nulls, { m: 0, l: 0 });
+  });
+  // ---- migration 013: blanks are left out of both the sum and the count
+  const QM = [...Array(10)].map((_, i) => `m${i + 1}`);
+  const QP = [...Array(10)].map((_, i) => `p${i + 1}`);
+  // one raw form for Maria / term2; r = { m1: 5, ... } (missing = blank)
+  const mariaForm = (subject, student, r) => db.none(`INSERT INTO public.sast_all_raw_data_survey
+    ("instructor_ID", term_id, subject_id, student_id, validation_status, manually_corrected, ${[...QM, ...QP].join(', ')})
+    VALUES ($1, $2, $3, $4, 'auto', false, $5:csv)`,
+  [ID.maria, ID.term2, subject, student, [...QM, ...QP].map((k) => (r[k] === undefined ? null : r[k]))]);
+  const all = (keys, v) => Object.fromEntries(keys.map((k) => [k, v]));
+  const recompute = async () => db.one('SELECT * FROM public.recompute_sast($1, $2)', [ID.maria, ID.term2]);
+  const mgmt = (subject) => db.oneOrNone(`SELECT * FROM public.management_results
+    WHERE instructor_id = $1 AND term_id = $2 AND subject_id = $3`, [ID.maria, ID.term2, subject]);
+  const perf = (subject) => db.oneOrNone(`SELECT * FROM public.performance_results
+    WHERE instructor_id = $1 AND term_id = $2 AND subject_id = $3`, [ID.maria, ID.term2, subject]);
+  const cleanMaria = async () => {
+    await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE "instructor_ID"::text = $1`, [ID.maria]);
+    await recompute();
+    await db.none('DELETE FROM public.instructor_subjects WHERE instructor_id = $1', [ID.maria]);
+  };
+
+  test('013: two forms m1 = 5 and 4 -> 4.50; a third form with m1 blank -> still 4.50 (count 2)', async () => {
+    await mariaForm(ID.it101, 'A1', { ...all(QM, 5), ...all(QP, 4) });
+    await mariaForm(ID.it101, 'A2', { ...all(QM, 4), ...all(QP, 4) });
+    let r = await recompute();
+    let m = await mgmt(ID.it101);
+    assert.deepStrictEqual([m.m1_mean, m.m1_count, m.total_responses].map(Number), [4.5, 2, 2]);
+    assert.strictEqual(r.total_responses, 2);
+    await mariaForm(ID.it101, 'A3', { ...all(QM, 3), m1: null, ...all(QP, 4) });
+    r = await recompute();
+    m = await mgmt(ID.it101);
+    assert.strictEqual(Number(m.m1_mean), 4.5, 'blank m1 is not a 0');
+    assert.strictEqual(Number(m.m1_count), 2);
+    assert.strictEqual(Number(m.m1_total), 9);
+    assert.strictEqual(Number(m.m2_mean), 4);           // 5, 4, 3
+    assert.strictEqual(Number(m.m2_count), 3);
+    assert.strictEqual(Number(m.total_responses), 3);
+    assert.strictEqual(Number(m.overall_management_mean), 4.05);  // (4.50 + 9 x 4.00) / 10
+    assert.strictEqual(r.total_responses, 3);
+  });
+  test('013: category mean = mean of the ROUNDED question means; all-blank question -> NULL', async () => {
+    // M1-M5 = 5, 4, 3 and M6-M10 = 5, 4, blank; P7 blank on every form
+    const f = (a, b, p) => ({ m1: a, m2: a, m3: a, m4: a, m5: a, m6: b, m7: b, m8: b, m9: b, m10: b, ...all(QP, p), p7: null });
+    await mariaForm(ID.ge104, 'B1', f(5, 5, 3));
+    await mariaForm(ID.ge104, 'B2', f(4, 4, 3));
+    await mariaForm(ID.ge104, 'B3', f(3, null, 3));
+    const r = await recompute();
+    const m = await mgmt(ID.ge104);
+    assert.strictEqual(Number(m.m1_mean), 4);
+    assert.strictEqual(Number(m.m6_mean), 4.5);
+    assert.strictEqual(Number(m.m6_count), 2);
+    assert.strictEqual(Number(m.overall_management_mean), 4.25, '(5 x 4.00 + 5 x 4.50) / 10');
+    assert.strictEqual(Number(m.grand_total), 105);
+    assert.strictEqual(Number(m.average_per_response_management), 35);
+    const p = await perf(ID.ge104);
+    assert.strictEqual(p.p7_mean, null, 'nobody answered P7: NULL, not 0');
+    assert.strictEqual(Number(p.p7_count), 0);
+    assert.strictEqual(Number(p.p7_total), 0);
+    assert.strictEqual(Number(p.overall_performance_mean), 3, 'P7 is left out of the category mean');
+    // Instructor + term totals pooled over both subjects (6 forms):
+    //   M1 = 5,4,_,5,4,3 -> 4.20; M2-M5 = 5,4,3 twice -> 4.00; M6-M10 = 5,4,3,5,4,_ -> 4.20 => 4.12
+    //   P (not 7) = 4,4,4,3,3,3 -> 3.50; P7 = 4,4,4 -> 4.00 => 3.55; combined (4.12 + 3.55) / 2 = 3.835 -> 3.84
+    assert.deepStrictEqual([r.total_responses, Number(r.management_mean), Number(r.performance_mean), Number(r.combined_score_mean)],
+      [6, 4.12, 3.55, 3.84]);
+    const o = await db.one('SELECT * FROM public.overall_total_survey WHERE instructor_id = $1 AND term_id = $2', [ID.maria, ID.term2]);
+    assert.deepStrictEqual([o.total_responses, o.management_total, o.performance_total, o.combined_total].map(Number), [6, 222, 201, 423]);
+    assert.deepStrictEqual([o.management_mean, o.performance_mean, o.combined_score_mean, o.overall_mean].map(Number),
+      [4.12, 3.55, 3.84, 3.84]);
+    const q = await db.any(`SELECT category, question_number AS n, mean_score, response_count FROM public.overall_question_means
+      WHERE instructor_id = $1 AND term_id = $2 ORDER BY category, question_number`, [ID.maria, ID.term2]);
+    assert.strictEqual(q.length, 20);
+    const qm = (cat, n) => q.find((x) => x.category === cat && x.n === n);
+    assert.deepStrictEqual([Number(qm('Management', 1).mean_score), qm('Management', 1).response_count], [4.2, 5]);
+    assert.deepStrictEqual([Number(qm('Performance', 7).mean_score), qm('Performance', 7).response_count], [4, 3]);
+    const links = await db.any('SELECT subject_id::text AS s FROM public.instructor_subjects WHERE instructor_id = $1 ORDER BY 1', [ID.maria]);
+    assert.deepStrictEqual(links.map((x) => x.s), [ID.it101, ID.ge104].sort());
+  });
+  test('013: a subject whose forms moved away loses its rows; all-blank category; no forms left', async () => {
+    await db.none(`UPDATE public.sast_all_raw_data_survey SET subject_id = $1
+      WHERE "instructor_ID"::text = $2 AND subject_id::text = $3`, [ID.ddmgt3, ID.maria, ID.ge104]);
+    await recompute();
+    assert.strictEqual(await mgmt(ID.ge104), null, 'moved subject: management row deleted');
+    assert.strictEqual(await perf(ID.ge104), null, 'moved subject: performance row deleted');
+    assert.strictEqual(Number((await mgmt(ID.ddmgt3)).overall_management_mean), 4.25);
+    assert.strictEqual(Number((await mgmt(ID.it101)).total_responses), 3, 'other subject untouched');
+    // one form, every P blank: no performance row, combined = management
+    await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE "instructor_ID"::text = $1`, [ID.maria]);
+    await mariaForm(ID.it101, 'C1', { ...all(QM, 4), m10: 5 });
+    let r = await recompute();
+    assert.strictEqual(await perf(ID.it101), null, 'no Performance answer: no performance row');
+    assert.strictEqual(await mgmt(ID.ddmgt3), null);
+    assert.strictEqual(Number((await mgmt(ID.it101)).overall_management_mean), 4.1);
+    assert.deepStrictEqual([r.total_responses, Number(r.management_mean), r.performance_mean, Number(r.combined_score_mean)],
+      [1, 4.1, null, 4.1]);
+    const o = await db.one('SELECT * FROM public.overall_total_survey WHERE instructor_id = $1 AND term_id = $2', [ID.maria, ID.term2]);
+    assert.deepStrictEqual([o.performance_mean, Number(o.combined_score_mean), Number(o.overall_mean)], [null, 4.1, 4.1]);
+    const p1 = await db.one(`SELECT mean_score, response_count FROM public.overall_question_means
+      WHERE instructor_id = $1 AND term_id = $2 AND category = 'Performance' AND question_number = 1`, [ID.maria, ID.term2]);
+    assert.deepStrictEqual([p1.mean_score, p1.response_count], [null, 0]);
+    // no forms left: totals and question means removed, still one row back
+    await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE "instructor_ID"::text = $1`, [ID.maria]);
+    r = await recompute();
+    assert.deepStrictEqual([r.total_responses, r.combined_score_mean], [0, null]);
+    const left = await db.one(`SELECT
+      (SELECT count(*) FROM public.management_results WHERE instructor_id = $1)::int AS m,
+      (SELECT count(*) FROM public.performance_results WHERE instructor_id = $1)::int AS p,
+      (SELECT count(*) FROM public.overall_total_survey WHERE instructor_id = $1)::int AS o,
+      (SELECT count(*) FROM public.overall_question_means WHERE instructor_id = $1)::int AS q`, [ID.maria]);
+    assert.deepStrictEqual(left, { m: 0, p: 0, o: 0, q: 0 });
+    await cleanMaria();
+  });
+  test('013: raw answers must be blank or 1..5 (CHECK rejects 0 and 6)', async () => {
+    for (const bad of [0, 6]) {
+      await assert.rejects(mariaForm(ID.it101, `X${bad}`, { m1: 5, p10: bad }), /sast_raw_p10_rating_1_to_5/);
+      await assert.rejects(mariaForm(ID.it101, `Y${bad}`, { m3: bad }), /sast_raw_m3_rating_1_to_5/);
+    }
+    await mariaForm(ID.it101, 'OK', { m1: 1, p10: 5 });   // 1, 5 and blanks are fine
+    await cleanMaria();
+  });
+  test('013: recompute_sast / sast_answers are not executable by PUBLIC', async () => {
+    const acl = await db.one(`SELECT has_function_privilege('public', 'public.recompute_sast(uuid, uuid)', 'EXECUTE') AS r,
+      has_function_privilege('public', 'public.sast_answers(uuid, uuid)', 'EXECUTE') AS a`);
+    assert.deepStrictEqual(acl, { r: false, a: false });
   });
   test('flagged: build flagged record1 (website record) only uses real failed_scan_queue columns', async () => {
     const webRec = {
@@ -1156,6 +1302,13 @@ async function suite(rawIdType) {
   try {
     for (const rawIdType of ['uuid', 'text']) {
       await db.multi(schemaSql(rawIdType));
+      // Supabase API roles that 013 revokes from / grants to (cluster-wide; created once)
+      await db.none(`DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN CREATE ROLE service_role NOLOGIN; END IF;
+      END $$`);
+      await db.multi(MIG013);
       for (const tc of await suite(rawIdType)) {
         total++;
         try {

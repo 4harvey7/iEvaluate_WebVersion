@@ -34,7 +34,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// sexual-word filter, from website_src/profanity.js\nconst PROFANITY_GROUPS = {\n  sexual: true,\n  fuck: true,            // masked even when used as a plain curse\n  sexual_curses: false,  // puta, tangina etc. stay allowed like other curses\n};\nconst PROFANITY_WORDS = [\n  ['sexual', 'fil', 'iyot', 'iyut'],\n  ['sexual', 'fil', 'bilat'],\n  ['sexual', 'fil', 'oten', 'otin', 'uten', 'utin'],\n  ['sexual', 'fil', 'salsal'],\n  ['sexual', 'none', 'puday'],\n  ['sexual', 'none', 'tamod', 'tamud'],\n  ['sexual', 'none', 'bayag'],\n  ['sexual', 'fil', 'kantot', 'kantut'],\n  ['sexual', 'fil', 'hindot', 'hindut'],\n  ['sexual', 'fil', 'jakol', 'jakul', 'dyakol'],\n  ['sexual', 'fil', 'tsupa', 'chupa'],\n  ['sexual', 'none', 'burat', 'titi', 'tite', 'etits'],             // exact only, titi+ng = katiting\n  ['sexual', 'none', 'puke', 'puki', 'pekpek', 'kepyas', 'kipay'],\n  ['sexual', 'none', 'betlog'],\n  ['sexual', 'none', 'pussy', 'pussies', 'cunt', 'cunts'],\n  ['sexual', 'none', 'boobs', 'boobies', 'tits', 'titties'],\n  ['sexual', 'none', 'porn', 'porno', 'blowjob', 'blowjobs', 'handjob', 'handjobs'],\n  ['sexual', 'none', 'horny', 'dildo', 'dildos', 'jizz'],\n  ['fuck', 'en', 'fuck', 'fuk', 'fck', 'phuck'],\n  ['fuck', 'none', 'fak', 'pakyu', 'pakshet', 'pakshit'],           // exact only, fak+ing = faking\n  ['sexual_curses', 'none', 'puta', 'pota', 'putangina', 'potangina', 'putanginamo', 'tangina', 'tanginamo'],\n  ['sexual_curses', 'none', 'whore', 'whores', 'slut', 'sluts'],\n];\nconst PROFANITY_PHRASES = [\n  ['fuck', 'pak', 'yu'], ['fuck', 'pak', 'you'],\n  ['sexual_curses', 'putang', 'ina'], ['sexual_curses', 'potang', 'ina'], ['sexual_curses', 'tang', 'ina'],\n];\nconst PF_CLASS = { a: 'a4@*', e: 'e3*', i: 'i1!|*', o: 'o0*', u: 'uv*', s: 's5$', t: 't7', l: 'l1|', b: 'b8' };\nconst PF_FIL_PREFIXES = ['gi', 'gina', 'gipa', 'ga', 'na', 'nag', 'naga', 'nagka', 'naka', 'nakaka', 'nang', 'nan',\n  'ni', 'ma', 'mag', 'maga', 'magka', 'maka', 'mang', 'man', 'mi', 'pa', 'pag', 'pang', 'paka', 'ka', 'kina',\n  'i', 'ipa', 'in', 'um', 'nakig', 'makig', 'pakig'];\nconst PF_FIL_SUFFIXES = ['an', 'han', 'on', 'hon', 'a', 'ha', 'ay', 'in', 'hin', 'ero', 'era', 'eros', 'eras'];\nconst PF_EN_PREFIXES = ['mother', 'motha', 'mutha', 'muther', 'mada'];\nconst PF_EN_SUFFIXES = ['s', 'ing', 'in', 'ed', 'er', 'ers', 'face', 'head'];\nconst PF_WS = ' \\\\t\\\\n\\\\r\\\\f\\\\v\\\\u00A0\\\\u1680\\\\u2000-\\\\u200A\\\\u2028\\\\u2029\\\\u202F\\\\u205F\\\\u3000\\\\uFEFF';\nconst PF_WORDCH = 'A-Za-z0-9\\\\u00C0-\\\\u024F\\\\u1E00-\\\\u1EFF@$';\nconst PF_DELIM_RE = new RegExp('([' + PF_WS + ',;:/\\\\\\\\()\\\\[\\\\]{}\"\\\\u201C\\\\u201D\\\\u00AB\\\\u00BB<>?]+)');\nconst PF_LEAD_RE = new RegExp('^[^' + PF_WORDCH + ']*');\nconst PF_TRAIL_RE = new RegExp('[^' + PF_WORDCH + ']*$');\nconst PF_ONLY_WS_RE = new RegExp('^[' + PF_WS + ']+$');\nconst PF_NON_WS_RE = new RegExp('[^' + PF_WS + ']', 'gu');\nconst PF_SEP_RE = /[.\\-_'‘’`]/;\nconst PF_PART_RE = /[^.\\-_'‘’`]+/g;\nconst PF_MAX_TOKEN = 64;\nconst PF_MAX_RUN = 20;\nfunction pfLetters(word) {\n  return Array.from(word).map((ch) => (PF_CLASS[ch] ? '[' + PF_CLASS[ch] + ']' : ch) + '+').join('');\n}\nfunction pfAlt(list) {\n  return '(?:' + list.map(pfLetters).join('|') + ')';\n}\nfunction pfFilRoot(word) {\n  if (/^[aeiou]/.test(word)) return pfLetters(word);\n  const withInfix = (w) => pfLetters(w[0]) + '(?:in|um)?' + pfLetters(w.slice(1));\n  const syl = (word.match(/^[^aeiou]+[aeiou]+/) || [word[0]])[0];\n  return '(?:' + withInfix(syl) + ')?' + withInfix(word);\n}\nfunction pfPatterns(groups) {\n  const roots = { fil: [], en: [], none: [] };\n  for (const [group, affix, ...words] of PROFANITY_WORDS) {\n    if (groups[group]) for (const w of words) roots[affix].push(affix === 'fil' ? pfFilRoot(w) : pfLetters(w));\n  }\n  const alts = [];\n  if (roots.fil.length) alts.push(pfAlt(PF_FIL_PREFIXES) + '?(?:' + roots.fil.join('|') + ')' + pfAlt(PF_FIL_SUFFIXES) + '?');\n  if (roots.en.length) alts.push(pfAlt(PF_EN_PREFIXES) + '?(?:' + roots.en.join('|') + ')' + pfAlt(PF_EN_SUFFIXES) + '?');\n  if (roots.none.length) alts.push('(?:' + roots.none.join('|') + ')');\n  return {\n    token: alts.length ? '^(?:' + alts.join('|') + ')$' : '^(?!)$',\n    phrases: PROFANITY_PHRASES.filter(([g]) => groups[g]).map(([, a, b]) => ['^' + pfLetters(a) + '$', '^' + pfLetters(b) + '$']),\n  };\n}\nconst PF_PATTERNS = pfPatterns(PROFANITY_GROUPS);\nconst PF_TOKEN_RE = new RegExp(PF_PATTERNS.token);\nconst PF_PHRASE_RES = PF_PATTERNS.phrases.map(([a, b]) => [new RegExp(a), new RegExp(b)]);\nfunction pfNorm(s) {\n  return String(s).normalize('NFD').toLowerCase().replace(/[̀-ͯ.\\-_'‘’`]/g, '');\n}\nfunction pfIsWord(core) {\n  return core.length <= PF_MAX_TOKEN && PF_TOKEN_RE.test(pfNorm(core));\n}\nfunction pfMaskSpan(s) {\n  return String(s).replace(PF_NON_WS_RE, '*');\n}\nfunction findProfanity(text) {\n  if (typeof text !== 'string' || !text) return [];\n  const pieces = text.split(PF_DELIM_RE);   // even = word chunk, odd = delimiters\n  const chunks = [];\n  let pos = 0;\n  for (let i = 0; i < pieces.length; i++) {\n    const p = pieces[i];\n    if (i % 2 === 0 && p) {\n      const lead = PF_LEAD_RE.exec(p)[0].length;\n      const core = p.slice(lead, p.length - PF_TRAIL_RE.exec(p.slice(lead))[0].length);\n      chunks.push({ start: pos + lead, core, after: pieces[i + 1] || '', masked: false });\n    }\n    pos += p.length;\n  }\n  const spans = [];\n  const add = (start, end) => spans.push({ start, end });\n  for (const c of chunks) {\n    if (!c.core) continue;\n    if (pfIsWord(c.core)) { add(c.start, c.start + c.core.length); c.masked = true; continue; }\n    if (!PF_SEP_RE.test(c.core)) continue;\n    PF_PART_RE.lastIndex = 0;\n    let m;\n    while ((m = PF_PART_RE.exec(c.core))) {\n      if (pfIsWord(m[0])) { add(c.start + m.index, c.start + m.index + m[0].length); c.masked = true; }\n    }\n  }\n  const single = (c) => !c.masked && Array.from(c.core).length === 1;\n  for (let k = 0; k < chunks.length;) {\n    if (!single(chunks[k])) { k++; continue; }\n    let e = k;\n    while (e + 1 < chunks.length && single(chunks[e + 1]) && PF_ONLY_WS_RE.test(chunks[e].after)) e++;\n    for (let s = k; s <= e;) {\n      let len = Math.min(e - s + 1, PF_MAX_RUN);\n      for (; len >= 3; len--) {\n        if (pfIsWord(chunks.slice(s, s + len).map((c) => c.core).join(''))) break;\n      }\n      if (len >= 3) {\n        const last = chunks[s + len - 1];\n        add(chunks[s].start, last.start + last.core.length);\n        for (let j = s; j < s + len; j++) chunks[j].masked = true;\n        s += len;\n      } else {\n        s++;\n      }\n    }\n    k = e + 1;\n  }\n  for (let k = 0; k + 1 < chunks.length; k++) {\n    const a = chunks[k];\n    const b = chunks[k + 1];\n    if (a.masked || b.masked || !a.core || !b.core || !PF_ONLY_WS_RE.test(a.after)) continue;\n    const na = pfNorm(a.core);\n    const nb = pfNorm(b.core);\n    if (PF_PHRASE_RES.some(([ra, rb]) => ra.test(na) && rb.test(nb))) {\n      add(a.start, b.start + b.core.length);\n      a.masked = true;\n      b.masked = true;\n      k++;\n    }\n  }\n  spans.sort((x, y) => x.start - y.start);\n  return spans.map((s) => ({ start: s.start, end: s.end, text: text.slice(s.start, s.end) }));\n}\nfunction maskProfanity(text) {\n  if (typeof text !== 'string' || !text) return text;\n  const spans = findProfanity(text);\n  if (!spans.length) return text;\n  let out = '';\n  let pos = 0;\n  for (const s of spans) {\n    out += text.slice(pos, s.start) + pfMaskSpan(s.text);\n    pos = s.end;\n  }\n  return out + text.slice(pos);\n}\nfunction profaneKeyword(word) {\n  return typeof word === 'string' && (word.includes('*') || maskProfanity(word) !== word);\n}\n// end of sexual-word filter\n\n// Safely attempt to get the staff ID by checking nodes independently\nlet staffId = null;\nlet isManuallyCorrected = false; // New flag to track if this was manually corrected\n\n// Attempt 1: 'clean data' node\ntry {\n  const cleanDataNode = $('clean data1').first();\n  if (cleanDataNode && cleanDataNode.json.staff_id) {\n    staffId = cleanDataNode.json.staff_id;\n  }\n} catch (error) {\n  // Node didn't run or data is missing, move on\n}\n\n// Attempt 2: 'SAST image from phone' node\nif (!staffId) {\n  try {\n    const phoneNode = $('SAST image from phone').first();\n    if (phoneNode && phoneNode.json.body && phoneNode.json.body.user_id) {\n      staffId = phoneNode.json.body.user_id;\n    }\n  } catch (error) {\n    // Node didn't run or data is missing\n  }\n}\n\n// Attempt 2b: 'SAST from Website' node\nif (!staffId) {\n  try {\n    const webNode = $('SAST from Website').first();\n    if (webNode && webNode.json.body && webNode.json.body.staff_id) {\n      staffId = webNode.json.body.staff_id;\n    }\n  } catch (error) {\n    // Not a website execution\n  }\n}\n\n// Attempt 3: 'sast-manual-correction' node\ntry {\n  const manualNode = $('sast-manual-correction1').first();\n  if (manualNode) {\n    // If this node executed without throwing an error, we know it's a manual correction!\n    isManuallyCorrected = true; \n    \n    // Check for the user_id in the manual correction payload if we don't have a staffId yet\n    if (!staffId && manualNode.json.body && manualNode.json.body.user_id) {\n      staffId = manualNode.json.body.user_id;\n    }\n  }\n} catch (error) {\n  // Node didn't run, meaning this is an automated run\n}\n\n// website rows are already stored, so skip the shared upsert\nlet websiteRawStored = false;\ntry {\n  const w = $('Website Raw Upsert').first();\n  websiteRawStored = !!(w && w.json && w.json.saved === true);\n} catch (error) {\n  // Not a website execution\n}\n\n// Map the raw data and include the new database flags\nconst rawData = $input.all().map(item => {\n  const r = item.json;\n  return {\n    json: {\n      instructor_ID: r['instructor_ID'] || null,\n      subject_id: r['true_subject_id'] || null,\n      term_id: r['current_term_id'] || null,\n      // blank student id -> NULL so it never matches another row\n      student_id: (typeof r['Student ID'] === 'string' ? r['Student ID'].trim() : r['Student ID']) || null,\n      instructor: r['Instructor/Professor'] || null,\n\n      m1: Number(r['M1']) || null,\n      m2: Number(r['M2']) || null,\n      m3: Number(r['M3']) || null,\n      m4: Number(r['M4']) || null,\n      m5: Number(r['M5']) || null,\n      m6: Number(r['M6']) || null,\n      m7: Number(r['M7']) || null,\n      m8: Number(r['M8']) || null,\n      m9: Number(r['M9']) || null,\n      m10: Number(r['M10']) || null,\n\n      p1: Number(r['P1']) || null,\n      p2: Number(r['P2']) || null,\n      p3: Number(r['P3']) || null,\n      p4: Number(r['P4']) || null,\n      p5: Number(r['P5']) || null,\n      p6: Number(r['P6']) || null,\n      p7: Number(r['P7']) || null,\n      p8: Number(r['P8']) || null,\n      p9: Number(r['P9']) || null,\n      p10: Number(r['P10']) || null,\n\n      // mask sexual words before storing\n      Remarks_and_Suggestions: maskProfanity(String(r['Remarks & Suggestions'] ?? '').trim()) || null,\n\n      submitted_date: r['Date'] ? new Date(r['Date']).toISOString().split('T')[0] : null,\n\n      sao_staff_id: staffId,\n\n      // ADDED: Map to the columns shown in your Supabase screenshot\n      manually_corrected: isManuallyCorrected,\n      validation_status: isManuallyCorrected ? 'corrected' : 'auto',\n\n      // only when present, so sheet imports never clear task_id\n      ...(r['task_id'] && !Array.isArray(r['task_id']) ? { task_id: String(r['task_id']) } : {}),\n      ...(websiteRawStored ? { _raw_already_stored: true } : {})\n    }\n  };\n});\n\nconst uniqueData = [];\nconst seen = new Set();\n\n// Loop backwards to keep the newest submission and discard older duplicates\nfor (let i = rawData.length - 1; i >= 0; i--) {\n  const item = rawData[i];\n  const j = item.json;\n  \n  // The magic fingerprint checking Student + Instructor + Subject + Term\n  const uniqueKey = `${j.student_id}_${j.instructor_ID}_${j.subject_id}_${j.term_id}`;\n\n  // rows without a student id are never deduped\n  if (j.student_id === null || !seen.has(uniqueKey)) {\n    seen.add(uniqueKey);\n    uniqueData.push(item);\n  }\n}\n\nreturn uniqueData.reverse();"
+        "jsCode": "// SAST rating, from website_src/rating.js\nfunction rating(v) {\n  if (typeof v === 'string') v = v.trim();\n  else if (typeof v !== 'number') return null;\n  if (v === '') return null;\n  const n = Number(v);\n  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null;\n}\n// end of SAST rating\n\n// sexual-word filter, from website_src/profanity.js\nconst PROFANITY_GROUPS = {\n  sexual: true,\n  fuck: true,            // masked even when used as a plain curse\n  sexual_curses: false,  // puta, tangina etc. stay allowed like other curses\n};\nconst PROFANITY_WORDS = [\n  ['sexual', 'fil', 'iyot', 'iyut'],\n  ['sexual', 'fil', 'bilat'],\n  ['sexual', 'fil', 'oten', 'otin', 'uten', 'utin'],\n  ['sexual', 'fil', 'salsal'],\n  ['sexual', 'none', 'puday'],\n  ['sexual', 'none', 'tamod', 'tamud'],\n  ['sexual', 'none', 'bayag'],\n  ['sexual', 'fil', 'kantot', 'kantut'],\n  ['sexual', 'fil', 'hindot', 'hindut'],\n  ['sexual', 'fil', 'jakol', 'jakul', 'dyakol'],\n  ['sexual', 'fil', 'tsupa', 'chupa'],\n  ['sexual', 'none', 'burat', 'titi', 'tite', 'etits'],             // exact only, titi+ng = katiting\n  ['sexual', 'none', 'puke', 'puki', 'pekpek', 'kepyas', 'kipay'],\n  ['sexual', 'none', 'betlog'],\n  ['sexual', 'none', 'pussy', 'pussies', 'cunt', 'cunts'],\n  ['sexual', 'none', 'boobs', 'boobies', 'tits', 'titties'],\n  ['sexual', 'none', 'porn', 'porno', 'blowjob', 'blowjobs', 'handjob', 'handjobs'],\n  ['sexual', 'none', 'horny', 'dildo', 'dildos', 'jizz'],\n  ['fuck', 'en', 'fuck', 'fuk', 'fck', 'phuck'],\n  ['fuck', 'none', 'fak', 'pakyu', 'pakshet', 'pakshit'],           // exact only, fak+ing = faking\n  ['sexual_curses', 'none', 'puta', 'pota', 'putangina', 'potangina', 'putanginamo', 'tangina', 'tanginamo'],\n  ['sexual_curses', 'none', 'whore', 'whores', 'slut', 'sluts'],\n];\nconst PROFANITY_PHRASES = [\n  ['fuck', 'pak', 'yu'], ['fuck', 'pak', 'you'],\n  ['sexual_curses', 'putang', 'ina'], ['sexual_curses', 'potang', 'ina'], ['sexual_curses', 'tang', 'ina'],\n];\nconst PF_CLASS = { a: 'a4@*', e: 'e3*', i: 'i1!|*', o: 'o0*', u: 'uv*', s: 's5$', t: 't7', l: 'l1|', b: 'b8' };\nconst PF_FIL_PREFIXES = ['gi', 'gina', 'gipa', 'ga', 'na', 'nag', 'naga', 'nagka', 'naka', 'nakaka', 'nang', 'nan',\n  'ni', 'ma', 'mag', 'maga', 'magka', 'maka', 'mang', 'man', 'mi', 'pa', 'pag', 'pang', 'paka', 'ka', 'kina',\n  'i', 'ipa', 'in', 'um', 'nakig', 'makig', 'pakig'];\nconst PF_FIL_SUFFIXES = ['an', 'han', 'on', 'hon', 'a', 'ha', 'ay', 'in', 'hin', 'ero', 'era', 'eros', 'eras'];\nconst PF_EN_PREFIXES = ['mother', 'motha', 'mutha', 'muther', 'mada'];\nconst PF_EN_SUFFIXES = ['s', 'ing', 'in', 'ed', 'er', 'ers', 'face', 'head'];\nconst PF_WS = ' \\\\t\\\\n\\\\r\\\\f\\\\v\\\\u00A0\\\\u1680\\\\u2000-\\\\u200A\\\\u2028\\\\u2029\\\\u202F\\\\u205F\\\\u3000\\\\uFEFF';\nconst PF_WORDCH = 'A-Za-z0-9\\\\u00C0-\\\\u024F\\\\u1E00-\\\\u1EFF@$';\nconst PF_DELIM_RE = new RegExp('([' + PF_WS + ',;:/\\\\\\\\()\\\\[\\\\]{}\"\\\\u201C\\\\u201D\\\\u00AB\\\\u00BB<>?]+)');\nconst PF_LEAD_RE = new RegExp('^[^' + PF_WORDCH + ']*');\nconst PF_TRAIL_RE = new RegExp('[^' + PF_WORDCH + ']*$');\nconst PF_ONLY_WS_RE = new RegExp('^[' + PF_WS + ']+$');\nconst PF_NON_WS_RE = new RegExp('[^' + PF_WS + ']', 'gu');\nconst PF_SEP_RE = /[.\\-_'‘’`]/;\nconst PF_PART_RE = /[^.\\-_'‘’`]+/g;\nconst PF_MAX_TOKEN = 64;\nconst PF_MAX_RUN = 20;\nfunction pfLetters(word) {\n  return Array.from(word).map((ch) => (PF_CLASS[ch] ? '[' + PF_CLASS[ch] + ']' : ch) + '+').join('');\n}\nfunction pfAlt(list) {\n  return '(?:' + list.map(pfLetters).join('|') + ')';\n}\nfunction pfFilRoot(word) {\n  if (/^[aeiou]/.test(word)) return pfLetters(word);\n  const withInfix = (w) => pfLetters(w[0]) + '(?:in|um)?' + pfLetters(w.slice(1));\n  const syl = (word.match(/^[^aeiou]+[aeiou]+/) || [word[0]])[0];\n  return '(?:' + withInfix(syl) + ')?' + withInfix(word);\n}\nfunction pfPatterns(groups) {\n  const roots = { fil: [], en: [], none: [] };\n  for (const [group, affix, ...words] of PROFANITY_WORDS) {\n    if (groups[group]) for (const w of words) roots[affix].push(affix === 'fil' ? pfFilRoot(w) : pfLetters(w));\n  }\n  const alts = [];\n  if (roots.fil.length) alts.push(pfAlt(PF_FIL_PREFIXES) + '?(?:' + roots.fil.join('|') + ')' + pfAlt(PF_FIL_SUFFIXES) + '?');\n  if (roots.en.length) alts.push(pfAlt(PF_EN_PREFIXES) + '?(?:' + roots.en.join('|') + ')' + pfAlt(PF_EN_SUFFIXES) + '?');\n  if (roots.none.length) alts.push('(?:' + roots.none.join('|') + ')');\n  return {\n    token: alts.length ? '^(?:' + alts.join('|') + ')$' : '^(?!)$',\n    phrases: PROFANITY_PHRASES.filter(([g]) => groups[g]).map(([, a, b]) => ['^' + pfLetters(a) + '$', '^' + pfLetters(b) + '$']),\n  };\n}\nconst PF_PATTERNS = pfPatterns(PROFANITY_GROUPS);\nconst PF_TOKEN_RE = new RegExp(PF_PATTERNS.token);\nconst PF_PHRASE_RES = PF_PATTERNS.phrases.map(([a, b]) => [new RegExp(a), new RegExp(b)]);\nfunction pfNorm(s) {\n  return String(s).normalize('NFD').toLowerCase().replace(/[̀-ͯ.\\-_'‘’`]/g, '');\n}\nfunction pfIsWord(core) {\n  return core.length <= PF_MAX_TOKEN && PF_TOKEN_RE.test(pfNorm(core));\n}\nfunction pfMaskSpan(s) {\n  return String(s).replace(PF_NON_WS_RE, '*');\n}\nfunction findProfanity(text) {\n  if (typeof text !== 'string' || !text) return [];\n  const pieces = text.split(PF_DELIM_RE);   // even = word chunk, odd = delimiters\n  const chunks = [];\n  let pos = 0;\n  for (let i = 0; i < pieces.length; i++) {\n    const p = pieces[i];\n    if (i % 2 === 0 && p) {\n      const lead = PF_LEAD_RE.exec(p)[0].length;\n      const core = p.slice(lead, p.length - PF_TRAIL_RE.exec(p.slice(lead))[0].length);\n      chunks.push({ start: pos + lead, core, after: pieces[i + 1] || '', masked: false });\n    }\n    pos += p.length;\n  }\n  const spans = [];\n  const add = (start, end) => spans.push({ start, end });\n  for (const c of chunks) {\n    if (!c.core) continue;\n    if (pfIsWord(c.core)) { add(c.start, c.start + c.core.length); c.masked = true; continue; }\n    if (!PF_SEP_RE.test(c.core)) continue;\n    PF_PART_RE.lastIndex = 0;\n    let m;\n    while ((m = PF_PART_RE.exec(c.core))) {\n      if (pfIsWord(m[0])) { add(c.start + m.index, c.start + m.index + m[0].length); c.masked = true; }\n    }\n  }\n  const single = (c) => !c.masked && Array.from(c.core).length === 1;\n  for (let k = 0; k < chunks.length;) {\n    if (!single(chunks[k])) { k++; continue; }\n    let e = k;\n    while (e + 1 < chunks.length && single(chunks[e + 1]) && PF_ONLY_WS_RE.test(chunks[e].after)) e++;\n    for (let s = k; s <= e;) {\n      let len = Math.min(e - s + 1, PF_MAX_RUN);\n      for (; len >= 3; len--) {\n        if (pfIsWord(chunks.slice(s, s + len).map((c) => c.core).join(''))) break;\n      }\n      if (len >= 3) {\n        const last = chunks[s + len - 1];\n        add(chunks[s].start, last.start + last.core.length);\n        for (let j = s; j < s + len; j++) chunks[j].masked = true;\n        s += len;\n      } else {\n        s++;\n      }\n    }\n    k = e + 1;\n  }\n  for (let k = 0; k + 1 < chunks.length; k++) {\n    const a = chunks[k];\n    const b = chunks[k + 1];\n    if (a.masked || b.masked || !a.core || !b.core || !PF_ONLY_WS_RE.test(a.after)) continue;\n    const na = pfNorm(a.core);\n    const nb = pfNorm(b.core);\n    if (PF_PHRASE_RES.some(([ra, rb]) => ra.test(na) && rb.test(nb))) {\n      add(a.start, b.start + b.core.length);\n      a.masked = true;\n      b.masked = true;\n      k++;\n    }\n  }\n  spans.sort((x, y) => x.start - y.start);\n  return spans.map((s) => ({ start: s.start, end: s.end, text: text.slice(s.start, s.end) }));\n}\nfunction maskProfanity(text) {\n  if (typeof text !== 'string' || !text) return text;\n  const spans = findProfanity(text);\n  if (!spans.length) return text;\n  let out = '';\n  let pos = 0;\n  for (const s of spans) {\n    out += text.slice(pos, s.start) + pfMaskSpan(s.text);\n    pos = s.end;\n  }\n  return out + text.slice(pos);\n}\nfunction profaneKeyword(word) {\n  return typeof word === 'string' && (word.includes('*') || maskProfanity(word) !== word);\n}\n// end of sexual-word filter\n\n// Safely attempt to get the staff ID by checking nodes independently\nlet staffId = null;\nlet isManuallyCorrected = false; // New flag to track if this was manually corrected\n\n// Attempt 1: 'clean data' node\ntry {\n  const cleanDataNode = $('clean data1').first();\n  if (cleanDataNode && cleanDataNode.json.staff_id) {\n    staffId = cleanDataNode.json.staff_id;\n  }\n} catch (error) {\n  // Node didn't run or data is missing, move on\n}\n\n// Attempt 2: 'SAST image from phone' node\nif (!staffId) {\n  try {\n    const phoneNode = $('SAST image from phone').first();\n    if (phoneNode && phoneNode.json.body && phoneNode.json.body.user_id) {\n      staffId = phoneNode.json.body.user_id;\n    }\n  } catch (error) {\n    // Node didn't run or data is missing\n  }\n}\n\n// Attempt 2b: 'SAST from Website' node\nif (!staffId) {\n  try {\n    const webNode = $('SAST from Website').first();\n    if (webNode && webNode.json.body && webNode.json.body.staff_id) {\n      staffId = webNode.json.body.staff_id;\n    }\n  } catch (error) {\n    // Not a website execution\n  }\n}\n\n// Attempt 3: 'sast-manual-correction' node\ntry {\n  const manualNode = $('sast-manual-correction1').first();\n  if (manualNode) {\n    // If this node executed without throwing an error, we know it's a manual correction!\n    isManuallyCorrected = true; \n    \n    // Check for the user_id in the manual correction payload if we don't have a staffId yet\n    if (!staffId && manualNode.json.body && manualNode.json.body.user_id) {\n      staffId = manualNode.json.body.user_id;\n    }\n  }\n} catch (error) {\n  // Node didn't run, meaning this is an automated run\n}\n\n// website rows are already stored, so skip the shared upsert\nlet websiteRawStored = false;\ntry {\n  const w = $('Website Raw Upsert').first();\n  websiteRawStored = !!(w && w.json && w.json.saved === true);\n} catch (error) {\n  // Not a website execution\n}\n\n// Map the raw data and include the new database flags\nconst rawData = $input.all().map(item => {\n  const r = item.json;\n  return {\n    json: {\n      instructor_ID: r['instructor_ID'] || null,\n      subject_id: r['true_subject_id'] || null,\n      term_id: r['current_term_id'] || null,\n      // blank student id -> NULL so it never matches another row\n      student_id: (typeof r['Student ID'] === 'string' ? r['Student ID'].trim() : r['Student ID']) || null,\n      instructor: r['Instructor/Professor'] || null,\n\n      m1: rating(r['M1']),\n      m2: rating(r['M2']),\n      m3: rating(r['M3']),\n      m4: rating(r['M4']),\n      m5: rating(r['M5']),\n      m6: rating(r['M6']),\n      m7: rating(r['M7']),\n      m8: rating(r['M8']),\n      m9: rating(r['M9']),\n      m10: rating(r['M10']),\n\n      p1: rating(r['P1']),\n      p2: rating(r['P2']),\n      p3: rating(r['P3']),\n      p4: rating(r['P4']),\n      p5: rating(r['P5']),\n      p6: rating(r['P6']),\n      p7: rating(r['P7']),\n      p8: rating(r['P8']),\n      p9: rating(r['P9']),\n      p10: rating(r['P10']),\n\n      // mask sexual words before storing\n      Remarks_and_Suggestions: maskProfanity(String(r['Remarks & Suggestions'] ?? '').trim()) || null,\n\n      submitted_date: r['Date'] ? new Date(r['Date']).toISOString().split('T')[0] : null,\n\n      sao_staff_id: staffId,\n\n      // ADDED: Map to the columns shown in your Supabase screenshot\n      manually_corrected: isManuallyCorrected,\n      validation_status: isManuallyCorrected ? 'corrected' : 'auto',\n\n      // only when present, so sheet imports never clear task_id\n      ...(r['task_id'] && !Array.isArray(r['task_id']) ? { task_id: String(r['task_id']) } : {}),\n      ...(websiteRawStored ? { _raw_already_stored: true } : {})\n    }\n  };\n});\n\nconst uniqueData = [];\nconst seen = new Set();\n\n// Loop backwards to keep the newest submission and discard older duplicates\nfor (let i = rawData.length - 1; i >= 0; i--) {\n  const item = rawData[i];\n  const j = item.json;\n  \n  // The magic fingerprint checking Student + Instructor + Subject + Term\n  const uniqueKey = `${j.student_id}_${j.instructor_ID}_${j.subject_id}_${j.term_id}`;\n\n  // rows without a student id are never deduped\n  if (j.student_id === null || !seen.has(uniqueKey)) {\n    seen.add(uniqueKey);\n    uniqueData.push(item);\n  }\n}\n\nreturn uniqueData.reverse();"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -93,196 +93,6 @@
     },
     {
       "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "4825e08d-db9b-4ce0-bbf5-d9f3da6e4647",
-              "name": "M1",
-              "value": "={{ $json.M1 }}",
-              "type": "number"
-            },
-            {
-              "id": "0f78433e-606d-4294-8bcf-b14ab5ed4b94",
-              "name": "M2",
-              "value": "={{ $json.M2 }}",
-              "type": "number"
-            },
-            {
-              "id": "36fbed1a-e3db-41a9-80c8-d7df60f2adc2",
-              "name": "M3",
-              "value": "={{ $json.M3 }}",
-              "type": "number"
-            },
-            {
-              "id": "63b33180-038a-45d6-803c-e2a45241bc4c",
-              "name": "M4",
-              "value": "={{ $json.M4 }}",
-              "type": "number"
-            },
-            {
-              "id": "0fe205d4-a874-4944-be35-1f2ecea0c336",
-              "name": "M5",
-              "value": "={{ $json.M5 }}",
-              "type": "number"
-            },
-            {
-              "id": "980e4dfc-4954-462d-af8b-98bb6634d7c2",
-              "name": "M6",
-              "value": "={{ $json.M6 }}",
-              "type": "number"
-            },
-            {
-              "id": "818bd795-6a5d-4f71-b861-db8ede786a70",
-              "name": "M7",
-              "value": "={{ $json.M7 }}",
-              "type": "number"
-            },
-            {
-              "id": "05d6d180-b22a-46d1-a81c-0532d2991884",
-              "name": "M8",
-              "value": "={{ $json.M8 }}",
-              "type": "number"
-            },
-            {
-              "id": "e2c6eded-127f-424e-a409-a5a6b1cfd87f",
-              "name": "M9",
-              "value": "={{ $json.M9 }}",
-              "type": "number"
-            },
-            {
-              "id": "55b4eb95-11c4-4272-8143-dda407e11f9b",
-              "name": "M10",
-              "value": "={{ $json.M10 }}",
-              "type": "number"
-            },
-            {
-              "id": "2630c517-7149-48d6-92df-1829c85deb10",
-              "name": "instructor_ID",
-              "value": "={{ $json.instructor_ID }}",
-              "type": "string"
-            },
-            {
-              "id": "29d77426-905e-49af-922c-eb6daf1337e3",
-              "name": "current_term_id",
-              "value": "={{ $json.current_term_id }}",
-              "type": "string"
-            },
-            {
-              "id": "dd001209-aeb0-485b-82dd-be252cfe3b70",
-              "name": "true_subject_id",
-              "value": "={{ $json.true_subject_id }}",
-              "type": "string"
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [
-        -41520,
-        20128
-      ],
-      "id": "85886518-3c97-4867-9a8a-e405422dab46",
-      "name": "Management Node1"
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "2fe621d3-e3b1-406e-89bf-1be4f8d36142",
-              "name": "P1",
-              "value": "={{ $json.P1 }}",
-              "type": "number"
-            },
-            {
-              "id": "08541d80-d6ed-432b-9c68-a5b07faed57f",
-              "name": "P2",
-              "value": "={{ $json.P2 }}",
-              "type": "number"
-            },
-            {
-              "id": "91039d17-9680-4db6-8538-3fa5a89b5ee4",
-              "name": "P3",
-              "value": "={{ $json.P3 }}",
-              "type": "number"
-            },
-            {
-              "id": "45bfd9ef-0fa7-4e3e-8dbe-2739840fea2d",
-              "name": "P4",
-              "value": "={{ $json.P4 }}",
-              "type": "number"
-            },
-            {
-              "id": "0fa5e52a-9997-4be5-b51b-5cd972c78833",
-              "name": "P5",
-              "value": "={{ $json.P5 }}",
-              "type": "number"
-            },
-            {
-              "id": "9112e44a-186c-495e-a5d0-09ef767b145e",
-              "name": "P6",
-              "value": "={{ $json.P6 }}",
-              "type": "number"
-            },
-            {
-              "id": "8fccc30f-71af-479a-a52b-0efe9f86dc16",
-              "name": "P7",
-              "value": "={{ $json.P7 }}",
-              "type": "number"
-            },
-            {
-              "id": "44b1fe8e-41c0-4fcc-a18c-222efbbf941d",
-              "name": "P8",
-              "value": "={{ $json.P8 }}",
-              "type": "number"
-            },
-            {
-              "id": "e0595602-22aa-40aa-b02c-e98b3d1687e8",
-              "name": "P9",
-              "value": "={{ $json.P9 }}",
-              "type": "number"
-            },
-            {
-              "id": "80b6f507-ab9f-4692-b735-7530c7b4b027",
-              "name": "P10",
-              "value": "={{ $json.P10 }}",
-              "type": "number"
-            },
-            {
-              "id": "fc17da5c-3c01-4eda-aec3-b0201452b3ab",
-              "name": "instructor_ID",
-              "value": "={{ $json.instructor_ID }}",
-              "type": "string"
-            },
-            {
-              "id": "de2fc341-1fdd-4171-abef-093cc817e02d",
-              "name": "current_term_id",
-              "value": "={{ $json.current_term_id }}",
-              "type": "string"
-            },
-            {
-              "id": "6504d42f-c99b-434b-8552-c9d56dcc1896",
-              "name": "true_subject_id",
-              "value": "={{ $json.true_subject_id }}",
-              "type": "string"
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [
-        -41520,
-        20704
-      ],
-      "id": "e84893ea-82c0-48fc-b365-2b9b6282159e",
-      "name": "Performance1"
-    },
-    {
-      "parameters": {
         "batchSize": 50,
         "options": {}
       },
@@ -297,86 +107,8 @@
     },
     {
       "parameters": {
-        "batchSize": 50,
-        "options": {}
-      },
-      "type": "n8n-nodes-base.splitInBatches",
-      "typeVersion": 3,
-      "position": [
-        -41072,
-        20128
-      ],
-      "id": "7e751ba9-eec0-4d29-b141-99d9c28a5778",
-      "name": "Loop Over Items4"
-    },
-    {
-      "parameters": {
-        "batchSize": 50,
-        "options": {}
-      },
-      "type": "n8n-nodes-base.splitInBatches",
-      "typeVersion": 3,
-      "position": [
-        -41072,
-        20704
-      ],
-      "id": "9de5011f-19b4-4425-919a-e3b65254e132",
-      "name": "Loop Over Items5"
-    },
-    {
-      "parameters": {
         "operation": "executeQuery",
-        "query": "-- Rebuilds the totals from all raw rows, not just this run.\n\n-- global lock held until commit so recomputes don't race\nDO $lock$ BEGIN PERFORM pg_advisory_xact_lock(hashtext('ievaluate:recompute_aggregates')); END $lock$;\nWITH link AS (\n  INSERT INTO public.instructor_subjects (subject_id, instructor_id, term_id)\n  SELECT $3, $1, $2\n  WHERE $1 IS NOT NULL AND $2 IS NOT NULL AND $3 IS NOT NULL\n  ON CONFLICT (subject_id, instructor_id, term_id) DO NOTHING\n  RETURNING 1 AS linked\n),\nagg AS (\n  SELECT\n    COUNT(*)::numeric AS n,\n    COALESCE(SUM(r.m1), 0)::numeric AS m1,\n    COALESCE(SUM(r.m2), 0)::numeric AS m2,\n    COALESCE(SUM(r.m3), 0)::numeric AS m3,\n    COALESCE(SUM(r.m4), 0)::numeric AS m4,\n    COALESCE(SUM(r.m5), 0)::numeric AS m5,\n    COALESCE(SUM(r.m6), 0)::numeric AS m6,\n    COALESCE(SUM(r.m7), 0)::numeric AS m7,\n    COALESCE(SUM(r.m8), 0)::numeric AS m8,\n    COALESCE(SUM(r.m9), 0)::numeric AS m9,\n    COALESCE(SUM(r.m10), 0)::numeric AS m10,\n    COALESCE(SUM(r.p1), 0)::numeric AS p1,\n    COALESCE(SUM(r.p2), 0)::numeric AS p2,\n    COALESCE(SUM(r.p3), 0)::numeric AS p3,\n    COALESCE(SUM(r.p4), 0)::numeric AS p4,\n    COALESCE(SUM(r.p5), 0)::numeric AS p5,\n    COALESCE(SUM(r.p6), 0)::numeric AS p6,\n    COALESCE(SUM(r.p7), 0)::numeric AS p7,\n    COALESCE(SUM(r.p8), 0)::numeric AS p8,\n    COALESCE(SUM(r.p9), 0)::numeric AS p9,\n    COALESCE(SUM(r.p10), 0)::numeric AS p10\n  FROM public.sast_all_raw_data_survey r\n  WHERE r.\"instructor_ID\" = $1\n    AND r.term_id         = $2\n    AND r.subject_id      = $3\n),\nmgmt AS (\n  INSERT INTO public.management_results (\n    instructor_id, term_id, subject_id, total_responses,\n    m1_total, m2_total, m3_total, m4_total, m5_total, m6_total, m7_total, m8_total, m9_total, m10_total, grand_total,\n    m1_mean, m2_mean, m3_mean, m4_mean, m5_mean, m6_mean, m7_mean, m8_mean, m9_mean, m10_mean,\n    overall_management_mean, average_per_response_management\n  )\n  SELECT $1, $2, $3, a.n,\n         a.m1, a.m2, a.m3, a.m4, a.m5, a.m6, a.m7, a.m8, a.m9, a.m10,\n         (a.m1 + a.m2 + a.m3 + a.m4 + a.m5 + a.m6 + a.m7 + a.m8 + a.m9 + a.m10),\n         ROUND(a.m1 / a.n, 2),\n         ROUND(a.m2 / a.n, 2),\n         ROUND(a.m3 / a.n, 2),\n         ROUND(a.m4 / a.n, 2),\n         ROUND(a.m5 / a.n, 2),\n         ROUND(a.m6 / a.n, 2),\n         ROUND(a.m7 / a.n, 2),\n         ROUND(a.m8 / a.n, 2),\n         ROUND(a.m9 / a.n, 2),\n         ROUND(a.m10 / a.n, 2),\n         ROUND((a.m1 + a.m2 + a.m3 + a.m4 + a.m5 + a.m6 + a.m7 + a.m8 + a.m9 + a.m10) / (a.n * 10), 2),\n         ROUND((a.m1 + a.m2 + a.m3 + a.m4 + a.m5 + a.m6 + a.m7 + a.m8 + a.m9 + a.m10) / a.n, 2)\n  FROM agg a\n  WHERE a.n > 0\n  ON CONFLICT (instructor_id, term_id, subject_id) DO UPDATE SET\n    total_responses = EXCLUDED.total_responses,\n    m1_total = EXCLUDED.m1_total,\n    m2_total = EXCLUDED.m2_total,\n    m3_total = EXCLUDED.m3_total,\n    m4_total = EXCLUDED.m4_total,\n    m5_total = EXCLUDED.m5_total,\n    m6_total = EXCLUDED.m6_total,\n    m7_total = EXCLUDED.m7_total,\n    m8_total = EXCLUDED.m8_total,\n    m9_total = EXCLUDED.m9_total,\n    m10_total = EXCLUDED.m10_total,\n    grand_total = EXCLUDED.grand_total,\n    m1_mean = EXCLUDED.m1_mean,\n    m2_mean = EXCLUDED.m2_mean,\n    m3_mean = EXCLUDED.m3_mean,\n    m4_mean = EXCLUDED.m4_mean,\n    m5_mean = EXCLUDED.m5_mean,\n    m6_mean = EXCLUDED.m6_mean,\n    m7_mean = EXCLUDED.m7_mean,\n    m8_mean = EXCLUDED.m8_mean,\n    m9_mean = EXCLUDED.m9_mean,\n    m10_mean = EXCLUDED.m10_mean,\n    overall_management_mean = EXCLUDED.overall_management_mean,\n    average_per_response_management = EXCLUDED.average_per_response_management\n  RETURNING total_responses\n),\nperf AS (\n  INSERT INTO public.performance_results (\n    instructor_id, term_id, subject_id, total_responses,\n    p1_total, p2_total, p3_total, p4_total, p5_total, p6_total, p7_total, p8_total, p9_total, p10_total, grand_total,\n    p1_mean, p2_mean, p3_mean, p4_mean, p5_mean, p6_mean, p7_mean, p8_mean, p9_mean, p10_mean,\n    overall_performance_mean, average_per_response_performance\n  )\n  SELECT $1, $2, $3, a.n,\n         a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10,\n         (a.p1 + a.p2 + a.p3 + a.p4 + a.p5 + a.p6 + a.p7 + a.p8 + a.p9 + a.p10),\n         ROUND(a.p1 / a.n, 2),\n         ROUND(a.p2 / a.n, 2),\n         ROUND(a.p3 / a.n, 2),\n         ROUND(a.p4 / a.n, 2),\n         ROUND(a.p5 / a.n, 2),\n         ROUND(a.p6 / a.n, 2),\n         ROUND(a.p7 / a.n, 2),\n         ROUND(a.p8 / a.n, 2),\n         ROUND(a.p9 / a.n, 2),\n         ROUND(a.p10 / a.n, 2),\n         ROUND((a.p1 + a.p2 + a.p3 + a.p4 + a.p5 + a.p6 + a.p7 + a.p8 + a.p9 + a.p10) / (a.n * 10), 2),\n         ROUND((a.p1 + a.p2 + a.p3 + a.p4 + a.p5 + a.p6 + a.p7 + a.p8 + a.p9 + a.p10) / a.n, 2)\n  FROM agg a\n  WHERE a.n > 0\n  ON CONFLICT (instructor_id, term_id, subject_id) DO UPDATE SET\n    total_responses = EXCLUDED.total_responses,\n    p1_total = EXCLUDED.p1_total,\n    p2_total = EXCLUDED.p2_total,\n    p3_total = EXCLUDED.p3_total,\n    p4_total = EXCLUDED.p4_total,\n    p5_total = EXCLUDED.p5_total,\n    p6_total = EXCLUDED.p6_total,\n    p7_total = EXCLUDED.p7_total,\n    p8_total = EXCLUDED.p8_total,\n    p9_total = EXCLUDED.p9_total,\n    p10_total = EXCLUDED.p10_total,\n    grand_total = EXCLUDED.grand_total,\n    p1_mean = EXCLUDED.p1_mean,\n    p2_mean = EXCLUDED.p2_mean,\n    p3_mean = EXCLUDED.p3_mean,\n    p4_mean = EXCLUDED.p4_mean,\n    p5_mean = EXCLUDED.p5_mean,\n    p6_mean = EXCLUDED.p6_mean,\n    p7_mean = EXCLUDED.p7_mean,\n    p8_mean = EXCLUDED.p8_mean,\n    p9_mean = EXCLUDED.p9_mean,\n    p10_mean = EXCLUDED.p10_mean,\n    overall_performance_mean = EXCLUDED.overall_performance_mean,\n    average_per_response_performance = EXCLUDED.average_per_response_performance\n  RETURNING total_responses\n)\nSELECT\n  (SELECT n FROM agg)              AS total_responses,\n  (SELECT count(*) FROM mgmt)      AS management_rows,\n  (SELECT count(*) FROM perf)      AS performance_rows,\n  (SELECT count(*) FROM link)      AS instructor_subject_linked;\n",
-        "options": {
-          "queryReplacement": "={{ [ $json.instructor_id, $json.term_id ?? null, $json.subject_id ] }}",
-          "queryBatching": "transaction"
-        }
-      },
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
-      "position": [
-        -40784,
-        20080
-      ],
-      "id": "e164ff7b-b9d0-4925-9440-b4cefc7815ce",
-      "name": "send to managment table1",
-      "credentials": {
-        "postgres": {
-          "id": "BEB0zDVaiSFMfjaE",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "-- Rebuilds the totals from all raw rows, not just this run.\n\n-- global lock held until commit so recomputes don't race\nDO $lock$ BEGIN PERFORM pg_advisory_xact_lock(hashtext('ievaluate:recompute_aggregates')); END $lock$;\nWITH link AS (\n  INSERT INTO public.instructor_subjects (subject_id, instructor_id, term_id)\n  SELECT $3, $1, $2\n  WHERE $1 IS NOT NULL AND $2 IS NOT NULL AND $3 IS NOT NULL\n  ON CONFLICT (subject_id, instructor_id, term_id) DO NOTHING\n  RETURNING 1 AS linked\n),\nagg AS (\n  SELECT\n    COUNT(*)::numeric AS n,\n    COALESCE(SUM(r.m1), 0)::numeric AS m1,\n    COALESCE(SUM(r.m2), 0)::numeric AS m2,\n    COALESCE(SUM(r.m3), 0)::numeric AS m3,\n    COALESCE(SUM(r.m4), 0)::numeric AS m4,\n    COALESCE(SUM(r.m5), 0)::numeric AS m5,\n    COALESCE(SUM(r.m6), 0)::numeric AS m6,\n    COALESCE(SUM(r.m7), 0)::numeric AS m7,\n    COALESCE(SUM(r.m8), 0)::numeric AS m8,\n    COALESCE(SUM(r.m9), 0)::numeric AS m9,\n    COALESCE(SUM(r.m10), 0)::numeric AS m10,\n    COALESCE(SUM(r.p1), 0)::numeric AS p1,\n    COALESCE(SUM(r.p2), 0)::numeric AS p2,\n    COALESCE(SUM(r.p3), 0)::numeric AS p3,\n    COALESCE(SUM(r.p4), 0)::numeric AS p4,\n    COALESCE(SUM(r.p5), 0)::numeric AS p5,\n    COALESCE(SUM(r.p6), 0)::numeric AS p6,\n    COALESCE(SUM(r.p7), 0)::numeric AS p7,\n    COALESCE(SUM(r.p8), 0)::numeric AS p8,\n    COALESCE(SUM(r.p9), 0)::numeric AS p9,\n    COALESCE(SUM(r.p10), 0)::numeric AS p10\n  FROM public.sast_all_raw_data_survey r\n  WHERE r.\"instructor_ID\" = $1\n    AND r.term_id         = $2\n    AND r.subject_id      = $3\n),\nmgmt AS (\n  INSERT INTO public.management_results (\n    instructor_id, term_id, subject_id, total_responses,\n    m1_total, m2_total, m3_total, m4_total, m5_total, m6_total, m7_total, m8_total, m9_total, m10_total, grand_total,\n    m1_mean, m2_mean, m3_mean, m4_mean, m5_mean, m6_mean, m7_mean, m8_mean, m9_mean, m10_mean,\n    overall_management_mean, average_per_response_management\n  )\n  SELECT $1, $2, $3, a.n,\n         a.m1, a.m2, a.m3, a.m4, a.m5, a.m6, a.m7, a.m8, a.m9, a.m10,\n         (a.m1 + a.m2 + a.m3 + a.m4 + a.m5 + a.m6 + a.m7 + a.m8 + a.m9 + a.m10),\n         ROUND(a.m1 / a.n, 2),\n         ROUND(a.m2 / a.n, 2),\n         ROUND(a.m3 / a.n, 2),\n         ROUND(a.m4 / a.n, 2),\n         ROUND(a.m5 / a.n, 2),\n         ROUND(a.m6 / a.n, 2),\n         ROUND(a.m7 / a.n, 2),\n         ROUND(a.m8 / a.n, 2),\n         ROUND(a.m9 / a.n, 2),\n         ROUND(a.m10 / a.n, 2),\n         ROUND((a.m1 + a.m2 + a.m3 + a.m4 + a.m5 + a.m6 + a.m7 + a.m8 + a.m9 + a.m10) / (a.n * 10), 2),\n         ROUND((a.m1 + a.m2 + a.m3 + a.m4 + a.m5 + a.m6 + a.m7 + a.m8 + a.m9 + a.m10) / a.n, 2)\n  FROM agg a\n  WHERE a.n > 0\n  ON CONFLICT (instructor_id, term_id, subject_id) DO UPDATE SET\n    total_responses = EXCLUDED.total_responses,\n    m1_total = EXCLUDED.m1_total,\n    m2_total = EXCLUDED.m2_total,\n    m3_total = EXCLUDED.m3_total,\n    m4_total = EXCLUDED.m4_total,\n    m5_total = EXCLUDED.m5_total,\n    m6_total = EXCLUDED.m6_total,\n    m7_total = EXCLUDED.m7_total,\n    m8_total = EXCLUDED.m8_total,\n    m9_total = EXCLUDED.m9_total,\n    m10_total = EXCLUDED.m10_total,\n    grand_total = EXCLUDED.grand_total,\n    m1_mean = EXCLUDED.m1_mean,\n    m2_mean = EXCLUDED.m2_mean,\n    m3_mean = EXCLUDED.m3_mean,\n    m4_mean = EXCLUDED.m4_mean,\n    m5_mean = EXCLUDED.m5_mean,\n    m6_mean = EXCLUDED.m6_mean,\n    m7_mean = EXCLUDED.m7_mean,\n    m8_mean = EXCLUDED.m8_mean,\n    m9_mean = EXCLUDED.m9_mean,\n    m10_mean = EXCLUDED.m10_mean,\n    overall_management_mean = EXCLUDED.overall_management_mean,\n    average_per_response_management = EXCLUDED.average_per_response_management\n  RETURNING total_responses\n),\nperf AS (\n  INSERT INTO public.performance_results (\n    instructor_id, term_id, subject_id, total_responses,\n    p1_total, p2_total, p3_total, p4_total, p5_total, p6_total, p7_total, p8_total, p9_total, p10_total, grand_total,\n    p1_mean, p2_mean, p3_mean, p4_mean, p5_mean, p6_mean, p7_mean, p8_mean, p9_mean, p10_mean,\n    overall_performance_mean, average_per_response_performance\n  )\n  SELECT $1, $2, $3, a.n,\n         a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10,\n         (a.p1 + a.p2 + a.p3 + a.p4 + a.p5 + a.p6 + a.p7 + a.p8 + a.p9 + a.p10),\n         ROUND(a.p1 / a.n, 2),\n         ROUND(a.p2 / a.n, 2),\n         ROUND(a.p3 / a.n, 2),\n         ROUND(a.p4 / a.n, 2),\n         ROUND(a.p5 / a.n, 2),\n         ROUND(a.p6 / a.n, 2),\n         ROUND(a.p7 / a.n, 2),\n         ROUND(a.p8 / a.n, 2),\n         ROUND(a.p9 / a.n, 2),\n         ROUND(a.p10 / a.n, 2),\n         ROUND((a.p1 + a.p2 + a.p3 + a.p4 + a.p5 + a.p6 + a.p7 + a.p8 + a.p9 + a.p10) / (a.n * 10), 2),\n         ROUND((a.p1 + a.p2 + a.p3 + a.p4 + a.p5 + a.p6 + a.p7 + a.p8 + a.p9 + a.p10) / a.n, 2)\n  FROM agg a\n  WHERE a.n > 0\n  ON CONFLICT (instructor_id, term_id, subject_id) DO UPDATE SET\n    total_responses = EXCLUDED.total_responses,\n    p1_total = EXCLUDED.p1_total,\n    p2_total = EXCLUDED.p2_total,\n    p3_total = EXCLUDED.p3_total,\n    p4_total = EXCLUDED.p4_total,\n    p5_total = EXCLUDED.p5_total,\n    p6_total = EXCLUDED.p6_total,\n    p7_total = EXCLUDED.p7_total,\n    p8_total = EXCLUDED.p8_total,\n    p9_total = EXCLUDED.p9_total,\n    p10_total = EXCLUDED.p10_total,\n    grand_total = EXCLUDED.grand_total,\n    p1_mean = EXCLUDED.p1_mean,\n    p2_mean = EXCLUDED.p2_mean,\n    p3_mean = EXCLUDED.p3_mean,\n    p4_mean = EXCLUDED.p4_mean,\n    p5_mean = EXCLUDED.p5_mean,\n    p6_mean = EXCLUDED.p6_mean,\n    p7_mean = EXCLUDED.p7_mean,\n    p8_mean = EXCLUDED.p8_mean,\n    p9_mean = EXCLUDED.p9_mean,\n    p10_mean = EXCLUDED.p10_mean,\n    overall_performance_mean = EXCLUDED.overall_performance_mean,\n    average_per_response_performance = EXCLUDED.average_per_response_performance\n  RETURNING total_responses\n)\nSELECT\n  (SELECT n FROM agg)              AS total_responses,\n  (SELECT count(*) FROM mgmt)      AS management_rows,\n  (SELECT count(*) FROM perf)      AS performance_rows,\n  (SELECT count(*) FROM link)      AS instructor_subject_linked;\n",
-        "options": {
-          "queryReplacement": "={{ [ $json.instructor_id, $json.term_id ?? null, $json.subject_id ] }}",
-          "queryBatching": "transaction"
-        }
-      },
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
-      "position": [
-        -40784,
-        20752
-      ],
-      "id": "68220509-edc3-4b9f-ac53-d52f4ff69a79",
-      "name": "send to performance node1",
-      "credentials": {
-        "postgres": {
-          "id": "BEB0zDVaiSFMfjaE",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH mgmt_stats AS (\n  SELECT \n    COALESCE(SUM(total_responses), 0) AS m_total_resp,\n    COALESCE(SUM(grand_total), 0) AS m_total,\n    COALESCE(SUM(grand_total)::numeric / NULLIF(SUM(total_responses) * 10, 0), 0) AS m_avg\n  FROM public.management_results\n  WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n),\nperf_stats AS (\n  SELECT \n    COALESCE(SUM(total_responses), 0) AS p_total_resp,\n    COALESCE(SUM(grand_total), 0) AS p_total,\n    COALESCE(SUM(grand_total)::numeric / NULLIF(SUM(total_responses) * 10, 0), 0) AS p_avg\n  FROM public.performance_results\n  WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n)\nINSERT INTO public.overall_total_survey (\n  instructor_id, term_id, total_responses, management_total, performance_total, combined_total, management_mean, performance_mean, combined_score_mean\n)\nSELECT \n  $1::uuid, $2::uuid, \n  m.m_total_resp, \n  m.m_total, p.p_total, \n  (m.m_total + p.p_total), \n  m.m_avg, \n  p.p_avg, \n  (m.m_total + p.p_total)::numeric / NULLIF((m.m_total_resp * 10) + (p.p_total_resp * 10), 0)\nFROM mgmt_stats m, perf_stats p\nON CONFLICT (instructor_id, term_id) \nDO UPDATE SET \n  total_responses = EXCLUDED.total_responses,\n  management_total = EXCLUDED.management_total,\n  performance_total = EXCLUDED.performance_total,\n  combined_total = EXCLUDED.combined_total,\n  management_mean = EXCLUDED.management_mean,\n  performance_mean = EXCLUDED.performance_mean,\n  combined_score_mean = EXCLUDED.combined_score_mean\nRETURNING instructor_id, term_id, combined_score_mean;",
+        "query": "SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);\n",
         "options": {
           "queryReplacement": "={{ [$json.instructor_id, $json.term_id] }}"
         }
@@ -469,30 +201,6 @@
       ],
       "id": "201a0b0e-5194-4677-a8be-f8d528c31f7e",
       "name": "Code in JavaScript8"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "INSERT INTO public.overall_question_means (instructor_id, term_id, category, question_number, mean_score)\nWITH m_totals AS (\n    SELECT \n        SUM(total_responses) as tr, \n        SUM(m1_total) as m1, SUM(m2_total) as m2, SUM(m3_total) as m3, SUM(m4_total) as m4, SUM(m5_total) as m5, \n        SUM(m6_total) as m6, SUM(m7_total) as m7, SUM(m8_total) as m8, SUM(m9_total) as m9, SUM(m10_total) as m10\n    FROM public.management_results \n    WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n),\np_totals AS (\n    SELECT \n        SUM(total_responses) as tr, \n        SUM(p1_total) as p1, SUM(p2_total) as p2, SUM(p3_total) as p3, SUM(p4_total) as p4, SUM(p5_total) as p5, \n        SUM(p6_total) as p6, SUM(p7_total) as p7, SUM(p8_total) as p8, SUM(p9_total) as p9, SUM(p10_total) as p10\n    FROM public.performance_results \n    WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n)\nSELECT $1::uuid, $2::uuid, 'Management', 1, COALESCE(ROUND((m1/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 2, COALESCE(ROUND((m2/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 3, COALESCE(ROUND((m3/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 4, COALESCE(ROUND((m4/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 5, COALESCE(ROUND((m5/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 6, COALESCE(ROUND((m6/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 7, COALESCE(ROUND((m7/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 8, COALESCE(ROUND((m8/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 9, COALESCE(ROUND((m9/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 10, COALESCE(ROUND((m10/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 1, COALESCE(ROUND((p1/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 2, COALESCE(ROUND((p2/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 3, COALESCE(ROUND((p3/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 4, COALESCE(ROUND((p4/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 5, COALESCE(ROUND((p5/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 6, COALESCE(ROUND((p6/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 7, COALESCE(ROUND((p7/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 8, COALESCE(ROUND((p8/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 9, COALESCE(ROUND((p9/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 10, COALESCE(ROUND((p10/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals\nON CONFLICT (instructor_id, term_id, category, question_number) \nDO UPDATE SET mean_score = EXCLUDED.mean_score, updated_at = now();",
-        "options": {
-          "queryReplacement": "={{ [$json.instructor_id, $json.term_id] }}"
-        }
-      },
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
-      "position": [
-        -40144,
-        20224
-      ],
-      "id": "b97ec55d-4898-425c-beb2-f693e7fb009d",
-      "name": "update to overall_question_means2",
-      "credentials": {
-        "postgres": {
-          "id": "BEB0zDVaiSFMfjaE",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
@@ -932,7 +640,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Reads the RECONCILED result, not the raw Python output.\n//\n// Before: this pulled ratings.management[] / ratings.performance[] straight from\n// the Python service, and referenced a node that has since been deleted, so it\n// threw on every run. Reading Python directly also threw away every bubble the\n// reconciler recovered from Gemini.\nconst rec = $('reconcile ocr and omr1').first().json;\n\nconst ratings = rec.ratings ?? {};\nconst result = {};\n\n// The reconciler emits a flat object, m1..m10 / p1..p10, where null means both\n// engines agreed the row is genuinely blank. Downstream arithmetic sums these,\n// so a blank has to become 0, not null.\nlet answered = 0;\nlet sum = 0;\nfor (let i = 1; i <= 10; i++) {\n  for (const prefix of ['m', 'p']) {\n    const key = `${prefix}${i}`;\n    const v = ratings[key];\n    const score = (v === null || v === undefined) ? 0 : Number(v) || 0;\n    result[key] = score;\n    if (score > 0) { answered++; sum += score; }\n  }\n}\n\n// Recomputed from the reconciled values. Python's own summary predates the\n// blank-filling, so reusing it would disagree with the scores just above it.\nresult.answered    = answered;\nresult.total_score = sum;\nresult.average     = answered ? Number((sum / answered).toFixed(2)) : 0;\nresult.percent     = Number(((sum / (20 * 5)) * 100).toFixed(2));\n\nresult.grid_source = rec.grid_source ?? null;\nresult.table_found = rec.table_found ?? null;\n\n// OCR text: Gemini-first, already decided by the reconciler.\nresult.cleaned_remarks = rec.remarks ?? '';\n\n// Carried so the run data shows whether anything cross-checked this scan.\nresult.validation_status = rec.validation_status ?? 'auto';\nresult.review_reasons    = rec.review_reasons ?? [];\n\nreturn [{ json: result }];\n"
+        "jsCode": "// SAST rating, from website_src/rating.js\nfunction rating(v) {\n  if (typeof v === 'string') v = v.trim();\n  else if (typeof v !== 'number') return null;\n  if (v === '') return null;\n  const n = Number(v);\n  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null;\n}\n// end of SAST rating\n\n// Reads the RECONCILED result, not the raw Python output.\n//\n// Before: this pulled ratings.management[] / ratings.performance[] straight from\n// the Python service, and referenced a node that has since been deleted, so it\n// threw on every run. Reading Python directly also threw away every bubble the\n// reconciler recovered from Gemini.\nconst rec = $('reconcile ocr and omr1').first().json;\n\nconst ratings = rec.ratings ?? {};\nconst result = {};\n\n// The reconciler emits a flat object, m1..m10 / p1..p10, where null means both\n// engines agreed the row is genuinely blank. A blank stays null (stored as NULL,\n// never 0): the database means skip NULLs, and a 0 would fail its CHECK (1..5).\nlet answered = 0;\nlet sum = 0;\nfor (let i = 1; i <= 10; i++) {\n  for (const prefix of ['m', 'p']) {\n    const key = `${prefix}${i}`;\n    const score = rating(ratings[key]);\n    result[key] = score;\n    if (score !== null) { answered++; sum += score; }\n  }\n}\n\n// Recomputed from the reconciled values, over the answered rows only (blanks\n// are skipped, not counted as 0).\nresult.answered    = answered;\nresult.total_score = sum;\nresult.average     = answered ? Number((sum / answered).toFixed(2)) : null;\nresult.percent     = answered ? Number((sum / (answered * 5) * 100).toFixed(2)) : null;\n\nresult.grid_source = rec.grid_source ?? null;\nresult.table_found = rec.table_found ?? null;\n\n// OCR text: Gemini-first, already decided by the reconciler.\nresult.cleaned_remarks = rec.remarks ?? '';\n\n// Carried so the run data shows whether anything cross-checked this scan.\nresult.validation_status = rec.validation_status ?? 'auto';\nresult.review_reasons    = rec.review_reasons ?? [];\n\nreturn [{ json: result }];\n"
       },
       "name": "2. Format Final Results1",
       "type": "n8n-nodes-base.code",
@@ -960,54 +668,6 @@
       "id": "91c0dd4c-2bc3-4fb2-ab17-12fe3a862072",
       "name": "get subject id4",
       "alwaysOutputData": true,
-      "credentials": {
-        "postgres": {
-          "id": "BEB0zDVaiSFMfjaE",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH mgmt_stats AS (\n  SELECT \n    COALESCE(SUM(total_responses), 0) AS m_total_resp,\n    COALESCE(SUM(grand_total), 0) AS m_total,\n    COALESCE(SUM(grand_total)::numeric / NULLIF(SUM(total_responses) * 10, 0), 0) AS m_avg\n  FROM public.management_results\n  WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n),\nperf_stats AS (\n  SELECT \n    COALESCE(SUM(total_responses), 0) AS p_total_resp,\n    COALESCE(SUM(grand_total), 0) AS p_total,\n    COALESCE(SUM(grand_total)::numeric / NULLIF(SUM(total_responses) * 10, 0), 0) AS p_avg\n  FROM public.performance_results\n  WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n)\nINSERT INTO public.overall_total_survey (\n  instructor_id, term_id, total_responses, management_total, performance_total, combined_total, management_mean, performance_mean, combined_score_mean\n)\nSELECT \n  $1::uuid, $2::uuid, \n  m.m_total_resp, \n  m.m_total, p.p_total, \n  (m.m_total + p.p_total), \n  m.m_avg, \n  p.p_avg, \n  (m.m_total + p.p_total)::numeric / NULLIF((m.m_total_resp * 10) + (p.p_total_resp * 10), 0)\nFROM mgmt_stats m, perf_stats p\nON CONFLICT (instructor_id, term_id) \nDO UPDATE SET \n  total_responses = EXCLUDED.total_responses,\n  management_total = EXCLUDED.management_total,\n  performance_total = EXCLUDED.performance_total,\n  combined_total = EXCLUDED.combined_total,\n  management_mean = EXCLUDED.management_mean,\n  performance_mean = EXCLUDED.performance_mean,\n  combined_score_mean = EXCLUDED.combined_score_mean\nRETURNING instructor_id, term_id, combined_score_mean;",
-        "options": {
-          "queryReplacement": "={{ [$json.instructor_id, $json.term_id] }}"
-        }
-      },
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
-      "position": [
-        -40432,
-        20560
-      ],
-      "id": "b2034e79-afec-4bef-836d-704b4d54126d",
-      "name": "update to overall total3",
-      "credentials": {
-        "postgres": {
-          "id": "BEB0zDVaiSFMfjaE",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "INSERT INTO public.overall_question_means (instructor_id, term_id, category, question_number, mean_score)\nWITH m_totals AS (\n    SELECT \n        SUM(total_responses) as tr, \n        SUM(m1_total) as m1, SUM(m2_total) as m2, SUM(m3_total) as m3, SUM(m4_total) as m4, SUM(m5_total) as m5, \n        SUM(m6_total) as m6, SUM(m7_total) as m7, SUM(m8_total) as m8, SUM(m9_total) as m9, SUM(m10_total) as m10\n    FROM public.management_results \n    WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n),\np_totals AS (\n    SELECT \n        SUM(total_responses) as tr, \n        SUM(p1_total) as p1, SUM(p2_total) as p2, SUM(p3_total) as p3, SUM(p4_total) as p4, SUM(p5_total) as p5, \n        SUM(p6_total) as p6, SUM(p7_total) as p7, SUM(p8_total) as p8, SUM(p9_total) as p9, SUM(p10_total) as p10\n    FROM public.performance_results \n    WHERE instructor_id = $1::uuid AND term_id = $2::uuid\n)\nSELECT $1::uuid, $2::uuid, 'Management', 1, COALESCE(ROUND((m1/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 2, COALESCE(ROUND((m2/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 3, COALESCE(ROUND((m3/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 4, COALESCE(ROUND((m4/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 5, COALESCE(ROUND((m5/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 6, COALESCE(ROUND((m6/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 7, COALESCE(ROUND((m7/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 8, COALESCE(ROUND((m8/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 9, COALESCE(ROUND((m9/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Management', 10, COALESCE(ROUND((m10/NULLIF(tr,0))::numeric, 2), 0) FROM m_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 1, COALESCE(ROUND((p1/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 2, COALESCE(ROUND((p2/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 3, COALESCE(ROUND((p3/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 4, COALESCE(ROUND((p4/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 5, COALESCE(ROUND((p5/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 6, COALESCE(ROUND((p6/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 7, COALESCE(ROUND((p7/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 8, COALESCE(ROUND((p8/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 9, COALESCE(ROUND((p9/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals UNION ALL\nSELECT $1::uuid, $2::uuid, 'Performance', 10, COALESCE(ROUND((p10/NULLIF(tr,0))::numeric, 2), 0) FROM p_totals\nON CONFLICT (instructor_id, term_id, category, question_number) \nDO UPDATE SET mean_score = EXCLUDED.mean_score, updated_at = now();",
-        "options": {
-          "queryReplacement": "={{ [$json.instructor_id, $json.term_id] }}"
-        }
-      },
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
-      "position": [
-        -40144,
-        20608
-      ],
-      "id": "c22c80ee-d8eb-4f4f-9ac8-8523d8a80e2d",
-      "name": "update to overall_question_means3",
       "credentials": {
         "postgres": {
           "id": "BEB0zDVaiSFMfjaE",
@@ -1152,7 +812,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const body = $('sast-manual-correction1').first().json.body;\nconst instructorId = $('get instructor id7').first().json.instructor_id ?? null;\nconst subjectId    = $('get subject id6').first().json.subject_id ?? null;\n\n// Safety: convert [null] arrays from Flutter → actual null\nconst termId  = Array.isArray(body.term_id)  ? null : (body.term_id  ?? null);\nconst userId  = Array.isArray(body.user_id)  ? null : (body.user_id  ?? null);\nconst taskId  = Array.isArray(body.task_id)  ? null : (body.task_id  ?? null);\n\nconst scores = {};\nfor (let i = 1; i <= 10; i++) {\n  scores[`m${i}`] = parseInt(body[`m${i}`]) || 0;\n  scores[`p${i}`] = parseInt(body[`p${i}`]) || 0;\n}\n\nreturn [{\n  json: {\n    raw: {\n      instructor:              body.instructor ?? '',\n      student_id:              body.student_id ?? '',\n      Remarks_and_Suggestions: body.remarks    ?? '',\n      submitted_date:          new Date().toISOString().split('T')[0],\n      sao_staff_id:            userId,       // ← safe, no [null]\n      term_id:                 termId,       // ← safe, no [null]\n      instructor_ID:           instructorId,\n      subject_id:              subjectId,\n      task_id:                 taskId,       // ← safe, no [null]\n      manually_corrected:      true,\n      validation_status:       'corrected',\n      ...scores,\n    },\n    instructor_ID:  instructorId,\n    subject_id:     subjectId,\n    term_id:        termId,\n    failed_scan_id: body.failed_scan_id,\n    scores,\n  }\n}];"
+        "jsCode": "// SAST rating, from website_src/rating.js\nfunction rating(v) {\n  if (typeof v === 'string') v = v.trim();\n  else if (typeof v !== 'number') return null;\n  if (v === '') return null;\n  const n = Number(v);\n  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null;\n}\n// end of SAST rating\n\nconst body = $('sast-manual-correction1').first().json.body;\nconst instructorId = $('get instructor id7').first().json.instructor_id ?? null;\nconst subjectId    = $('get subject id6').first().json.subject_id ?? null;\n\n// Safety: convert [null] arrays from Flutter → actual null\nconst termId  = Array.isArray(body.term_id)  ? null : (body.term_id  ?? null);\nconst userId  = Array.isArray(body.user_id)  ? null : (body.user_id  ?? null);\nconst taskId  = Array.isArray(body.task_id)  ? null : (body.task_id  ?? null);\n\nconst scores = {};\nfor (let i = 1; i <= 10; i++) {\n  scores[`m${i}`] = rating(body[`m${i}`]);\n  scores[`p${i}`] = rating(body[`p${i}`]);\n}\n\nreturn [{\n  json: {\n    raw: {\n      instructor:              body.instructor ?? '',\n      student_id:              body.student_id ?? '',\n      Remarks_and_Suggestions: body.remarks    ?? '',\n      submitted_date:          new Date().toISOString().split('T')[0],\n      sao_staff_id:            userId,       // ← safe, no [null]\n      term_id:                 termId,       // ← safe, no [null]\n      instructor_ID:           instructorId,\n      subject_id:              subjectId,\n      task_id:                 taskId,       // ← safe, no [null]\n      manually_corrected:      true,\n      validation_status:       'corrected',\n      ...scores,\n    },\n    instructor_ID:  instructorId,\n    subject_id:     subjectId,\n    term_id:        termId,\n    failed_scan_id: body.failed_scan_id,\n    scores,\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -1250,45 +910,6 @@
           "name": "Postgres account"
         }
       }
-    },
-    {
-      "parameters": {
-        "jsCode": "const groups = {};\n\n// 1. Group data by Instructor AND Subject\nfor (const item of items) {\n  const id = item.json.instructor_ID;\n  const subjectId = item.json.true_subject_id || item.json.subject_id;\n  if (!id || !subjectId) continue;\n\n  const key = `${id}_${subjectId}`;\n\n  if (!groups[key]) {\n    groups[key] = {\n      instructor_id: id,\n      subject_id: subjectId,\n      term_id: item.json.current_term_id ?? null,\n      count: 0,\n      totals: {\n        p1: 0, p2: 0, p3: 0, p4: 0, p5: 0,\n        p6: 0, p7: 0, p8: 0, p9: 0, p10: 0\n      }\n    };\n  }\n\n  groups[key].count++;\n  for (let i = 1; i <= 10; i++) {\n    const valKey = `P${i}`;\n    const val = Number(item.json[valKey]);\n    if (!isNaN(val)) {\n      groups[key].totals[`p${i}`] += val;\n    }\n  }\n}\n\n// 2. Build output\nconst output = [];\nfor (const key in groups) {\n  const data = groups[key];\n  const means = {};\n  const totalsOut = {};\n  let sumMeans = 0;\n  let grandTotal = 0;\n\n  for (let i = 1; i <= 10; i++) {\n    const total = data.totals[`p${i}`];\n    const mean = total / data.count;\n    totalsOut[`p${i}_total`] = total;\n    means[`p${i}_mean`] = Number(mean.toFixed(2));  // ✅ 2 decimal places\n    sumMeans += mean;\n    grandTotal += total;\n  }\n\n  // ✅ FIX 1: renamed to snake_case to match Supabase column\n  const overall_performance_mean = Number((grandTotal / (data.count * 10)).toFixed(2));\n  const average_per_response_performance = Number((grandTotal / data.count).toFixed(2));\n\n  output.push({\n    json: {\n      instructor_id: data.instructor_id,  // ✅ FIX 2: lowercase 'd'\n      term_id: data.term_id,\n      subject_id: data.subject_id,\n      total_responses: data.count,\n      ...totalsOut,\n      grand_total: grandTotal,\n      ...means,\n      overall_performance_mean,            // ✅ FIX 1: correct column name\n      average_per_response_performance\n    }\n  });\n}\n\nreturn output;"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        -41296,
-        20704
-      ],
-      "id": "7370c103-602a-4b5b-aa84-b1f8eb5669ca",
-      "name": "calculate performance1"
-    },
-    {
-      "parameters": {
-        "jsCode": "// Grab ALL 205 items from the If node\nconst allItems = $('If1').all();\nconst uniquePairs = {};\n\n// Loop through all of them and find every unique Instructor + Term combo\nfor (const item of allItems) {\n  const instId = item.json.instructor_ID;\n  const termId = item.json.current_term_id;\n  \n  if (instId && termId) {\n    uniquePairs[`${instId}_${termId}`] = {\n      instructor_id: instId,\n      term_id: termId\n    };\n  }\n}\n\n// Return the full list of unique instructors so Postgres updates ALL of them\nreturn Object.values(uniquePairs).map(pair => ({ json: pair }));"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        -40784,
-        20560
-      ],
-      "id": "5f561e81-ac28-46aa-b68f-3a2ad4af02b0",
-      "name": "calc1"
-    },
-    {
-      "parameters": {
-        "jsCode": "const groups = {};\n\n// 1. Group data by Instructor AND Subject\nfor (const item of items) {\n  const id = item.json.instructor_ID;\n  const subjectId = item.json.true_subject_id || item.json.subject_id;\n  if (!id || !subjectId) continue;\n\n  const key = `${id}_${subjectId}`;\n\n  if (!groups[key]) {\n    groups[key] = {\n      instructor_id: id,\n      subject_id: subjectId,\n      term_id: item.json.current_term_id ?? null,\n      count: 0,\n      totals: {\n        m1: 0, m2: 0, m3: 0, m4: 0, m5: 0,\n        m6: 0, m7: 0, m8: 0, m9: 0, m10: 0\n      }\n    };\n  }\n\n  groups[key].count++;\n  for (let i = 1; i <= 10; i++) {\n    const valKey = `M${i}`;           // ← M not P\n    const val = Number(item.json[valKey]);\n    if (!isNaN(val)) {\n      groups[key].totals[`m${i}`] += val;\n    }\n  }\n}\n\n// 2. Build output\nconst output = [];\nfor (const key in groups) {\n  const data = groups[key];\n  const means = {};\n  const totalsOut = {};\n  let sumMeans = 0;\n  let grandTotal = 0;\n\n  for (let i = 1; i <= 10; i++) {\n    const total = data.totals[`m${i}`];   // ← m not p\n    const mean = total / data.count;\n    totalsOut[`m${i}_total`] = total;     // ← m not p\n    means[`m${i}_mean`] = Number(mean.toFixed(2));\n    sumMeans += mean;\n    grandTotal += total;\n  }\n\n  const overall_management_mean = Number((grandTotal / (data.count * 10)).toFixed(2));\n  const average_per_response_management = Number((grandTotal / data.count).toFixed(2));\n\n  output.push({\n    json: {\n      instructor_id: data.instructor_id,\n      term_id: data.term_id,\n      subject_id: data.subject_id,\n      total_responses: data.count,\n      ...totalsOut,\n      grand_total: grandTotal,\n      ...means,\n      overall_management_mean,\n      average_per_response_management\n    }\n  });\n}\n\nreturn output;"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        -41296,
-        20128
-      ],
-      "id": "7bd3a62e-18d6-47c7-b9f0-be2aac357103",
-      "name": "calculate mangement1"
     },
     {
       "parameters": {
@@ -2911,11 +2532,12 @@
           "conditions": [
             {
               "id": "741292c5-9077-4c74-bbbf-220f071b43a9",
-              "leftValue": "={{ $json.combined_score_mean }}",
-              "rightValue": 3,
+              "leftValue": "={{ $json.combined_score_mean !== null && $json.combined_score_mean !== undefined && $json.combined_score_mean !== '' && Number($json.combined_score_mean) < 3 }}",
+              "rightValue": "",
               "operator": {
-                "type": "number",
-                "operation": "lt"
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
               }
             }
           ],
@@ -3340,7 +2962,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const newItems = [];\n\n// Generate today's date formatted as \"Month DD, YYYY\" specifically in Philippine Time\nconst todayFormatted = new Date().toLocaleDateString('en-US', { \n  timeZone: 'Asia/Manila',\n  year: 'numeric', \n  month: 'long', \n  day: 'numeric' \n});\n\n// 1. Fetch the flattened scores (m1-m10, p1-p10) from the previous formatting node\nconst formattedResults = $('2. Format Final Results1').first().json;\n\n// 2. Fetch the OCR data (student_id, remarks, raw instructor/subject text) from the reconciler\nconst separateData = $('reconcile ocr and omr1').first().json;\n\n// 3. Fetch the DB lookup results for instructor/subject\nconst instructorDbData = $('get instructor id6').first().json;\nconst subjectDbData = $('get subject id4').first().json;\n\nfor (const item of $input.all()) {\n  const data = item.json; // This is the input from 'Set Status - Auto'\n  const result = {};\n\n  // 1. Map IDs\n  result[\"instructor_ID\"] = instructorDbData.instructor_id || null;\n  result[\"true_subject_id\"] = subjectDbData.subject_id || null;\n  result[\"current_term_id\"] = data.current_term_id || null;\n  result[\"scan_image\"] = separateData.scan_image || null;\n  result[\"review_reasons\"] = separateData.review_reasons || [];\n  result[\"omr_comparisons\"] = separateData.comparisons || null;\n  result[\"review_note\"] = separateData.review_note || null;\n  result[\"task_id\"] = separateData.task_id || null;\n  \n  // 2. Map standard text fields\n  result[\"Student ID\"] =  separateData.student_id || \"\";\n  const rawInstructorName = separateData.instructor || \"\";\n  const firstName = instructorDbData.first_name || \"\";\n  const lastName = instructorDbData.last_name || \"\";\n  const dbInstructorName = `${firstName} ${lastName}`.trim();\n  result[\"Instructor/Professor\"] = dbInstructorName || rawInstructorName;\n  result[\"Subject Taught\"] = subjectDbData.subject_name || separateData.subject || \"\";\n  result[\"AY/Semester\"] = (data.academic_terms?.semester || \"\") + \" \" + (data.academic_terms?.academic_year || \"\");\n  result[\"Remarks & Suggestions\"] = separateData.remarks || \"\";\n  result[\"Date\"] = todayFormatted;\n  \n  // 3. Map OMR Scores\n  for (let i = 1; i <= 10; i++) {\n    result[`M${i}`] = formattedResults[`m${i}`] !== undefined ? formattedResults[`m${i}`] : 0;\n    result[`P${i}`] = formattedResults[`p${i}`] !== undefined ? formattedResults[`p${i}`] : 0;\n  }\n\n  newItems.push({ json: result });\n}\n\nreturn newItems;\n"
+        "jsCode": "const newItems = [];\n\n// Generate today's date formatted as \"Month DD, YYYY\" specifically in Philippine Time\nconst todayFormatted = new Date().toLocaleDateString('en-US', { \n  timeZone: 'Asia/Manila',\n  year: 'numeric', \n  month: 'long', \n  day: 'numeric' \n});\n\n// 1. Fetch the flattened scores (m1-m10, p1-p10) from the previous formatting node\nconst formattedResults = $('2. Format Final Results1').first().json;\n\n// 2. Fetch the OCR data (student_id, remarks, raw instructor/subject text) from the reconciler\nconst separateData = $('reconcile ocr and omr1').first().json;\n\n// 3. Fetch the DB lookup results for instructor/subject\nconst instructorDbData = $('get instructor id6').first().json;\nconst subjectDbData = $('get subject id4').first().json;\n\nfor (const item of $input.all()) {\n  const data = item.json; // This is the input from 'Set Status - Auto'\n  const result = {};\n\n  // 1. Map IDs\n  result[\"instructor_ID\"] = instructorDbData.instructor_id || null;\n  result[\"true_subject_id\"] = subjectDbData.subject_id || null;\n  result[\"current_term_id\"] = data.current_term_id || null;\n  result[\"scan_image\"] = separateData.scan_image || null;\n  result[\"review_reasons\"] = separateData.review_reasons || [];\n  result[\"omr_comparisons\"] = separateData.comparisons || null;\n  result[\"review_note\"] = separateData.review_note || null;\n  result[\"task_id\"] = separateData.task_id || null;\n  \n  // 2. Map standard text fields\n  result[\"Student ID\"] =  separateData.student_id || \"\";\n  const rawInstructorName = separateData.instructor || \"\";\n  const firstName = instructorDbData.first_name || \"\";\n  const lastName = instructorDbData.last_name || \"\";\n  const dbInstructorName = `${firstName} ${lastName}`.trim();\n  result[\"Instructor/Professor\"] = dbInstructorName || rawInstructorName;\n  result[\"Subject Taught\"] = subjectDbData.subject_name || separateData.subject || \"\";\n  result[\"AY/Semester\"] = (data.academic_terms?.semester || \"\") + \" \" + (data.academic_terms?.academic_year || \"\");\n  result[\"Remarks & Suggestions\"] = separateData.remarks || \"\";\n  result[\"Date\"] = todayFormatted;\n  \n  // 3. Map OMR Scores\n  for (let i = 1; i <= 10; i++) {\n    result[`M${i}`] = formattedResults[`m${i}`] !== undefined ? formattedResults[`m${i}`] : null;\n    result[`P${i}`] = formattedResults[`p${i}`] !== undefined ? formattedResults[`p${i}`] : null;\n  }\n\n  newItems.push({ json: result });\n}\n\nreturn newItems;\n"
       },
       "name": "Map to Target Format3",
       "type": "n8n-nodes-base.code",
@@ -3406,7 +3028,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// sexual-word filter, from website_src/profanity.js\nconst PROFANITY_GROUPS = {\n  sexual: true,\n  fuck: true,            // masked even when used as a plain curse\n  sexual_curses: false,  // puta, tangina etc. stay allowed like other curses\n};\nconst PROFANITY_WORDS = [\n  ['sexual', 'fil', 'iyot', 'iyut'],\n  ['sexual', 'fil', 'bilat'],\n  ['sexual', 'fil', 'oten', 'otin', 'uten', 'utin'],\n  ['sexual', 'fil', 'salsal'],\n  ['sexual', 'none', 'puday'],\n  ['sexual', 'none', 'tamod', 'tamud'],\n  ['sexual', 'none', 'bayag'],\n  ['sexual', 'fil', 'kantot', 'kantut'],\n  ['sexual', 'fil', 'hindot', 'hindut'],\n  ['sexual', 'fil', 'jakol', 'jakul', 'dyakol'],\n  ['sexual', 'fil', 'tsupa', 'chupa'],\n  ['sexual', 'none', 'burat', 'titi', 'tite', 'etits'],             // exact only, titi+ng = katiting\n  ['sexual', 'none', 'puke', 'puki', 'pekpek', 'kepyas', 'kipay'],\n  ['sexual', 'none', 'betlog'],\n  ['sexual', 'none', 'pussy', 'pussies', 'cunt', 'cunts'],\n  ['sexual', 'none', 'boobs', 'boobies', 'tits', 'titties'],\n  ['sexual', 'none', 'porn', 'porno', 'blowjob', 'blowjobs', 'handjob', 'handjobs'],\n  ['sexual', 'none', 'horny', 'dildo', 'dildos', 'jizz'],\n  ['fuck', 'en', 'fuck', 'fuk', 'fck', 'phuck'],\n  ['fuck', 'none', 'fak', 'pakyu', 'pakshet', 'pakshit'],           // exact only, fak+ing = faking\n  ['sexual_curses', 'none', 'puta', 'pota', 'putangina', 'potangina', 'putanginamo', 'tangina', 'tanginamo'],\n  ['sexual_curses', 'none', 'whore', 'whores', 'slut', 'sluts'],\n];\nconst PROFANITY_PHRASES = [\n  ['fuck', 'pak', 'yu'], ['fuck', 'pak', 'you'],\n  ['sexual_curses', 'putang', 'ina'], ['sexual_curses', 'potang', 'ina'], ['sexual_curses', 'tang', 'ina'],\n];\nconst PF_CLASS = { a: 'a4@*', e: 'e3*', i: 'i1!|*', o: 'o0*', u: 'uv*', s: 's5$', t: 't7', l: 'l1|', b: 'b8' };\nconst PF_FIL_PREFIXES = ['gi', 'gina', 'gipa', 'ga', 'na', 'nag', 'naga', 'nagka', 'naka', 'nakaka', 'nang', 'nan',\n  'ni', 'ma', 'mag', 'maga', 'magka', 'maka', 'mang', 'man', 'mi', 'pa', 'pag', 'pang', 'paka', 'ka', 'kina',\n  'i', 'ipa', 'in', 'um', 'nakig', 'makig', 'pakig'];\nconst PF_FIL_SUFFIXES = ['an', 'han', 'on', 'hon', 'a', 'ha', 'ay', 'in', 'hin', 'ero', 'era', 'eros', 'eras'];\nconst PF_EN_PREFIXES = ['mother', 'motha', 'mutha', 'muther', 'mada'];\nconst PF_EN_SUFFIXES = ['s', 'ing', 'in', 'ed', 'er', 'ers', 'face', 'head'];\nconst PF_WS = ' \\\\t\\\\n\\\\r\\\\f\\\\v\\\\u00A0\\\\u1680\\\\u2000-\\\\u200A\\\\u2028\\\\u2029\\\\u202F\\\\u205F\\\\u3000\\\\uFEFF';\nconst PF_WORDCH = 'A-Za-z0-9\\\\u00C0-\\\\u024F\\\\u1E00-\\\\u1EFF@$';\nconst PF_DELIM_RE = new RegExp('([' + PF_WS + ',;:/\\\\\\\\()\\\\[\\\\]{}\"\\\\u201C\\\\u201D\\\\u00AB\\\\u00BB<>?]+)');\nconst PF_LEAD_RE = new RegExp('^[^' + PF_WORDCH + ']*');\nconst PF_TRAIL_RE = new RegExp('[^' + PF_WORDCH + ']*$');\nconst PF_ONLY_WS_RE = new RegExp('^[' + PF_WS + ']+$');\nconst PF_NON_WS_RE = new RegExp('[^' + PF_WS + ']', 'gu');\nconst PF_SEP_RE = /[.\\-_'‘’`]/;\nconst PF_PART_RE = /[^.\\-_'‘’`]+/g;\nconst PF_MAX_TOKEN = 64;\nconst PF_MAX_RUN = 20;\nfunction pfLetters(word) {\n  return Array.from(word).map((ch) => (PF_CLASS[ch] ? '[' + PF_CLASS[ch] + ']' : ch) + '+').join('');\n}\nfunction pfAlt(list) {\n  return '(?:' + list.map(pfLetters).join('|') + ')';\n}\nfunction pfFilRoot(word) {\n  if (/^[aeiou]/.test(word)) return pfLetters(word);\n  const withInfix = (w) => pfLetters(w[0]) + '(?:in|um)?' + pfLetters(w.slice(1));\n  const syl = (word.match(/^[^aeiou]+[aeiou]+/) || [word[0]])[0];\n  return '(?:' + withInfix(syl) + ')?' + withInfix(word);\n}\nfunction pfPatterns(groups) {\n  const roots = { fil: [], en: [], none: [] };\n  for (const [group, affix, ...words] of PROFANITY_WORDS) {\n    if (groups[group]) for (const w of words) roots[affix].push(affix === 'fil' ? pfFilRoot(w) : pfLetters(w));\n  }\n  const alts = [];\n  if (roots.fil.length) alts.push(pfAlt(PF_FIL_PREFIXES) + '?(?:' + roots.fil.join('|') + ')' + pfAlt(PF_FIL_SUFFIXES) + '?');\n  if (roots.en.length) alts.push(pfAlt(PF_EN_PREFIXES) + '?(?:' + roots.en.join('|') + ')' + pfAlt(PF_EN_SUFFIXES) + '?');\n  if (roots.none.length) alts.push('(?:' + roots.none.join('|') + ')');\n  return {\n    token: alts.length ? '^(?:' + alts.join('|') + ')$' : '^(?!)$',\n    phrases: PROFANITY_PHRASES.filter(([g]) => groups[g]).map(([, a, b]) => ['^' + pfLetters(a) + '$', '^' + pfLetters(b) + '$']),\n  };\n}\nconst PF_PATTERNS = pfPatterns(PROFANITY_GROUPS);\nconst PF_TOKEN_RE = new RegExp(PF_PATTERNS.token);\nconst PF_PHRASE_RES = PF_PATTERNS.phrases.map(([a, b]) => [new RegExp(a), new RegExp(b)]);\nfunction pfNorm(s) {\n  return String(s).normalize('NFD').toLowerCase().replace(/[̀-ͯ.\\-_'‘’`]/g, '');\n}\nfunction pfIsWord(core) {\n  return core.length <= PF_MAX_TOKEN && PF_TOKEN_RE.test(pfNorm(core));\n}\nfunction pfMaskSpan(s) {\n  return String(s).replace(PF_NON_WS_RE, '*');\n}\nfunction findProfanity(text) {\n  if (typeof text !== 'string' || !text) return [];\n  const pieces = text.split(PF_DELIM_RE);   // even = word chunk, odd = delimiters\n  const chunks = [];\n  let pos = 0;\n  for (let i = 0; i < pieces.length; i++) {\n    const p = pieces[i];\n    if (i % 2 === 0 && p) {\n      const lead = PF_LEAD_RE.exec(p)[0].length;\n      const core = p.slice(lead, p.length - PF_TRAIL_RE.exec(p.slice(lead))[0].length);\n      chunks.push({ start: pos + lead, core, after: pieces[i + 1] || '', masked: false });\n    }\n    pos += p.length;\n  }\n  const spans = [];\n  const add = (start, end) => spans.push({ start, end });\n  for (const c of chunks) {\n    if (!c.core) continue;\n    if (pfIsWord(c.core)) { add(c.start, c.start + c.core.length); c.masked = true; continue; }\n    if (!PF_SEP_RE.test(c.core)) continue;\n    PF_PART_RE.lastIndex = 0;\n    let m;\n    while ((m = PF_PART_RE.exec(c.core))) {\n      if (pfIsWord(m[0])) { add(c.start + m.index, c.start + m.index + m[0].length); c.masked = true; }\n    }\n  }\n  const single = (c) => !c.masked && Array.from(c.core).length === 1;\n  for (let k = 0; k < chunks.length;) {\n    if (!single(chunks[k])) { k++; continue; }\n    let e = k;\n    while (e + 1 < chunks.length && single(chunks[e + 1]) && PF_ONLY_WS_RE.test(chunks[e].after)) e++;\n    for (let s = k; s <= e;) {\n      let len = Math.min(e - s + 1, PF_MAX_RUN);\n      for (; len >= 3; len--) {\n        if (pfIsWord(chunks.slice(s, s + len).map((c) => c.core).join(''))) break;\n      }\n      if (len >= 3) {\n        const last = chunks[s + len - 1];\n        add(chunks[s].start, last.start + last.core.length);\n        for (let j = s; j < s + len; j++) chunks[j].masked = true;\n        s += len;\n      } else {\n        s++;\n      }\n    }\n    k = e + 1;\n  }\n  for (let k = 0; k + 1 < chunks.length; k++) {\n    const a = chunks[k];\n    const b = chunks[k + 1];\n    if (a.masked || b.masked || !a.core || !b.core || !PF_ONLY_WS_RE.test(a.after)) continue;\n    const na = pfNorm(a.core);\n    const nb = pfNorm(b.core);\n    if (PF_PHRASE_RES.some(([ra, rb]) => ra.test(na) && rb.test(nb))) {\n      add(a.start, b.start + b.core.length);\n      a.masked = true;\n      b.masked = true;\n      k++;\n    }\n  }\n  spans.sort((x, y) => x.start - y.start);\n  return spans.map((s) => ({ start: s.start, end: s.end, text: text.slice(s.start, s.end) }));\n}\nfunction maskProfanity(text) {\n  if (typeof text !== 'string' || !text) return text;\n  const spans = findProfanity(text);\n  if (!spans.length) return text;\n  let out = '';\n  let pos = 0;\n  for (const s of spans) {\n    out += text.slice(pos, s.start) + pfMaskSpan(s.text);\n    pos = s.end;\n  }\n  return out + text.slice(pos);\n}\nfunction profaneKeyword(word) {\n  return typeof word === 'string' && (word.includes('*') || maskProfanity(word) !== word);\n}\n// end of sexual-word filter\n\nconst data = $input.first().json;\n\n// website_review uses the page's term, others the current term\nlet correctedTermId = data.current_term_id;\ntry {\n  const cb = $('sast-manual-correction1').first().json.body || {};\n  const ct = typeof cb.term_id === 'string' ? cb.term_id.trim().toLowerCase() : '';\n  if (cb.correction_source === 'website_review'\n      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(ct)) {\n    correctedTermId = ct;\n  }\n} catch (e) {}\n\nlet instructorFirstName = '';\nlet instructorLastName = '';\ntry {\n  const ins = $('get instructor id7').first().json;\n  instructorFirstName = ins.first_name ?? '';\n  instructorLastName  = ins.last_name  ?? '';\n} catch(e) {}\nconst dbInstructorName = `${instructorFirstName} ${instructorLastName}`.trim();\nconst rawInstructorName = data.raw.instructor ?? '';\n\nlet subjectName = '';\nlet departmentId = null;\ntry {\n  const subj = $('get subject id6').first().json;\n  subjectName  = subj.subject_name ?? '';\n  departmentId = subj.department_id ?? null;\n} catch(e) {}\n\nlet rawSubjectName = '';\ntry {\n  rawSubjectName = $('sast-manual-correction1').first().json.body.subject ?? '';\n} catch(e) {}\n\nlet existingScanImageId = null;\ntry {\n  existingScanImageId = $('get existing scan image id').first().json.scan_image_id ?? null;\n} catch(e) {}\n\nreturn [{\n  json: {\n    instructor_ID:          data.raw.instructor_ID,\n    'Student ID':           data.raw.student_id ?? '',\n    'Instructor/Professor': dbInstructorName || rawInstructorName,\n    'Subject Taught':       subjectName || rawSubjectName,\n    'AY/Semester':          '',\n    M1:  data.raw.m1  ?? 0,  M2:  data.raw.m2  ?? 0,\n    M3:  data.raw.m3  ?? 0,  M4:  data.raw.m4  ?? 0,\n    M5:  data.raw.m5  ?? 0,  M6:  data.raw.m6  ?? 0,\n    M7:  data.raw.m7  ?? 0,  M8:  data.raw.m8  ?? 0,\n    M9:  data.raw.m9  ?? 0,  M10: data.raw.m10 ?? 0,\n    P1:  data.raw.p1  ?? 0,  P2:  data.raw.p2  ?? 0,\n    P3:  data.raw.p3  ?? 0,  P4:  data.raw.p4  ?? 0,\n    P5:  data.raw.p5  ?? 0,  P6:  data.raw.p6  ?? 0,\n    P7:  data.raw.p7  ?? 0,  P8:  data.raw.p8  ?? 0,\n    P9:  data.raw.p9  ?? 0,  P10: data.raw.p10 ?? 0,\n    'Remarks & Suggestions': maskProfanity(data.raw.Remarks_and_Suggestions ?? ''),\n    Date:                   data.raw.submitted_date ?? '',\n    current_term_id:        correctedTermId,\n    true_subject_id:        data.raw.subject_id,\n    department_id:          departmentId,\n    task_id:                data.raw.task_id ?? null,\n    source:                 'scan',\n    existing_scan_image_id:  existingScanImageId,\n    raw: {\n      m1:  data.raw.m1  ?? 0,  m2:  data.raw.m2  ?? 0,\n      m3:  data.raw.m3  ?? 0,  m4:  data.raw.m4  ?? 0,\n      m5:  data.raw.m5  ?? 0,  m6:  data.raw.m6  ?? 0,\n      m7:  data.raw.m7  ?? 0,  m8:  data.raw.m8  ?? 0,\n      m9:  data.raw.m9  ?? 0,  m10: data.raw.m10 ?? 0,\n      p1:  data.raw.p1  ?? 0,  p2:  data.raw.p2  ?? 0,\n      p3:  data.raw.p3  ?? 0,  p4:  data.raw.p4  ?? 0,\n      p5:  data.raw.p5  ?? 0,  p6:  data.raw.p6  ?? 0,\n      p7:  data.raw.p7  ?? 0,  p8:  data.raw.p8  ?? 0,\n      p9:  data.raw.p9  ?? 0,  p10: data.raw.p10 ?? 0,\n      Remarks_and_Suggestions: maskProfanity(data.raw.Remarks_and_Suggestions ?? ''),\n      sao_staff_id:       data.raw.sao_staff_id   ?? null,\n      student_id:         data.raw.student_id      ?? '',\n      instructor:         data.raw.instructor      ?? '',\n      submitted_date:     data.raw.submitted_date  ?? new Date().toISOString().split('T')[0],\n      instructor_ID:      data.raw.instructor_ID   ?? null,\n      term_id:            correctedTermId          ?? null,\n      subject_id:         data.raw.subject_id      ?? null,\n      validation_status:  'corrected',\n      manually_corrected: true,\n      task_id:            data.raw.task_id         ?? null,\n    },\n    failed_scan_id: data.raw.failed_scan_id ?? null,\n  }\n}];\n"
+        "jsCode": "// sexual-word filter, from website_src/profanity.js\nconst PROFANITY_GROUPS = {\n  sexual: true,\n  fuck: true,            // masked even when used as a plain curse\n  sexual_curses: false,  // puta, tangina etc. stay allowed like other curses\n};\nconst PROFANITY_WORDS = [\n  ['sexual', 'fil', 'iyot', 'iyut'],\n  ['sexual', 'fil', 'bilat'],\n  ['sexual', 'fil', 'oten', 'otin', 'uten', 'utin'],\n  ['sexual', 'fil', 'salsal'],\n  ['sexual', 'none', 'puday'],\n  ['sexual', 'none', 'tamod', 'tamud'],\n  ['sexual', 'none', 'bayag'],\n  ['sexual', 'fil', 'kantot', 'kantut'],\n  ['sexual', 'fil', 'hindot', 'hindut'],\n  ['sexual', 'fil', 'jakol', 'jakul', 'dyakol'],\n  ['sexual', 'fil', 'tsupa', 'chupa'],\n  ['sexual', 'none', 'burat', 'titi', 'tite', 'etits'],             // exact only, titi+ng = katiting\n  ['sexual', 'none', 'puke', 'puki', 'pekpek', 'kepyas', 'kipay'],\n  ['sexual', 'none', 'betlog'],\n  ['sexual', 'none', 'pussy', 'pussies', 'cunt', 'cunts'],\n  ['sexual', 'none', 'boobs', 'boobies', 'tits', 'titties'],\n  ['sexual', 'none', 'porn', 'porno', 'blowjob', 'blowjobs', 'handjob', 'handjobs'],\n  ['sexual', 'none', 'horny', 'dildo', 'dildos', 'jizz'],\n  ['fuck', 'en', 'fuck', 'fuk', 'fck', 'phuck'],\n  ['fuck', 'none', 'fak', 'pakyu', 'pakshet', 'pakshit'],           // exact only, fak+ing = faking\n  ['sexual_curses', 'none', 'puta', 'pota', 'putangina', 'potangina', 'putanginamo', 'tangina', 'tanginamo'],\n  ['sexual_curses', 'none', 'whore', 'whores', 'slut', 'sluts'],\n];\nconst PROFANITY_PHRASES = [\n  ['fuck', 'pak', 'yu'], ['fuck', 'pak', 'you'],\n  ['sexual_curses', 'putang', 'ina'], ['sexual_curses', 'potang', 'ina'], ['sexual_curses', 'tang', 'ina'],\n];\nconst PF_CLASS = { a: 'a4@*', e: 'e3*', i: 'i1!|*', o: 'o0*', u: 'uv*', s: 's5$', t: 't7', l: 'l1|', b: 'b8' };\nconst PF_FIL_PREFIXES = ['gi', 'gina', 'gipa', 'ga', 'na', 'nag', 'naga', 'nagka', 'naka', 'nakaka', 'nang', 'nan',\n  'ni', 'ma', 'mag', 'maga', 'magka', 'maka', 'mang', 'man', 'mi', 'pa', 'pag', 'pang', 'paka', 'ka', 'kina',\n  'i', 'ipa', 'in', 'um', 'nakig', 'makig', 'pakig'];\nconst PF_FIL_SUFFIXES = ['an', 'han', 'on', 'hon', 'a', 'ha', 'ay', 'in', 'hin', 'ero', 'era', 'eros', 'eras'];\nconst PF_EN_PREFIXES = ['mother', 'motha', 'mutha', 'muther', 'mada'];\nconst PF_EN_SUFFIXES = ['s', 'ing', 'in', 'ed', 'er', 'ers', 'face', 'head'];\nconst PF_WS = ' \\\\t\\\\n\\\\r\\\\f\\\\v\\\\u00A0\\\\u1680\\\\u2000-\\\\u200A\\\\u2028\\\\u2029\\\\u202F\\\\u205F\\\\u3000\\\\uFEFF';\nconst PF_WORDCH = 'A-Za-z0-9\\\\u00C0-\\\\u024F\\\\u1E00-\\\\u1EFF@$';\nconst PF_DELIM_RE = new RegExp('([' + PF_WS + ',;:/\\\\\\\\()\\\\[\\\\]{}\"\\\\u201C\\\\u201D\\\\u00AB\\\\u00BB<>?]+)');\nconst PF_LEAD_RE = new RegExp('^[^' + PF_WORDCH + ']*');\nconst PF_TRAIL_RE = new RegExp('[^' + PF_WORDCH + ']*$');\nconst PF_ONLY_WS_RE = new RegExp('^[' + PF_WS + ']+$');\nconst PF_NON_WS_RE = new RegExp('[^' + PF_WS + ']', 'gu');\nconst PF_SEP_RE = /[.\\-_'‘’`]/;\nconst PF_PART_RE = /[^.\\-_'‘’`]+/g;\nconst PF_MAX_TOKEN = 64;\nconst PF_MAX_RUN = 20;\nfunction pfLetters(word) {\n  return Array.from(word).map((ch) => (PF_CLASS[ch] ? '[' + PF_CLASS[ch] + ']' : ch) + '+').join('');\n}\nfunction pfAlt(list) {\n  return '(?:' + list.map(pfLetters).join('|') + ')';\n}\nfunction pfFilRoot(word) {\n  if (/^[aeiou]/.test(word)) return pfLetters(word);\n  const withInfix = (w) => pfLetters(w[0]) + '(?:in|um)?' + pfLetters(w.slice(1));\n  const syl = (word.match(/^[^aeiou]+[aeiou]+/) || [word[0]])[0];\n  return '(?:' + withInfix(syl) + ')?' + withInfix(word);\n}\nfunction pfPatterns(groups) {\n  const roots = { fil: [], en: [], none: [] };\n  for (const [group, affix, ...words] of PROFANITY_WORDS) {\n    if (groups[group]) for (const w of words) roots[affix].push(affix === 'fil' ? pfFilRoot(w) : pfLetters(w));\n  }\n  const alts = [];\n  if (roots.fil.length) alts.push(pfAlt(PF_FIL_PREFIXES) + '?(?:' + roots.fil.join('|') + ')' + pfAlt(PF_FIL_SUFFIXES) + '?');\n  if (roots.en.length) alts.push(pfAlt(PF_EN_PREFIXES) + '?(?:' + roots.en.join('|') + ')' + pfAlt(PF_EN_SUFFIXES) + '?');\n  if (roots.none.length) alts.push('(?:' + roots.none.join('|') + ')');\n  return {\n    token: alts.length ? '^(?:' + alts.join('|') + ')$' : '^(?!)$',\n    phrases: PROFANITY_PHRASES.filter(([g]) => groups[g]).map(([, a, b]) => ['^' + pfLetters(a) + '$', '^' + pfLetters(b) + '$']),\n  };\n}\nconst PF_PATTERNS = pfPatterns(PROFANITY_GROUPS);\nconst PF_TOKEN_RE = new RegExp(PF_PATTERNS.token);\nconst PF_PHRASE_RES = PF_PATTERNS.phrases.map(([a, b]) => [new RegExp(a), new RegExp(b)]);\nfunction pfNorm(s) {\n  return String(s).normalize('NFD').toLowerCase().replace(/[̀-ͯ.\\-_'‘’`]/g, '');\n}\nfunction pfIsWord(core) {\n  return core.length <= PF_MAX_TOKEN && PF_TOKEN_RE.test(pfNorm(core));\n}\nfunction pfMaskSpan(s) {\n  return String(s).replace(PF_NON_WS_RE, '*');\n}\nfunction findProfanity(text) {\n  if (typeof text !== 'string' || !text) return [];\n  const pieces = text.split(PF_DELIM_RE);   // even = word chunk, odd = delimiters\n  const chunks = [];\n  let pos = 0;\n  for (let i = 0; i < pieces.length; i++) {\n    const p = pieces[i];\n    if (i % 2 === 0 && p) {\n      const lead = PF_LEAD_RE.exec(p)[0].length;\n      const core = p.slice(lead, p.length - PF_TRAIL_RE.exec(p.slice(lead))[0].length);\n      chunks.push({ start: pos + lead, core, after: pieces[i + 1] || '', masked: false });\n    }\n    pos += p.length;\n  }\n  const spans = [];\n  const add = (start, end) => spans.push({ start, end });\n  for (const c of chunks) {\n    if (!c.core) continue;\n    if (pfIsWord(c.core)) { add(c.start, c.start + c.core.length); c.masked = true; continue; }\n    if (!PF_SEP_RE.test(c.core)) continue;\n    PF_PART_RE.lastIndex = 0;\n    let m;\n    while ((m = PF_PART_RE.exec(c.core))) {\n      if (pfIsWord(m[0])) { add(c.start + m.index, c.start + m.index + m[0].length); c.masked = true; }\n    }\n  }\n  const single = (c) => !c.masked && Array.from(c.core).length === 1;\n  for (let k = 0; k < chunks.length;) {\n    if (!single(chunks[k])) { k++; continue; }\n    let e = k;\n    while (e + 1 < chunks.length && single(chunks[e + 1]) && PF_ONLY_WS_RE.test(chunks[e].after)) e++;\n    for (let s = k; s <= e;) {\n      let len = Math.min(e - s + 1, PF_MAX_RUN);\n      for (; len >= 3; len--) {\n        if (pfIsWord(chunks.slice(s, s + len).map((c) => c.core).join(''))) break;\n      }\n      if (len >= 3) {\n        const last = chunks[s + len - 1];\n        add(chunks[s].start, last.start + last.core.length);\n        for (let j = s; j < s + len; j++) chunks[j].masked = true;\n        s += len;\n      } else {\n        s++;\n      }\n    }\n    k = e + 1;\n  }\n  for (let k = 0; k + 1 < chunks.length; k++) {\n    const a = chunks[k];\n    const b = chunks[k + 1];\n    if (a.masked || b.masked || !a.core || !b.core || !PF_ONLY_WS_RE.test(a.after)) continue;\n    const na = pfNorm(a.core);\n    const nb = pfNorm(b.core);\n    if (PF_PHRASE_RES.some(([ra, rb]) => ra.test(na) && rb.test(nb))) {\n      add(a.start, b.start + b.core.length);\n      a.masked = true;\n      b.masked = true;\n      k++;\n    }\n  }\n  spans.sort((x, y) => x.start - y.start);\n  return spans.map((s) => ({ start: s.start, end: s.end, text: text.slice(s.start, s.end) }));\n}\nfunction maskProfanity(text) {\n  if (typeof text !== 'string' || !text) return text;\n  const spans = findProfanity(text);\n  if (!spans.length) return text;\n  let out = '';\n  let pos = 0;\n  for (const s of spans) {\n    out += text.slice(pos, s.start) + pfMaskSpan(s.text);\n    pos = s.end;\n  }\n  return out + text.slice(pos);\n}\nfunction profaneKeyword(word) {\n  return typeof word === 'string' && (word.includes('*') || maskProfanity(word) !== word);\n}\n// end of sexual-word filter\n\nconst data = $input.first().json;\n\n// website_review uses the page's term, others the current term\nlet correctedTermId = data.current_term_id;\ntry {\n  const cb = $('sast-manual-correction1').first().json.body || {};\n  const ct = typeof cb.term_id === 'string' ? cb.term_id.trim().toLowerCase() : '';\n  if (cb.correction_source === 'website_review'\n      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(ct)) {\n    correctedTermId = ct;\n  }\n} catch (e) {}\n\nlet instructorFirstName = '';\nlet instructorLastName = '';\ntry {\n  const ins = $('get instructor id7').first().json;\n  instructorFirstName = ins.first_name ?? '';\n  instructorLastName  = ins.last_name  ?? '';\n} catch(e) {}\nconst dbInstructorName = `${instructorFirstName} ${instructorLastName}`.trim();\nconst rawInstructorName = data.raw.instructor ?? '';\n\nlet subjectName = '';\nlet departmentId = null;\ntry {\n  const subj = $('get subject id6').first().json;\n  subjectName  = subj.subject_name ?? '';\n  departmentId = subj.department_id ?? null;\n} catch(e) {}\n\nlet rawSubjectName = '';\ntry {\n  rawSubjectName = $('sast-manual-correction1').first().json.body.subject ?? '';\n} catch(e) {}\n\nlet existingScanImageId = null;\ntry {\n  existingScanImageId = $('get existing scan image id').first().json.scan_image_id ?? null;\n} catch(e) {}\n\nreturn [{\n  json: {\n    instructor_ID:          data.raw.instructor_ID,\n    'Student ID':           data.raw.student_id ?? '',\n    'Instructor/Professor': dbInstructorName || rawInstructorName,\n    'Subject Taught':       subjectName || rawSubjectName,\n    'AY/Semester':          '',\n    M1:  data.raw.m1  ?? null,  M2:  data.raw.m2  ?? null,\n    M3:  data.raw.m3  ?? null,  M4:  data.raw.m4  ?? null,\n    M5:  data.raw.m5  ?? null,  M6:  data.raw.m6  ?? null,\n    M7:  data.raw.m7  ?? null,  M8:  data.raw.m8  ?? null,\n    M9:  data.raw.m9  ?? null,  M10: data.raw.m10 ?? null,\n    P1:  data.raw.p1  ?? null,  P2:  data.raw.p2  ?? null,\n    P3:  data.raw.p3  ?? null,  P4:  data.raw.p4  ?? null,\n    P5:  data.raw.p5  ?? null,  P6:  data.raw.p6  ?? null,\n    P7:  data.raw.p7  ?? null,  P8:  data.raw.p8  ?? null,\n    P9:  data.raw.p9  ?? null,  P10: data.raw.p10 ?? null,\n    'Remarks & Suggestions': maskProfanity(data.raw.Remarks_and_Suggestions ?? ''),\n    Date:                   data.raw.submitted_date ?? '',\n    current_term_id:        correctedTermId,\n    true_subject_id:        data.raw.subject_id,\n    department_id:          departmentId,\n    task_id:                data.raw.task_id ?? null,\n    source:                 'scan',\n    existing_scan_image_id:  existingScanImageId,\n    raw: {\n      m1:  data.raw.m1  ?? null,  m2:  data.raw.m2  ?? null,\n      m3:  data.raw.m3  ?? null,  m4:  data.raw.m4  ?? null,\n      m5:  data.raw.m5  ?? null,  m6:  data.raw.m6  ?? null,\n      m7:  data.raw.m7  ?? null,  m8:  data.raw.m8  ?? null,\n      m9:  data.raw.m9  ?? null,  m10: data.raw.m10 ?? null,\n      p1:  data.raw.p1  ?? null,  p2:  data.raw.p2  ?? null,\n      p3:  data.raw.p3  ?? null,  p4:  data.raw.p4  ?? null,\n      p5:  data.raw.p5  ?? null,  p6:  data.raw.p6  ?? null,\n      p7:  data.raw.p7  ?? null,  p8:  data.raw.p8  ?? null,\n      p9:  data.raw.p9  ?? null,  p10: data.raw.p10 ?? null,\n      Remarks_and_Suggestions: maskProfanity(data.raw.Remarks_and_Suggestions ?? ''),\n      sao_staff_id:       data.raw.sao_staff_id   ?? null,\n      student_id:         data.raw.student_id      ?? '',\n      instructor:         data.raw.instructor      ?? '',\n      submitted_date:     data.raw.submitted_date  ?? new Date().toISOString().split('T')[0],\n      instructor_ID:      data.raw.instructor_ID   ?? null,\n      term_id:            correctedTermId          ?? null,\n      subject_id:         data.raw.subject_id      ?? null,\n      validation_status:  'corrected',\n      manually_corrected: true,\n      task_id:            data.raw.task_id         ?? null,\n    },\n    failed_scan_id: data.raw.failed_scan_id ?? null,\n  }\n}];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -3419,7 +3041,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// sexual-word filter, from website_src/profanity.js\nconst PROFANITY_GROUPS = {\n  sexual: true,\n  fuck: true,            // masked even when used as a plain curse\n  sexual_curses: false,  // puta, tangina etc. stay allowed like other curses\n};\nconst PROFANITY_WORDS = [\n  ['sexual', 'fil', 'iyot', 'iyut'],\n  ['sexual', 'fil', 'bilat'],\n  ['sexual', 'fil', 'oten', 'otin', 'uten', 'utin'],\n  ['sexual', 'fil', 'salsal'],\n  ['sexual', 'none', 'puday'],\n  ['sexual', 'none', 'tamod', 'tamud'],\n  ['sexual', 'none', 'bayag'],\n  ['sexual', 'fil', 'kantot', 'kantut'],\n  ['sexual', 'fil', 'hindot', 'hindut'],\n  ['sexual', 'fil', 'jakol', 'jakul', 'dyakol'],\n  ['sexual', 'fil', 'tsupa', 'chupa'],\n  ['sexual', 'none', 'burat', 'titi', 'tite', 'etits'],             // exact only, titi+ng = katiting\n  ['sexual', 'none', 'puke', 'puki', 'pekpek', 'kepyas', 'kipay'],\n  ['sexual', 'none', 'betlog'],\n  ['sexual', 'none', 'pussy', 'pussies', 'cunt', 'cunts'],\n  ['sexual', 'none', 'boobs', 'boobies', 'tits', 'titties'],\n  ['sexual', 'none', 'porn', 'porno', 'blowjob', 'blowjobs', 'handjob', 'handjobs'],\n  ['sexual', 'none', 'horny', 'dildo', 'dildos', 'jizz'],\n  ['fuck', 'en', 'fuck', 'fuk', 'fck', 'phuck'],\n  ['fuck', 'none', 'fak', 'pakyu', 'pakshet', 'pakshit'],           // exact only, fak+ing = faking\n  ['sexual_curses', 'none', 'puta', 'pota', 'putangina', 'potangina', 'putanginamo', 'tangina', 'tanginamo'],\n  ['sexual_curses', 'none', 'whore', 'whores', 'slut', 'sluts'],\n];\nconst PROFANITY_PHRASES = [\n  ['fuck', 'pak', 'yu'], ['fuck', 'pak', 'you'],\n  ['sexual_curses', 'putang', 'ina'], ['sexual_curses', 'potang', 'ina'], ['sexual_curses', 'tang', 'ina'],\n];\nconst PF_CLASS = { a: 'a4@*', e: 'e3*', i: 'i1!|*', o: 'o0*', u: 'uv*', s: 's5$', t: 't7', l: 'l1|', b: 'b8' };\nconst PF_FIL_PREFIXES = ['gi', 'gina', 'gipa', 'ga', 'na', 'nag', 'naga', 'nagka', 'naka', 'nakaka', 'nang', 'nan',\n  'ni', 'ma', 'mag', 'maga', 'magka', 'maka', 'mang', 'man', 'mi', 'pa', 'pag', 'pang', 'paka', 'ka', 'kina',\n  'i', 'ipa', 'in', 'um', 'nakig', 'makig', 'pakig'];\nconst PF_FIL_SUFFIXES = ['an', 'han', 'on', 'hon', 'a', 'ha', 'ay', 'in', 'hin', 'ero', 'era', 'eros', 'eras'];\nconst PF_EN_PREFIXES = ['mother', 'motha', 'mutha', 'muther', 'mada'];\nconst PF_EN_SUFFIXES = ['s', 'ing', 'in', 'ed', 'er', 'ers', 'face', 'head'];\nconst PF_WS = ' \\\\t\\\\n\\\\r\\\\f\\\\v\\\\u00A0\\\\u1680\\\\u2000-\\\\u200A\\\\u2028\\\\u2029\\\\u202F\\\\u205F\\\\u3000\\\\uFEFF';\nconst PF_WORDCH = 'A-Za-z0-9\\\\u00C0-\\\\u024F\\\\u1E00-\\\\u1EFF@$';\nconst PF_DELIM_RE = new RegExp('([' + PF_WS + ',;:/\\\\\\\\()\\\\[\\\\]{}\"\\\\u201C\\\\u201D\\\\u00AB\\\\u00BB<>?]+)');\nconst PF_LEAD_RE = new RegExp('^[^' + PF_WORDCH + ']*');\nconst PF_TRAIL_RE = new RegExp('[^' + PF_WORDCH + ']*$');\nconst PF_ONLY_WS_RE = new RegExp('^[' + PF_WS + ']+$');\nconst PF_NON_WS_RE = new RegExp('[^' + PF_WS + ']', 'gu');\nconst PF_SEP_RE = /[.\\-_'‘’`]/;\nconst PF_PART_RE = /[^.\\-_'‘’`]+/g;\nconst PF_MAX_TOKEN = 64;\nconst PF_MAX_RUN = 20;\nfunction pfLetters(word) {\n  return Array.from(word).map((ch) => (PF_CLASS[ch] ? '[' + PF_CLASS[ch] + ']' : ch) + '+').join('');\n}\nfunction pfAlt(list) {\n  return '(?:' + list.map(pfLetters).join('|') + ')';\n}\nfunction pfFilRoot(word) {\n  if (/^[aeiou]/.test(word)) return pfLetters(word);\n  const withInfix = (w) => pfLetters(w[0]) + '(?:in|um)?' + pfLetters(w.slice(1));\n  const syl = (word.match(/^[^aeiou]+[aeiou]+/) || [word[0]])[0];\n  return '(?:' + withInfix(syl) + ')?' + withInfix(word);\n}\nfunction pfPatterns(groups) {\n  const roots = { fil: [], en: [], none: [] };\n  for (const [group, affix, ...words] of PROFANITY_WORDS) {\n    if (groups[group]) for (const w of words) roots[affix].push(affix === 'fil' ? pfFilRoot(w) : pfLetters(w));\n  }\n  const alts = [];\n  if (roots.fil.length) alts.push(pfAlt(PF_FIL_PREFIXES) + '?(?:' + roots.fil.join('|') + ')' + pfAlt(PF_FIL_SUFFIXES) + '?');\n  if (roots.en.length) alts.push(pfAlt(PF_EN_PREFIXES) + '?(?:' + roots.en.join('|') + ')' + pfAlt(PF_EN_SUFFIXES) + '?');\n  if (roots.none.length) alts.push('(?:' + roots.none.join('|') + ')');\n  return {\n    token: alts.length ? '^(?:' + alts.join('|') + ')$' : '^(?!)$',\n    phrases: PROFANITY_PHRASES.filter(([g]) => groups[g]).map(([, a, b]) => ['^' + pfLetters(a) + '$', '^' + pfLetters(b) + '$']),\n  };\n}\nconst PF_PATTERNS = pfPatterns(PROFANITY_GROUPS);\nconst PF_TOKEN_RE = new RegExp(PF_PATTERNS.token);\nconst PF_PHRASE_RES = PF_PATTERNS.phrases.map(([a, b]) => [new RegExp(a), new RegExp(b)]);\nfunction pfNorm(s) {\n  return String(s).normalize('NFD').toLowerCase().replace(/[̀-ͯ.\\-_'‘’`]/g, '');\n}\nfunction pfIsWord(core) {\n  return core.length <= PF_MAX_TOKEN && PF_TOKEN_RE.test(pfNorm(core));\n}\nfunction pfMaskSpan(s) {\n  return String(s).replace(PF_NON_WS_RE, '*');\n}\nfunction findProfanity(text) {\n  if (typeof text !== 'string' || !text) return [];\n  const pieces = text.split(PF_DELIM_RE);   // even = word chunk, odd = delimiters\n  const chunks = [];\n  let pos = 0;\n  for (let i = 0; i < pieces.length; i++) {\n    const p = pieces[i];\n    if (i % 2 === 0 && p) {\n      const lead = PF_LEAD_RE.exec(p)[0].length;\n      const core = p.slice(lead, p.length - PF_TRAIL_RE.exec(p.slice(lead))[0].length);\n      chunks.push({ start: pos + lead, core, after: pieces[i + 1] || '', masked: false });\n    }\n    pos += p.length;\n  }\n  const spans = [];\n  const add = (start, end) => spans.push({ start, end });\n  for (const c of chunks) {\n    if (!c.core) continue;\n    if (pfIsWord(c.core)) { add(c.start, c.start + c.core.length); c.masked = true; continue; }\n    if (!PF_SEP_RE.test(c.core)) continue;\n    PF_PART_RE.lastIndex = 0;\n    let m;\n    while ((m = PF_PART_RE.exec(c.core))) {\n      if (pfIsWord(m[0])) { add(c.start + m.index, c.start + m.index + m[0].length); c.masked = true; }\n    }\n  }\n  const single = (c) => !c.masked && Array.from(c.core).length === 1;\n  for (let k = 0; k < chunks.length;) {\n    if (!single(chunks[k])) { k++; continue; }\n    let e = k;\n    while (e + 1 < chunks.length && single(chunks[e + 1]) && PF_ONLY_WS_RE.test(chunks[e].after)) e++;\n    for (let s = k; s <= e;) {\n      let len = Math.min(e - s + 1, PF_MAX_RUN);\n      for (; len >= 3; len--) {\n        if (pfIsWord(chunks.slice(s, s + len).map((c) => c.core).join(''))) break;\n      }\n      if (len >= 3) {\n        const last = chunks[s + len - 1];\n        add(chunks[s].start, last.start + last.core.length);\n        for (let j = s; j < s + len; j++) chunks[j].masked = true;\n        s += len;\n      } else {\n        s++;\n      }\n    }\n    k = e + 1;\n  }\n  for (let k = 0; k + 1 < chunks.length; k++) {\n    const a = chunks[k];\n    const b = chunks[k + 1];\n    if (a.masked || b.masked || !a.core || !b.core || !PF_ONLY_WS_RE.test(a.after)) continue;\n    const na = pfNorm(a.core);\n    const nb = pfNorm(b.core);\n    if (PF_PHRASE_RES.some(([ra, rb]) => ra.test(na) && rb.test(nb))) {\n      add(a.start, b.start + b.core.length);\n      a.masked = true;\n      b.masked = true;\n      k++;\n    }\n  }\n  spans.sort((x, y) => x.start - y.start);\n  return spans.map((s) => ({ start: s.start, end: s.end, text: text.slice(s.start, s.end) }));\n}\nfunction maskProfanity(text) {\n  if (typeof text !== 'string' || !text) return text;\n  const spans = findProfanity(text);\n  if (!spans.length) return text;\n  let out = '';\n  let pos = 0;\n  for (const s of spans) {\n    out += text.slice(pos, s.start) + pfMaskSpan(s.text);\n    pos = s.end;\n  }\n  return out + text.slice(pos);\n}\nfunction profaneKeyword(word) {\n  return typeof word === 'string' && (word.includes('*') || maskProfanity(word) !== word);\n}\n// end of sexual-word filter\n\nconst body = $('import-error-correction1').first().json.body;\nconst subjectRow = $('get subject id5').first().json;\nconst raw        = body.raw_data || {};\n\nlet instructorFirstName = '';\nlet instructorLastName = '';\ntry {\n  const ins = $('get instructor id9').first().json;\n  instructorFirstName = ins.first_name ?? '';\n  instructorLastName  = ins.last_name  ?? '';\n} catch(e) {}\nconst dbInstructorName = `${instructorFirstName} ${instructorLastName}`.trim();\nconst rawInstructorName = body.instructor || raw['Instructor/Professor'] || raw.instructor_name || '';\n\nconst dbSubjectName = subjectRow.subject_name ?? '';\nconst rawSubjectName = raw['Subject Taught'] || raw.subject_name || '';\n\nlet existingScanImageId = null;\ntry {\n  existingScanImageId = $('get existing scan image id1').first().json.scan_image_id ?? null;\n} catch(e) {}\n\nconst source = existingScanImageId ? 'scan' : 'google_sheet';\nconst taskId = body.task_id ?? raw.task_id ?? null;\n\nreturn [{\n  json: {\n    true_subject_id:        body.corrected_subject_id,\n    department_id:          subjectRow.department_id,\n    instructor_ID:          body.corrected_instructor_id,\n    current_term_id:        body.term_id,\n    existing_scan_image_id:  existingScanImageId,\n    row_number: 1,\n    'Student ID':           raw['Student ID']           || raw.student_id       || '',\n    'Instructor/Professor': dbInstructorName || rawInstructorName,\n    'Subject Taught':       dbSubjectName || rawSubjectName,\n    'AY/Semester':          raw['AY/Semester']          || raw.ay_semester      || '',\n    Date:                   raw['Date']                 || raw.date             || '',\n    M1:  Number(raw.M1  ?? raw.m1  ?? 0),\n    M2:  Number(raw.M2  ?? raw.m2  ?? 0),\n    M3:  Number(raw.M3  ?? raw.m3  ?? 0),\n    M4:  Number(raw.M4  ?? raw.m4  ?? 0),\n    M5:  Number(raw.M5  ?? raw.m5  ?? 0),\n    M6:  Number(raw.M6  ?? raw.m6  ?? 0),\n    M7:  Number(raw.M7  ?? raw.m7  ?? 0),\n    M8:  Number(raw.M8  ?? raw.m8  ?? 0),\n    M9:  Number(raw.M9  ?? raw.m9  ?? 0),\n    M10: Number(raw.M10 ?? raw.m10 ?? 0),\n    P1:  Number(raw.P1  ?? raw.p1  ?? 0),\n    P2:  Number(raw.P2  ?? raw.p2  ?? 0),\n    P3:  Number(raw.P3  ?? raw.p3  ?? 0),\n    P4:  Number(raw.P4  ?? raw.p4  ?? 0),\n    P5:  Number(raw.P5  ?? raw.p5  ?? 0),\n    P6:  Number(raw.P6  ?? raw.p6  ?? 0),\n    P7:  Number(raw.P7  ?? raw.p7  ?? 0),\n    P8:  Number(raw.P8  ?? raw.p8  ?? 0),\n    P9:  Number(raw.P9  ?? raw.p9  ?? 0),\n    P10: Number(raw.P10 ?? raw.p10 ?? 0),\n    'Remarks & Suggestions': maskProfanity(raw['Remarks & Suggestions'] || raw.remarks || ''),\n    import_error_id: body.import_error_id,\n    resolved_by:     body.resolved_by,\n    source:  source,\n    task_id: taskId,\n  }\n}];\n"
+        "jsCode": "// SAST rating, from website_src/rating.js\nfunction rating(v) {\n  if (typeof v === 'string') v = v.trim();\n  else if (typeof v !== 'number') return null;\n  if (v === '') return null;\n  const n = Number(v);\n  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null;\n}\n// end of SAST rating\n\n// sexual-word filter, from website_src/profanity.js\nconst PROFANITY_GROUPS = {\n  sexual: true,\n  fuck: true,            // masked even when used as a plain curse\n  sexual_curses: false,  // puta, tangina etc. stay allowed like other curses\n};\nconst PROFANITY_WORDS = [\n  ['sexual', 'fil', 'iyot', 'iyut'],\n  ['sexual', 'fil', 'bilat'],\n  ['sexual', 'fil', 'oten', 'otin', 'uten', 'utin'],\n  ['sexual', 'fil', 'salsal'],\n  ['sexual', 'none', 'puday'],\n  ['sexual', 'none', 'tamod', 'tamud'],\n  ['sexual', 'none', 'bayag'],\n  ['sexual', 'fil', 'kantot', 'kantut'],\n  ['sexual', 'fil', 'hindot', 'hindut'],\n  ['sexual', 'fil', 'jakol', 'jakul', 'dyakol'],\n  ['sexual', 'fil', 'tsupa', 'chupa'],\n  ['sexual', 'none', 'burat', 'titi', 'tite', 'etits'],             // exact only, titi+ng = katiting\n  ['sexual', 'none', 'puke', 'puki', 'pekpek', 'kepyas', 'kipay'],\n  ['sexual', 'none', 'betlog'],\n  ['sexual', 'none', 'pussy', 'pussies', 'cunt', 'cunts'],\n  ['sexual', 'none', 'boobs', 'boobies', 'tits', 'titties'],\n  ['sexual', 'none', 'porn', 'porno', 'blowjob', 'blowjobs', 'handjob', 'handjobs'],\n  ['sexual', 'none', 'horny', 'dildo', 'dildos', 'jizz'],\n  ['fuck', 'en', 'fuck', 'fuk', 'fck', 'phuck'],\n  ['fuck', 'none', 'fak', 'pakyu', 'pakshet', 'pakshit'],           // exact only, fak+ing = faking\n  ['sexual_curses', 'none', 'puta', 'pota', 'putangina', 'potangina', 'putanginamo', 'tangina', 'tanginamo'],\n  ['sexual_curses', 'none', 'whore', 'whores', 'slut', 'sluts'],\n];\nconst PROFANITY_PHRASES = [\n  ['fuck', 'pak', 'yu'], ['fuck', 'pak', 'you'],\n  ['sexual_curses', 'putang', 'ina'], ['sexual_curses', 'potang', 'ina'], ['sexual_curses', 'tang', 'ina'],\n];\nconst PF_CLASS = { a: 'a4@*', e: 'e3*', i: 'i1!|*', o: 'o0*', u: 'uv*', s: 's5$', t: 't7', l: 'l1|', b: 'b8' };\nconst PF_FIL_PREFIXES = ['gi', 'gina', 'gipa', 'ga', 'na', 'nag', 'naga', 'nagka', 'naka', 'nakaka', 'nang', 'nan',\n  'ni', 'ma', 'mag', 'maga', 'magka', 'maka', 'mang', 'man', 'mi', 'pa', 'pag', 'pang', 'paka', 'ka', 'kina',\n  'i', 'ipa', 'in', 'um', 'nakig', 'makig', 'pakig'];\nconst PF_FIL_SUFFIXES = ['an', 'han', 'on', 'hon', 'a', 'ha', 'ay', 'in', 'hin', 'ero', 'era', 'eros', 'eras'];\nconst PF_EN_PREFIXES = ['mother', 'motha', 'mutha', 'muther', 'mada'];\nconst PF_EN_SUFFIXES = ['s', 'ing', 'in', 'ed', 'er', 'ers', 'face', 'head'];\nconst PF_WS = ' \\\\t\\\\n\\\\r\\\\f\\\\v\\\\u00A0\\\\u1680\\\\u2000-\\\\u200A\\\\u2028\\\\u2029\\\\u202F\\\\u205F\\\\u3000\\\\uFEFF';\nconst PF_WORDCH = 'A-Za-z0-9\\\\u00C0-\\\\u024F\\\\u1E00-\\\\u1EFF@$';\nconst PF_DELIM_RE = new RegExp('([' + PF_WS + ',;:/\\\\\\\\()\\\\[\\\\]{}\"\\\\u201C\\\\u201D\\\\u00AB\\\\u00BB<>?]+)');\nconst PF_LEAD_RE = new RegExp('^[^' + PF_WORDCH + ']*');\nconst PF_TRAIL_RE = new RegExp('[^' + PF_WORDCH + ']*$');\nconst PF_ONLY_WS_RE = new RegExp('^[' + PF_WS + ']+$');\nconst PF_NON_WS_RE = new RegExp('[^' + PF_WS + ']', 'gu');\nconst PF_SEP_RE = /[.\\-_'‘’`]/;\nconst PF_PART_RE = /[^.\\-_'‘’`]+/g;\nconst PF_MAX_TOKEN = 64;\nconst PF_MAX_RUN = 20;\nfunction pfLetters(word) {\n  return Array.from(word).map((ch) => (PF_CLASS[ch] ? '[' + PF_CLASS[ch] + ']' : ch) + '+').join('');\n}\nfunction pfAlt(list) {\n  return '(?:' + list.map(pfLetters).join('|') + ')';\n}\nfunction pfFilRoot(word) {\n  if (/^[aeiou]/.test(word)) return pfLetters(word);\n  const withInfix = (w) => pfLetters(w[0]) + '(?:in|um)?' + pfLetters(w.slice(1));\n  const syl = (word.match(/^[^aeiou]+[aeiou]+/) || [word[0]])[0];\n  return '(?:' + withInfix(syl) + ')?' + withInfix(word);\n}\nfunction pfPatterns(groups) {\n  const roots = { fil: [], en: [], none: [] };\n  for (const [group, affix, ...words] of PROFANITY_WORDS) {\n    if (groups[group]) for (const w of words) roots[affix].push(affix === 'fil' ? pfFilRoot(w) : pfLetters(w));\n  }\n  const alts = [];\n  if (roots.fil.length) alts.push(pfAlt(PF_FIL_PREFIXES) + '?(?:' + roots.fil.join('|') + ')' + pfAlt(PF_FIL_SUFFIXES) + '?');\n  if (roots.en.length) alts.push(pfAlt(PF_EN_PREFIXES) + '?(?:' + roots.en.join('|') + ')' + pfAlt(PF_EN_SUFFIXES) + '?');\n  if (roots.none.length) alts.push('(?:' + roots.none.join('|') + ')');\n  return {\n    token: alts.length ? '^(?:' + alts.join('|') + ')$' : '^(?!)$',\n    phrases: PROFANITY_PHRASES.filter(([g]) => groups[g]).map(([, a, b]) => ['^' + pfLetters(a) + '$', '^' + pfLetters(b) + '$']),\n  };\n}\nconst PF_PATTERNS = pfPatterns(PROFANITY_GROUPS);\nconst PF_TOKEN_RE = new RegExp(PF_PATTERNS.token);\nconst PF_PHRASE_RES = PF_PATTERNS.phrases.map(([a, b]) => [new RegExp(a), new RegExp(b)]);\nfunction pfNorm(s) {\n  return String(s).normalize('NFD').toLowerCase().replace(/[̀-ͯ.\\-_'‘’`]/g, '');\n}\nfunction pfIsWord(core) {\n  return core.length <= PF_MAX_TOKEN && PF_TOKEN_RE.test(pfNorm(core));\n}\nfunction pfMaskSpan(s) {\n  return String(s).replace(PF_NON_WS_RE, '*');\n}\nfunction findProfanity(text) {\n  if (typeof text !== 'string' || !text) return [];\n  const pieces = text.split(PF_DELIM_RE);   // even = word chunk, odd = delimiters\n  const chunks = [];\n  let pos = 0;\n  for (let i = 0; i < pieces.length; i++) {\n    const p = pieces[i];\n    if (i % 2 === 0 && p) {\n      const lead = PF_LEAD_RE.exec(p)[0].length;\n      const core = p.slice(lead, p.length - PF_TRAIL_RE.exec(p.slice(lead))[0].length);\n      chunks.push({ start: pos + lead, core, after: pieces[i + 1] || '', masked: false });\n    }\n    pos += p.length;\n  }\n  const spans = [];\n  const add = (start, end) => spans.push({ start, end });\n  for (const c of chunks) {\n    if (!c.core) continue;\n    if (pfIsWord(c.core)) { add(c.start, c.start + c.core.length); c.masked = true; continue; }\n    if (!PF_SEP_RE.test(c.core)) continue;\n    PF_PART_RE.lastIndex = 0;\n    let m;\n    while ((m = PF_PART_RE.exec(c.core))) {\n      if (pfIsWord(m[0])) { add(c.start + m.index, c.start + m.index + m[0].length); c.masked = true; }\n    }\n  }\n  const single = (c) => !c.masked && Array.from(c.core).length === 1;\n  for (let k = 0; k < chunks.length;) {\n    if (!single(chunks[k])) { k++; continue; }\n    let e = k;\n    while (e + 1 < chunks.length && single(chunks[e + 1]) && PF_ONLY_WS_RE.test(chunks[e].after)) e++;\n    for (let s = k; s <= e;) {\n      let len = Math.min(e - s + 1, PF_MAX_RUN);\n      for (; len >= 3; len--) {\n        if (pfIsWord(chunks.slice(s, s + len).map((c) => c.core).join(''))) break;\n      }\n      if (len >= 3) {\n        const last = chunks[s + len - 1];\n        add(chunks[s].start, last.start + last.core.length);\n        for (let j = s; j < s + len; j++) chunks[j].masked = true;\n        s += len;\n      } else {\n        s++;\n      }\n    }\n    k = e + 1;\n  }\n  for (let k = 0; k + 1 < chunks.length; k++) {\n    const a = chunks[k];\n    const b = chunks[k + 1];\n    if (a.masked || b.masked || !a.core || !b.core || !PF_ONLY_WS_RE.test(a.after)) continue;\n    const na = pfNorm(a.core);\n    const nb = pfNorm(b.core);\n    if (PF_PHRASE_RES.some(([ra, rb]) => ra.test(na) && rb.test(nb))) {\n      add(a.start, b.start + b.core.length);\n      a.masked = true;\n      b.masked = true;\n      k++;\n    }\n  }\n  spans.sort((x, y) => x.start - y.start);\n  return spans.map((s) => ({ start: s.start, end: s.end, text: text.slice(s.start, s.end) }));\n}\nfunction maskProfanity(text) {\n  if (typeof text !== 'string' || !text) return text;\n  const spans = findProfanity(text);\n  if (!spans.length) return text;\n  let out = '';\n  let pos = 0;\n  for (const s of spans) {\n    out += text.slice(pos, s.start) + pfMaskSpan(s.text);\n    pos = s.end;\n  }\n  return out + text.slice(pos);\n}\nfunction profaneKeyword(word) {\n  return typeof word === 'string' && (word.includes('*') || maskProfanity(word) !== word);\n}\n// end of sexual-word filter\n\nconst body = $('import-error-correction1').first().json.body;\nconst subjectRow = $('get subject id5').first().json;\nconst raw        = body.raw_data || {};\n\nlet instructorFirstName = '';\nlet instructorLastName = '';\ntry {\n  const ins = $('get instructor id9').first().json;\n  instructorFirstName = ins.first_name ?? '';\n  instructorLastName  = ins.last_name  ?? '';\n} catch(e) {}\nconst dbInstructorName = `${instructorFirstName} ${instructorLastName}`.trim();\nconst rawInstructorName = body.instructor || raw['Instructor/Professor'] || raw.instructor_name || '';\n\nconst dbSubjectName = subjectRow.subject_name ?? '';\nconst rawSubjectName = raw['Subject Taught'] || raw.subject_name || '';\n\nlet existingScanImageId = null;\ntry {\n  existingScanImageId = $('get existing scan image id1').first().json.scan_image_id ?? null;\n} catch(e) {}\n\nconst source = existingScanImageId ? 'scan' : 'google_sheet';\nconst taskId = body.task_id ?? raw.task_id ?? null;\n\nreturn [{\n  json: {\n    true_subject_id:        body.corrected_subject_id,\n    department_id:          subjectRow.department_id,\n    instructor_ID:          body.corrected_instructor_id,\n    current_term_id:        body.term_id,\n    existing_scan_image_id:  existingScanImageId,\n    row_number: 1,\n    'Student ID':           raw['Student ID']           || raw.student_id       || '',\n    'Instructor/Professor': dbInstructorName || rawInstructorName,\n    'Subject Taught':       dbSubjectName || rawSubjectName,\n    'AY/Semester':          raw['AY/Semester']          || raw.ay_semester      || '',\n    Date:                   raw['Date']                 || raw.date             || '',\n    M1:  rating(raw.M1  ?? raw.m1),\n    M2:  rating(raw.M2  ?? raw.m2),\n    M3:  rating(raw.M3  ?? raw.m3),\n    M4:  rating(raw.M4  ?? raw.m4),\n    M5:  rating(raw.M5  ?? raw.m5),\n    M6:  rating(raw.M6  ?? raw.m6),\n    M7:  rating(raw.M7  ?? raw.m7),\n    M8:  rating(raw.M8  ?? raw.m8),\n    M9:  rating(raw.M9  ?? raw.m9),\n    M10: rating(raw.M10 ?? raw.m10),\n    P1:  rating(raw.P1  ?? raw.p1),\n    P2:  rating(raw.P2  ?? raw.p2),\n    P3:  rating(raw.P3  ?? raw.p3),\n    P4:  rating(raw.P4  ?? raw.p4),\n    P5:  rating(raw.P5  ?? raw.p5),\n    P6:  rating(raw.P6  ?? raw.p6),\n    P7:  rating(raw.P7  ?? raw.p7),\n    P8:  rating(raw.P8  ?? raw.p8),\n    P9:  rating(raw.P9  ?? raw.p9),\n    P10: rating(raw.P10 ?? raw.p10),\n    'Remarks & Suggestions': maskProfanity(raw['Remarks & Suggestions'] || raw.remarks || ''),\n    import_error_id: body.import_error_id,\n    resolved_by:     body.resolved_by,\n    source:  source,\n    task_id: taskId,\n  }\n}];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4420,7 +4042,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Same fields as 'Map to Target Format3', credited to the batch.\nconst d = $('Website Decide').first(0).json;\nconst rec = $('Website Reconcile OCR OMR').first(0).json;\n\nconst result = {};\nresult['instructor_ID'] = d.instructor_id;\nresult['true_subject_id'] = d.subject_id;\nresult['current_term_id'] = d.term_id;\nresult['scan_image'] = null;           // website rows never reach import_errors\nresult['review_reasons'] = [];\nresult['omr_comparisons'] = rec.comparisons || null;\nresult['review_note'] = d.review_note || null;\nresult['task_id'] = d.task_id;\n\nresult['Student ID'] = d.student_id || '';\nresult['Instructor/Professor'] = d.instructor_name || '';\nresult['Subject Taught'] = d.subject_name || d.subject_code || '';\nresult['AY/Semester'] = rec.ay_semester || '';\nresult['Remarks & Suggestions'] = d.remark || '';\n// YYYY-MM-DD so the date never shifts with the server timezone\nresult['Date'] = d.submitted_date;\n\nfor (let i = 1; i <= 10; i++) {\n  // blank row -> 0, stored as NULL later\n  result[`M${i}`] = d.ratings?.[`m${i}`] ?? 0;\n  result[`P${i}`] = d.ratings?.[`p${i}`] ?? 0;\n}\n\nreturn [{ json: result }];\n"
+        "jsCode": "// Same fields as 'Map to Target Format3', credited to the batch.\nconst d = $('Website Decide').first(0).json;\nconst rec = $('Website Reconcile OCR OMR').first(0).json;\n\nconst result = {};\nresult['instructor_ID'] = d.instructor_id;\nresult['true_subject_id'] = d.subject_id;\nresult['current_term_id'] = d.term_id;\nresult['scan_image'] = null;           // website rows never reach import_errors\nresult['review_reasons'] = [];\nresult['omr_comparisons'] = rec.comparisons || null;\nresult['review_note'] = d.review_note || null;\nresult['task_id'] = d.task_id;\n\nresult['Student ID'] = d.student_id || '';\nresult['Instructor/Professor'] = d.instructor_name || '';\nresult['Subject Taught'] = d.subject_name || d.subject_code || '';\nresult['AY/Semester'] = rec.ay_semester || '';\nresult['Remarks & Suggestions'] = d.remark || '';\n// YYYY-MM-DD so the date never shifts with the server timezone\nresult['Date'] = d.submitted_date;\n\nfor (let i = 1; i <= 10; i++) {\n  // blank row stays null (stored as NULL, never 0)\n  result[`M${i}`] = d.ratings?.[`m${i}`] ?? null;\n  result[`P${i}`] = d.ratings?.[`p${i}`] ?? null;\n}\n\nreturn [{ json: result }];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4672,28 +4294,6 @@
         ]
       ]
     },
-    "Management Node1": {
-      "main": [
-        [
-          {
-            "node": "calculate mangement1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Performance1": {
-      "main": [
-        [
-          {
-            "node": "calculate performance1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Loop Over Items3": {
       "main": [
         [
@@ -4712,72 +4312,9 @@
         ]
       ]
     },
-    "Loop Over Items4": {
-      "main": [
-        [
-          {
-            "node": "Code in JavaScript8",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "send to managment table1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Loop Over Items5": {
-      "main": [
-        [
-          {
-            "node": "calc1",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "send to performance node1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "send to managment table1": {
-      "main": [
-        [
-          {
-            "node": "Loop Over Items4",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "send to performance node1": {
-      "main": [
-        [
-          {
-            "node": "Loop Over Items5",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "update to overall total2": {
       "main": [
         [
-          {
-            "node": "update to overall_question_means2",
-            "type": "main",
-            "index": 0
-          },
           {
             "node": "If28",
             "type": "main",
@@ -4890,22 +4427,6 @@
         ]
       ]
     },
-    "update to overall total3": {
-      "main": [
-        [
-          {
-            "node": "update to overall_question_means3",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "If28",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Health Check Webhook1": {
       "main": [
         [
@@ -5010,39 +4531,6 @@
         [
           {
             "node": "Respond to Webhook5",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "calculate performance1": {
-      "main": [
-        [
-          {
-            "node": "Loop Over Items5",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "calc1": {
-      "main": [
-        [
-          {
-            "node": "update to overall total3",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "calculate mangement1": {
-      "main": [
-        [
-          {
-            "node": "Loop Over Items4",
             "type": "main",
             "index": 0
           }
@@ -6185,12 +5673,7 @@
       "main": [
         [
           {
-            "node": "Management Node1",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Performance1",
+            "node": "Code in JavaScript8",
             "type": "main",
             "index": 0
           }

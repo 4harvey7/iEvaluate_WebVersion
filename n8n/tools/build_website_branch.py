@@ -2,6 +2,9 @@
 """Build n8n/perfect-101-website.json from the original n8n export.
 
 Re-runnable:  python build_website_branch.py [INPUT_JSON] [OUTPUT_JSON] [LAYOUT_JSON]
+Live export:  python build_website_branch.py --live LIVE_EXPORT_JSON [OUTPUT_JSON]
+              applies only step 6 below (apply_sast_v2) to a live n8n export of this build
+              (e.g. 'perfect 2.1.json' -> ../perfect-2.1.json); ids/positions/name/id kept.
 
 Defaults:
   INPUT  = C:\\Users\\rodzh\\Downloads\\perfect 101 (4).json   (read only, never modified)
@@ -47,15 +50,13 @@ What it does
          executions only); adds batch_id and the website partial_data.
        * 'Respond to Webhook': website executions get the backend contract object;
          phone executions get exactly the same text as before.
-       * Aggregate fix: 'send to managment table1' / 'send to performance node1'
-         recompute from ALL raw rows (recompute_aggregates.sql), and the
-         Management/Performance chain starts from the "done" output of the raw
-         upsert loop ('Loop Over Items3' -> 'Raw Upsert Done'). Every upsert result goes
+       * Aggregate fix: the aggregates start from the "done" output of the raw
+         upsert loop ('Loop Over Items3' -> 'Raw Upsert Done'; see 6. for the chain
+         after it). Every upsert result goes
          back into the loop (a failed batch no longer stops it), rows are upserted
          independently (queryBatching 'independently'; the earlier 'independent' ran no
          query at all and returned 0 items, which dead-ended the loop), the upsert has
-         alwaysOutputData so an empty run still re-feeds the loop, and the recompute
-         holds a global advisory lock.
+         alwaysOutputData so an empty run still re-feeds the loop.
        * 'Loop Over Items8' (grouped remark AI) is fed back once per group: only by
          'insert data to student remarks2' (the critical-remark alert branch no longer
          feeds Wait1).
@@ -101,6 +102,17 @@ What it does
      apikey/Authorization headers use the credential "Supabase iEvaluate (secret key)"
      (type Supabase API). Credentials are referenced by name AND by the live credential id
      (from the live export), so a re-import into the same n8n keeps them linked.
+  6. Migration 013 (apply_sast_v2; needs public.recompute_sast in the database first):
+       * One aggregate path: 'Raw Upsert Done' -> 'Code in JavaScript8' (unique instructor+term
+         pairs) -> 'update to overall total2' running SELECT * FROM public.recompute_sast($1, $2)
+         -> 'If28'. The two parallel Management/Performance chains (same recompute twice, If28 and
+         its push alerts fired twice) are removed: Management Node1, Performance1, calculate
+         mangement1/performance1, Loop Over Items4/5, send to managment table1/performance node1,
+         calc1, update to overall total3, update to overall_question_means2/3.
+       * Blank ratings stay NULL, never 0 (CHECK 1..5): website_src/rating.js (integer 1..5, else
+         null) in 'Code in JavaScript', '2. Format Final Results1', 'build the record1' and
+         'Map target1'; 'Map to Target Format3', 'Website Map to Target Format' and 'Map target'
+         default a missing rating to null.
 """
 from __future__ import annotations
 
@@ -180,6 +192,29 @@ RAW_SKIP_IF = "Raw Row Already Stored?"      # website rows: skip the shared ups
 RAW_UPSERT_BATCHING = "independently"        # exact n8n Postgres v2 option value (NOT 'independent')
 AGG_CHAIN_HEADS = ["Management Node1", "Performance1"]
 
+# SAST aggregates (migration 013): ONE call of public.recompute_sast per (instructor, term) rebuilds
+# management_results, performance_results, overall_total_survey, overall_question_means and the
+# instructor_subjects links from the raw rows (blanks = NULL, excluded). Replaces the two parallel
+# Management/Performance chains (both ran the same recompute, and each ran 'overall total' -> If28,
+# so every low-score alert was pushed twice). See apply_sast_recompute_flow.
+SAST_PAIRS = "Code in JavaScript8"             # unique {instructor_id, term_id} from If1 (kept as is)
+SAST_RECOMPUTE = "update to overall total2"    # reused (same credentials), now runs recompute_sast
+SAST_ALERT_IF = "If28"                         # combined_score_mean < 3 -> department head / phone alerts
+SAST_RECOMPUTE_SQL = "SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);\n"
+SAST_RECOMPUTE_PARAMS = "={{ [$json.instructor_id, $json.term_id] }}"
+SAST_DEAD_NODES = [
+    "Management Node1", "Performance1", "calculate mangement1", "calculate performance1",
+    "Loop Over Items4", "Loop Over Items5", "send to managment table1", "send to performance node1",
+    "calc1", "update to overall total3", "update to overall_question_means2", "update to overall_question_means3",
+]
+# Rating nodes: a blank answer stays NULL (never 0); anything outside 1..5 becomes NULL before the
+# insert (the table gets CHECK 1..5 in migration 013). See patch_null_ratings / website_src/rating.js.
+FORMAT_FINAL = "2. Format Final Results1"
+PHONE_MAP = "Map to Target Format3"
+WEBSITE_MAP = "Website Map to Target Format"
+CORRECTION_BUILD = "build the record1"
+NODE_REF_RE = re.compile(r"""\$\(\s*(['"])(.+?)\1\s*\)|\$node\[\s*(['"])(.+?)\3\s*\]""")
+
 # Grouped remark AI loop (Google Sheet imports, If21 true branch).
 REMARK_LOOP = "Loop Over Items8"
 REMARK_LOOP_WAIT = "Wait1"                   # Wait1 -> Loop Over Items8 (next group)
@@ -222,6 +257,7 @@ HELPER_HEADERS = {
     "remark_verify.js": "remark re-check",
     "name_match.js": "name matcher",
     "layout_check.js": "layout check",
+    "rating.js": "SAST rating",
 }
 # Known names for the main Gemini OCR prompt: a new Postgres node right before the Gemini call;
 # Gemini returns the raw reading plus its closest known entry. Phone: instructors + subjects
@@ -1088,26 +1124,18 @@ def apply_main_flow_aggregate_fix(out):
     """Phone / sheet / correction / website: recompute aggregates from the raw
     table, strictly after the raw upsert of the execution.
 
-    * 'send to managment table1' and 'send to performance node1' keep their names,
-      inputs and outputs but run recompute_aggregates.sql for the (instructor,
-      term, subject) of each item from 'calculate mangement1' / 'calculate
-      performance1'; the per-execution totals in those items are ignored.
     * Ordering: with executionOrder v1, If1's branches run in canvas order, so the
       raw upsert only ran first because 'Code in JavaScript' sat highest on the
       canvas. Now 'If1' no longer feeds 'Management Node1' / 'Performance1'; they
       are fed by 'Raw Upsert Done' on the "done" output of 'Loop Over Items3'.
+    * The aggregate chain itself is replaced afterwards by apply_sast_recompute_flow
+      (Raw Upsert Done -> Code in JavaScript8 -> recompute_sast -> If28); the old
+      'send to ...' nodes (recompute_aggregates.sql) are removed there.
     """
     by_name = {n["name"]: n for n in out["nodes"]}
     for name in [*MAIN_RECOMPUTE_NODES, RAW_LOOP, "If1", "Insert or update rows in a table1", *AGG_CHAIN_HEADS]:
         if name not in by_name:
             raise SystemExit(f"Input workflow has no node named {name!r}")
-    sql = read("recompute_aggregates.sql")
-    assert_no_param_in_sql_comments("recompute_aggregates.sql", sql)
-    for name in MAIN_RECOMPUTE_NODES:
-        p = by_name[name]["parameters"]
-        p["query"] = sql
-        p.setdefault("options", {})["queryReplacement"] = \
-            "={{ [ $json.instructor_id, $json.term_id ?? null, $json.subject_id ] }}"
 
     conns = out["connections"]
     if1_main = conns["If1"]["main"]
@@ -1153,9 +1181,225 @@ def apply_main_flow_aggregate_fix(out):
     add_connection(conns, RAW_LOOP, 1, RAW_SKIP_IF, 0)
     add_connection(conns, RAW_SKIP_IF, 0, RAW_LOOP, 0)
     add_connection(conns, RAW_SKIP_IF, 1, RAW_UPSERT, 0)
-    # recompute: explicit transaction mode (the advisory lock in the SQL is held until commit)
-    for name in MAIN_RECOMPUTE_NODES:
-        by_name[name]["parameters"]["options"]["queryBatching"] = "transaction"
+
+
+def apply_sast_recompute_flow(out):
+    """One aggregate path after the raw upsert (needs migration 013: public.recompute_sast).
+
+    Before: 'Raw Upsert Done' fed two parallel chains, Management Node1 -> calculate mangement1 ->
+    Loop Over Items4 -> send to managment table1 (-> done: Code in JavaScript8 -> update to overall
+    total2 -> update to overall_question_means2 + If28) and the same for Performance1 (-> calc1 ->
+    update to overall total3 -> ...means3 + If28). Both 'send to ...' nodes ran the same recompute
+    (both tables, twice), the calculate* means were discarded, and 'overall total' ran twice, so
+    If28 pushed every low-score alert twice.
+
+    After: Raw Upsert Done -> Code in JavaScript8 (unique {instructor_id, term_id} from If1) ->
+    'update to overall total2' running SELECT * FROM public.recompute_sast($1, $2) (one row per
+    pair: instructor_id, term_id, total_responses, management/performance/combined_score_mean) ->
+    If28 (reads $json.combined_score_mean and $json.instructor_id). The 12 dead nodes are removed.
+    Works on the build output and on a live export of that build (node ids/positions untouched)."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    missing = [n for n in [RAW_UPSERT_GATE, SAST_PAIRS, SAST_RECOMPUTE, SAST_ALERT_IF, *SAST_DEAD_NODES]
+               if n not in by_name]
+    if missing:
+        raise SystemExit(f"apply_sast_recompute_flow: no node named {missing} (already applied?)")
+    conns = out["connections"]
+
+    def tg(name, idx=0):
+        lists = conns.get(name, {}).get("main", [])
+        return sorted(c["node"] for c in (lists[idx] if idx < len(lists) else []) or [])
+    # the chain must be exactly the one described above (a hand edit in n8n is never overwritten)
+    expected = {(RAW_UPSERT_GATE, 0): sorted(AGG_CHAIN_HEADS),
+                (SAST_PAIRS, 0): [SAST_RECOMPUTE],
+                (SAST_RECOMPUTE, 0): sorted(["update to overall_question_means2", SAST_ALERT_IF]),
+                ("Loop Over Items4", 0): [SAST_PAIRS]}
+    wrong = {f"{k[0]}[{k[1]}]": tg(*k) for k, v in expected.items() if tg(*k) != v}
+    if wrong:
+        raise SystemExit(f"apply_sast_recompute_flow: aggregate chain changed: {wrong}")
+    dead = set(SAST_DEAD_NODES)
+    refs = sorted({f"{n['name']} -> {m.group(2) or m.group(4)}" for n in out["nodes"] if n["name"] not in dead
+                   for s in _strings(n.get("parameters", {})) for m in NODE_REF_RE.finditer(s)
+                   if (m.group(2) or m.group(4)) in dead})
+    if refs:
+        raise SystemExit(f"apply_sast_recompute_flow: kept nodes reference removed nodes: {refs}")
+
+    out["nodes"] = [n for n in out["nodes"] if n["name"] not in dead]
+    remove_node_connections(conns, SAST_DEAD_NODES)
+    conns[RAW_UPSERT_GATE]["main"][0] = []
+    add_connection(conns, RAW_UPSERT_GATE, 0, SAST_PAIRS, 0)
+    conns[SAST_RECOMPUTE]["main"] = [[]]
+    add_connection(conns, SAST_RECOMPUTE, 0, SAST_ALERT_IF, 0)
+
+    node = by_name[SAST_RECOMPUTE]
+    p = node["parameters"]
+    p["operation"] = "executeQuery"
+    p["query"] = SAST_RECOMPUTE_SQL
+    p.setdefault("options", {})["queryReplacement"] = SAST_RECOMPUTE_PARAMS
+    node["onError"] = "continueRegularOutput"
+
+
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
+def _with_rating(code: str, where: str) -> str:
+    """Put website_src/rating.js in front of a node's code (once)."""
+    if "function rating(" in code:
+        raise SystemExit(f"{where}: already contains rating(); the input changed")
+    return helper_block("rating.js") + "\n" + code
+
+
+FORMAT_FINAL_OLD = """// The reconciler emits a flat object, m1..m10 / p1..p10, where null means both
+// engines agreed the row is genuinely blank. Downstream arithmetic sums these,
+// so a blank has to become 0, not null.
+let answered = 0;
+let sum = 0;
+for (let i = 1; i <= 10; i++) {
+  for (const prefix of ['m', 'p']) {
+    const key = `${prefix}${i}`;
+    const v = ratings[key];
+    const score = (v === null || v === undefined) ? 0 : Number(v) || 0;
+    result[key] = score;
+    if (score > 0) { answered++; sum += score; }
+  }
+}
+
+// Recomputed from the reconciled values. Python's own summary predates the
+// blank-filling, so reusing it would disagree with the scores just above it.
+result.answered    = answered;
+result.total_score = sum;
+result.average     = answered ? Number((sum / answered).toFixed(2)) : 0;
+result.percent     = Number(((sum / (20 * 5)) * 100).toFixed(2));
+"""
+FORMAT_FINAL_NEW = """// The reconciler emits a flat object, m1..m10 / p1..p10, where null means both
+// engines agreed the row is genuinely blank. A blank stays null (stored as NULL,
+// never 0): the database means skip NULLs, and a 0 would fail its CHECK (1..5).
+let answered = 0;
+let sum = 0;
+for (let i = 1; i <= 10; i++) {
+  for (const prefix of ['m', 'p']) {
+    const key = `${prefix}${i}`;
+    const score = rating(ratings[key]);
+    result[key] = score;
+    if (score !== null) { answered++; sum += score; }
+  }
+}
+
+// Recomputed from the reconciled values, over the answered rows only (blanks
+// are skipped, not counted as 0).
+result.answered    = answered;
+result.total_score = sum;
+result.average     = answered ? Number((sum / answered).toFixed(2)) : null;
+result.percent     = answered ? Number((sum / (answered * 5) * 100).toFixed(2)) : null;
+"""
+
+
+def patch_null_ratings(out):
+    """Blank / invalid ratings stay NULL all the way to the raw row (never 0). Every mapper that
+    used to turn a missing rating into 0 now keeps null, and every node that reads ratings typed
+    or sent by a client uses rating() (website_src/rating.js): an integer 1..5, else null. The
+    Flutter app and the website backend send 0 for a blank row: rating(0) = null.
+    'Code in JavaScript' (the last step before the shared raw upsert, every path goes through it)
+    applies rating() to all 20 columns, so nothing outside 1..5 reaches the CHECK constraint."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in [CODE_IN_JS, FORMAT_FINAL, PHONE_MAP, WEBSITE_MAP, CORRECTION_BUILD, *CORRECTION_MAPS]:
+        if name not in by_name:
+            raise SystemExit(f"patch_null_ratings: no node named {name!r}")
+
+    def code_of(name):
+        return by_name[name]["parameters"]["jsCode"]
+
+    def set_code(name, code):
+        by_name[name]["parameters"]["jsCode"] = code
+
+    # 'Code in JavaScript': Number(r['M1']) || null -> rating(r['M1'])   (0/'blank'/6 -> null)
+    code = code_of(CODE_IN_JS)
+    for p in "mp":
+        for i in range(1, 11):
+            code = replace_once(code, f"      {p}{i}: Number(r['{p.upper()}{i}']) || null,\n",
+                                f"      {p}{i}: rating(r['{p.upper()}{i}']),\n", CODE_IN_JS)
+    set_code(CODE_IN_JS, _with_rating(code, CODE_IN_JS))
+
+    # '2. Format Final Results1' (phone scan): blank -> null, stats over the answered rows only
+    set_code(FORMAT_FINAL, _with_rating(replace_once(code_of(FORMAT_FINAL), FORMAT_FINAL_OLD, FORMAT_FINAL_NEW,
+                                                     FORMAT_FINAL), FORMAT_FINAL))
+
+    # 'Map to Target Format3' (phone scan): a missing score defaults to null, not 0
+    code = code_of(PHONE_MAP)
+    for p in "mp":
+        code = replace_once(
+            code,
+            f"result[`{p.upper()}${{i}}`] = formattedResults[`{p}${{i}}`] !== undefined ? formattedResults[`{p}${{i}}`] : 0;",
+            f"result[`{p.upper()}${{i}}`] = formattedResults[`{p}${{i}}`] !== undefined ? formattedResults[`{p}${{i}}`] : null;",
+            PHONE_MAP)
+    set_code(PHONE_MAP, code)
+
+    # 'Website Map to Target Format': ?? 0 -> ?? null (website_src/website_map_to_target.js). The build
+    # generates it from the source already; a live export still has the old code.
+    want = read_js("website_map_to_target.js")
+    code = code_of(WEBSITE_MAP)
+    if code != want:
+        code = replace_once(code, "  // blank row -> 0, stored as NULL later\n",
+                            "  // blank row stays null (stored as NULL, never 0)\n", WEBSITE_MAP)
+        code = replace_once(code, "d.ratings?.[`m${i}`] ?? 0;", "d.ratings?.[`m${i}`] ?? null;", WEBSITE_MAP)
+        code = replace_once(code, "d.ratings?.[`p${i}`] ?? 0;", "d.ratings?.[`p${i}`] ?? null;", WEBSITE_MAP)
+        if code != want:
+            raise SystemExit(f"{WEBSITE_MAP}: code differs from website_src/website_map_to_target.js")
+        set_code(WEBSITE_MAP, code)
+
+    # 'build the record1' (sast-manual-correction): parseInt(..) || 0 -> rating(..)
+    code = code_of(CORRECTION_BUILD)
+    for p in "mp":
+        code = replace_once(code, f"scores[`{p}${{i}}`] = parseInt(body[`{p}${{i}}`]) || 0;",
+                            f"scores[`{p}${{i}}`] = rating(body[`{p}${{i}}`]);", CORRECTION_BUILD)
+    set_code(CORRECTION_BUILD, _with_rating(code, CORRECTION_BUILD))
+
+    # 'Map target' (sast-manual-correction): data.raw.mN ?? 0 -> ?? null (top level M/P and raw.*)
+    code, n = re.subn(r"(data\.raw\.[mp]\d+\s*\?\?) 0\b", r"\1 null", code_of("Map target"))
+    if n != 40:
+        raise SystemExit(f"Map target: expected 40 'data.raw.mN ?? 0', found {n}; the input changed")
+    set_code("Map target", code)
+
+    # 'Map target1' (import-error-correction): Number(raw.M1 ?? raw.m1 ?? 0) -> rating(raw.M1 ?? raw.m1)
+    code, n = re.subn(r"Number\((raw\.[MP]\d+\s*\?\?\s*raw\.[mp]\d+)\s*\?\?\s*0\)", r"rating(\1)",
+                      code_of("Map target1"))
+    if n != 20:
+        raise SystemExit(f"Map target1: expected 20 'Number(raw.MN ?? raw.mN ?? 0)', found {n}; the input changed")
+    set_code("Map target1", _with_rating(code, "Map target1"))
+
+
+SAST_ALERT_EXPR = ("={{ $json.combined_score_mean !== null && $json.combined_score_mean !== undefined "
+                   "&& $json.combined_score_mean !== '' && Number($json.combined_score_mean) < 3 }}")
+
+
+def patch_alert_if(out):
+    """recompute_sast returns combined_score_mean = NULL when no form is answered; with loose type
+    validation the old 'number lt 3' coerced NULL to 0 and pushed a false 'below 3.0' alert (numerics
+    may also arrive as strings). If28 is now true only for a real number below 3 (boolean 'true',
+    like the other boolean IFs). id, name, position and connections are unchanged."""
+    node = next((n for n in out["nodes"] if n["name"] == SAST_ALERT_IF), None)
+    if node is None:
+        raise SystemExit(f"Input workflow has no node named {SAST_ALERT_IF!r}")
+    conds = node["parameters"]["conditions"]["conditions"]
+    if len(conds) != 1 or conds[0]["leftValue"] != "={{ $json.combined_score_mean }}":
+        raise SystemExit(f"{SAST_ALERT_IF}: unexpected condition; the input changed")
+    conds[0]["leftValue"] = SAST_ALERT_EXPR
+    conds[0]["rightValue"] = ""
+    conds[0]["operator"] = {"type": "boolean", "operation": "true", "singleValue": True}
+
+
+def apply_sast_v2(out):
+    """Migration-013 workflow changes: one recompute_sast path + blanks stay NULL."""
+    apply_sast_recompute_flow(out)
+    patch_null_ratings(out)
+    patch_alert_if(out)
 
 
 def fix_remark_loop_single_feed(out):
@@ -1553,7 +1797,34 @@ def place_new_nodes(out, placed):
         by_name[CORRECTION_AFTER]["position"] = [r[0] + 224, r[1]]
 
 
+def live_main(argv):
+    """--live LIVE_EXPORT [OUTPUT]: apply only the migration-013 step (apply_sast_v2) to a live n8n
+    export of this build. Everything else (node ids, positions, credentials, name, id, versionId,
+    active) stays exactly as exported, so importing the result never rolls back newer live work."""
+    if not argv:
+        raise SystemExit("usage: build_website_branch.py --live LIVE_EXPORT_JSON [OUTPUT_JSON]")
+    src = Path(argv[0])
+    dst = Path(argv[1]) if len(argv) > 1 else HERE.parent / (src.stem.replace(" ", "-") + ".json")
+    if dst.resolve() == src.resolve():
+        raise SystemExit("output must differ from the live export (the export is never modified)")
+    wf = json.loads(src.read_text(encoding="utf-8"))
+    out = copy.deepcopy(wf)
+    apply_sast_v2(out)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    print(f"input : {src} (name {wf.get('name')!r}, id {wf.get('id')}, versionId {wf.get('versionId')})")
+    print(f"output: {dst}")
+    print(f"nodes : {len(wf['nodes'])} -> {len(out['nodes'])} (removed {len(SAST_DEAD_NODES)}: "
+          f"{', '.join(SAST_DEAD_NODES)})")
+    print(f"flow  : {RAW_UPSERT_GATE} -> {SAST_PAIRS} -> {SAST_RECOMPUTE} (recompute_sast) -> {SAST_ALERT_IF}")
+    print(f"null ratings: {CODE_IN_JS}, {FORMAT_FINAL}, {PHONE_MAP}, {WEBSITE_MAP}, {CORRECTION_BUILD}, "
+          f"{', '.join(CORRECTION_MAPS)}")
+    return 0
+
+
 def main(argv):
+    if len(argv) > 1 and argv[1] == "--live":
+        return live_main(argv[2:])
     src = Path(argv[1]) if len(argv) > 1 else DEFAULT_INPUT
     dst = Path(argv[2]) if len(argv) > 2 else DEFAULT_OUTPUT
     layout = Path(argv[3]) if len(argv) > 3 else DEFAULT_LAYOUT
@@ -1633,6 +1904,9 @@ def main(argv):
     for s, o, t, i in WEBSITE_CONNECTIONS:
         add_connection(out["connections"], s, o, t, i)
 
+    # 5b. migration 013: one recompute_sast path after the raw upsert; blank ratings stay NULL
+    apply_sast_v2(out)
+
     # 6. secrets -> credentials
     swapped = swap_supabase_credentials(out["nodes"])
 
@@ -1653,8 +1927,10 @@ def main(argv):
         print(f"note  : draft nodes not found in input (already removed?): {missing_old}")
     print(f"nodes : {len(wf['nodes'])} -> {len(out['nodes'])}")
     print(f"shared edits: {CODE_IN_JS}, {BUILD_FLAGGED}, {FLAGGED_RESPOND}, {SHEET_MAP}, {PHONE_RECONCILE}, "
-          f"{PHONE_GEMINI_FAILURE}, {', '.join(MAIN_RECOMPUTE_NODES)}; "
-          f"{RAW_LOOP}[done] -> {RAW_UPSERT_GATE} -> {', '.join(AGG_CHAIN_HEADS)}")
+          f"{PHONE_GEMINI_FAILURE}; {RAW_LOOP}[done] -> {RAW_UPSERT_GATE} -> {SAST_PAIRS} -> "
+          f"{SAST_RECOMPUTE} (recompute_sast) -> {SAST_ALERT_IF}")
+    print(f"null ratings (rating.js): {CODE_IN_JS}, {FORMAT_FINAL}, {PHONE_MAP}, {WEBSITE_MAP}, "
+          f"{CORRECTION_BUILD}, {', '.join(CORRECTION_MAPS)}; removed {len(SAST_DEAD_NODES)} aggregate nodes")
     print(f"sexual-word filter: re-check nodes {PHONE_REMARK_CHECK} / Website Remark Check "
           f"(verify timeouts {PHONE_VERIFY_TIMEOUT_MS // 1000} s / {WEB_VERIFY_TIMEOUT_MS // 1000} s); "
           f"{sum('function maskProfanity' in n['parameters'].get('jsCode', '') for n in out['nodes'])} nodes mask remarks")

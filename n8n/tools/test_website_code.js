@@ -1631,6 +1631,122 @@ test('Raw Upsert Done: re-emits every If1 item unchanged (input = loop "done" it
   assert.deepStrictEqual(out.map((i) => i.json), rows);
 });
 
+// ---------------------------------------------------------------- migration 013: recompute_sast + blank ratings stay NULL
+const SAST_DEAD = ['Management Node1', 'Performance1', 'calculate mangement1', 'calculate performance1', 'Loop Over Items4',
+  'Loop Over Items5', 'send to managment table1', 'send to performance node1', 'calc1', 'update to overall total3',
+  'update to overall_question_means2', 'update to overall_question_means3'];
+function outs(name, idx = 0) {
+  const l = (wf.connections[name] || {}).main || [];
+  return (l[idx] || []).map((c) => c.node);
+}
+function ins(name) {
+  const r = [];
+  for (const [s, c] of Object.entries(wf.connections)) {
+    (c.main || []).forEach((l, i) => (l || []).forEach((e) => { if (e.node === name) r.push(`${s}[${i}]`); }));
+  }
+  return r.sort();
+}
+test('Aggregates: Raw Upsert Done -> Code in JavaScript8 -> recompute_sast -> If28 (once); old chains gone', async () => {
+  const names = new Set(wf.nodes.map((n) => n.name));
+  for (const d of SAST_DEAD) assert.ok(!names.has(d), `${d} removed`);
+  const txt = JSON.stringify(wf);
+  for (const d of SAST_DEAD) assert.ok(!txt.includes(JSON.stringify(d).slice(1, -1)), `${d} not referenced`);
+  assert.deepStrictEqual(outs('Raw Upsert Done'), ['Code in JavaScript8']);
+  assert.deepStrictEqual(outs('Code in JavaScript8'), ['update to overall total2']);
+  assert.deepStrictEqual(outs('update to overall total2'), ['If28']);
+  assert.deepStrictEqual(ins('If28'), ['update to overall total2[0]']);
+  assert.deepStrictEqual(ins('update to overall total2'), ['Code in JavaScript8[0]']);
+  const n = wf.nodes.find((x) => x.name === 'update to overall total2');
+  assert.strictEqual(n.parameters.query.trim(), 'SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);');
+  assert.strictEqual(n.parameters.options.queryReplacement, '={{ [$json.instructor_id, $json.term_id] }}');
+  assert.strictEqual(n.onError, 'continueRegularOutput');
+  // unique instructor+term pairs (one recompute and at most one alert each)
+  const rows = [
+    { instructor_ID: INSTR, current_term_id: TERM }, { instructor_ID: INSTR, current_term_id: TERM },
+    { instructor_ID: SUBJ, current_term_id: TERM }, { instructor_ID: null, current_term_id: TERM },
+  ];
+  const pairs = await run('Code in JavaScript8', null, { If1: { __items: rows } });
+  assert.deepStrictEqual(pairs.map((i) => i.json), [{ instructor_id: INSTR, term_id: TERM }, { instructor_id: SUBJ, term_id: TERM }]);
+  // If28 reads what recompute_sast returns
+  const if28 = JSON.stringify(wf.nodes.find((x) => x.name === 'If28').parameters);
+  assert.ok(if28.includes('$json.combined_score_mean'));
+});
+test('Code in JavaScript: ratings are integers 1..5 or NULL (blank, 0, text, out of range -> NULL)', async () => {
+  const row = { instructor_ID: INSTR, true_subject_id: SUBJ, current_term_id: TERM, 'Student ID': 'R1', Date: '2026-10-01' };
+  const vals = [5, '4', 0, '', null, 'blank', 6, 3.0, ' 2 ', 4.5];
+  const want = [5, 4, null, null, null, null, null, 3, 2, null];
+  vals.forEach((v, i) => { row[`M${i + 1}`] = v; row[`P${i + 1}`] = v; });
+  const out = await run('Code in JavaScript', null, { 'SAST image from phone': { body: { user_id: STAFF } } }, [row]);
+  const j = out[0].json;
+  want.forEach((w, i) => { assert.strictEqual(j[`m${i + 1}`], w, `m${i + 1}`); assert.strictEqual(j[`p${i + 1}`], w, `p${i + 1}`); });
+  const missing = await run('Code in JavaScript', null, { 'SAST image from phone': { body: { user_id: STAFF } } },
+    [{ ...row, M1: undefined, P10: undefined }]);
+  assert.strictEqual(missing[0].json.m1, null);
+  assert.strictEqual(missing[0].json.p10, null);
+});
+test('Phone scan: blank rows stay null through 2. Format Final Results1 -> Map to Target Format3; stats over answered rows', async () => {
+  const ratings = {};
+  for (let i = 1; i <= 10; i++) { ratings[`m${i}`] = 4; ratings[`p${i}`] = 2; }
+  ratings.m3 = null; ratings.p7 = null;
+  const f = (await run('2. Format Final Results1', null, { 'reconcile ocr and omr1': { ratings } }))[0].json;
+  assert.strictEqual(f.m3, null);
+  assert.strictEqual(f.p7, null);
+  assert.strictEqual(f.m1, 4);
+  assert.strictEqual(f.answered, 18);
+  assert.strictEqual(f.total_score, 9 * 4 + 9 * 2);
+  assert.strictEqual(f.average, 3);
+  assert.strictEqual(f.percent, 60);
+  const none = (await run('2. Format Final Results1', null, { 'reconcile ocr and omr1': { ratings: {} } }))[0].json;
+  assert.strictEqual(none.answered, 0);
+  assert.strictEqual(none.average, null);
+  assert.strictEqual(none.percent, null);
+  assert.strictEqual(none.m1, null);
+  const m = (await run('Map to Target Format3', {}, {
+    '2. Format Final Results1': { m1: 4 }, 'reconcile ocr and omr1': {}, 'get instructor id6': {}, 'get subject id4': {},
+  }))[0].json;
+  assert.strictEqual(m.M1, 4);
+  assert.strictEqual(m.M2, null);
+  assert.strictEqual(m.P10, null);
+});
+test('Website Map to Target Format: blank rating -> null (not 0)', async () => {
+  const d = await decide(identity());
+  const out = (await run('Website Map to Target Format', {}, {
+    'Website Decide': { ...d, ratings: { ...d.ratings, m2: null, p5: undefined } }, 'Website Reconcile OCR OMR': REC }))[0].json;
+  assert.strictEqual(out.M2, null);
+  assert.strictEqual(out.P5, null);
+  assert.strictEqual(out.M1, 5);
+});
+test('Corrections: 0 / blank / invalid ratings from Flutter or the website -> null (build the record1, Map target, Map target1)', async () => {
+  const b = { term_id: TERM, user_id: STAFF, task_id: null, failed_scan_id: 7 };
+  const vals = [5, '4', 0, '', null, 'blank', 6, 3.0, '0', 1];
+  const want = [5, 4, null, null, null, null, null, 3, null, 1];
+  vals.forEach((v, i) => { b[`m${i + 1}`] = v; b[`p${i + 1}`] = v; });
+  const rec = (await run('build the record1', null, {
+    'sast-manual-correction1': { body: b }, 'get instructor id7': { instructor_id: INSTR }, 'get subject id6': { subject_id: SUBJ },
+  }))[0].json;
+  want.forEach((w, i) => assert.strictEqual(rec.raw[`m${i + 1}`], w, `raw.m${i + 1}`));
+  want.forEach((w, i) => assert.strictEqual(rec.scores[`p${i + 1}`], w, `scores.p${i + 1}`));
+  const mt = (await run('Map target', rec, {
+    'sast-manual-correction1': { body: b }, 'get instructor id7': { instructor_id: INSTR }, 'get subject id6': { subject_id: SUBJ },
+    'get existing scan image id': {},
+  }))[0].json;
+  want.forEach((w, i) => {
+    assert.strictEqual(mt[`M${i + 1}`], w, `M${i + 1}`);
+    assert.strictEqual(mt.raw[`p${i + 1}`], w, `raw.p${i + 1}`);
+  });
+  const raw = { M1: 0, m2: '3', P1: 'blank', p2: 6, M3: '5' };
+  const m1 = (await run('Map target1', null, {
+    'import-error-correction1': { body: { raw_data: raw, corrected_subject_id: SUBJ, corrected_instructor_id: INSTR, term_id: TERM } },
+    'get subject id5': { subject_id: SUBJ }, 'get instructor id9': { instructor_id: INSTR }, 'get existing scan image id1': {},
+  }))[0].json;
+  assert.strictEqual(m1.M1, null);
+  assert.strictEqual(m1.M2, 3);
+  assert.strictEqual(m1.M3, 5);
+  assert.strictEqual(m1.P1, null);
+  assert.strictEqual(m1.P2, null);
+  assert.strictEqual(m1.P10, null);
+});
+
 // ---------------------------------------------------------------- corrections -> import_errors keep the scan image
 // Evaluates an If node (v2, combinator and) the way n8n does for the operators used here.
 function ifTrue(name, $json) {
@@ -2128,6 +2244,21 @@ test('Website: no instructor name or list is sent to Gemini (Known Names SQL, AI
   // eslint-disable-next-line no-new-func
   const vbody = new Function('$', '$json', `return (${vm[1]});`)((ref) => ({ first: () => ({ json: vnodes[ref] }) }), item);
   for (const name of NAMES) assert.ok(!vbody.includes(name), `${name} not in the re-check body`);
+});
+
+test('If28: alerts only for a real combined_score_mean below 3 (NULL/empty/undefined do not)', () => {
+  const n = wf.nodes.find((x) => x.name === 'If28');
+  const c = n.parameters.conditions.conditions[0];
+  assert.deepStrictEqual(c.operator, { type: 'boolean', operation: 'true', singleValue: true });
+  const m = /^=\{\{([\s\S]*)\}\}$/.exec(c.leftValue.trim());
+  assert.ok(m, 'If28 leftValue is an expression');
+  // eslint-disable-next-line no-new-func
+  const f = new Function('$json', `return (${m[1]});`);
+  const cases = [[null, false], ['', false], [undefined, false], ['2.99', true], [3, false], ['3', false], [4.5, false], [0, true], [1.5, true]];
+  for (const [v, want] of cases) {
+    assert.strictEqual(f({ combined_score_mean: v }), want, `combined_score_mean=${JSON.stringify(v)}`);
+  }
+  assert.strictEqual(f({}), false, 'missing field');
 });
 
 (async () => {

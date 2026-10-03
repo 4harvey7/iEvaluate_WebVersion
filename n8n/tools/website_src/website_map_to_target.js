@@ -21,9 +21,9 @@ result['Remarks & Suggestions'] = d.remark || '';
 result['Date'] = d.submitted_date;
 
 for (let i = 1; i <= 10; i++) {
-  // blank row -> 0, stored as NULL later
-  result[`M${i}`] = d.ratings?.[`m${i}`] ?? 0;
-  result[`P${i}`] = d.ratings?.[`p${i}`] ?? 0;
+  // blank row stays null (stored as NULL, never 0)
+  result[`M${i}`] = d.ratings?.[`m${i}`] ?? null;
+  result[`P${i}`] = d.ratings?.[`p${i}`] ?? null;
 }
 
 return [{ json: result }];

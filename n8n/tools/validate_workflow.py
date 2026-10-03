@@ -46,6 +46,14 @@ Checks
     website_known_names.sql (subjects only, no parameters) and its prompt asks only for
     known_subject, so no instructor name ever reaches Gemini; Decide (subject pick) and the phone
     reconciler use them through one identical copy of website_src/name_match.js; not_found never flags
+  * migration 013: one aggregate path Raw Upsert Done -> Code in JavaScript8 -> 'update to overall
+    total2' (SELECT * FROM public.recompute_sast($1, $2), continue on error) -> If28, entered once (no
+    duplicate low-score pushes); the old Management/Performance chains are gone and unreferenced
+  * blank ratings stay NULL: one identical copy of website_src/rating.js where client/OMR values are
+    read; no mapper turns a missing m/p rating into 0
+A live n8n export of this build (e.g. ../perfect-2.1.json) has n8n's own node ids and drops default
+values, so compare it with the build output instead of the original export, or pass a non-existent
+ORIGINAL_JSON to skip the original-diff checks.
 Exit code 0 = all checks passed.
 """
 from __future__ import annotations
@@ -69,16 +77,35 @@ WEB_RESPOND_SAVED = "Website Respond Saved"
 RAW_UPSERT = "Insert or update rows in a table1"
 RAW_SKIP_IF = "Raw Row Already Stored?"
 FLAGGED_RESPOND = "Respond to Webhook"
-MAIN_RECOMPUTE_NODES = ["send to managment table1", "send to performance node1"]
 RAW_LOOP = "Loop Over Items3"
 RAW_UPSERT_GATE = "Raw Upsert Done"
-AGG_CHAIN_HEADS = ["Management Node1", "Performance1"]
+AGG_CHAIN_HEADS = ["Management Node1", "Performance1"]   # original export only (removed by migration 013)
+# migration 013: one recompute_sast path; these nodes of the original export are removed
+SAST_PAIRS = "Code in JavaScript8"
+SAST_RECOMPUTE = "update to overall total2"
+SAST_ALERT_IF = "If28"
+SAST_RECOMPUTE_SQL = "SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);\n"
+SAST_RECOMPUTE_PARAMS = "={{ [$json.instructor_id, $json.term_id] }}"
+SAST_DEAD_NODES = [
+    "Management Node1", "Performance1", "calculate mangement1", "calculate performance1",
+    "Loop Over Items4", "Loop Over Items5", "send to managment table1", "send to performance node1",
+    "calc1", "update to overall total3", "update to overall_question_means2", "update to overall_question_means3",
+]
+# blank ratings stay NULL: nodes with one identical copy of website_src/rating.js
+RATING_NODES = {"Code in JavaScript", "2. Format Final Results1", "build the record1", "Map target1"}
+RATING_START = "// SAST rating, from website_src/rating.js\n"
+RATING_END = "// end of SAST rating\n"
+RATING_MAPPERS = ["Code in JavaScript", "2. Format Final Results1", "Map to Target Format3", "Website Map to Target Format",
+                  "build the record1", "Map target", "Map target1", "Map to Target Format"]
 EDITED_SHARED = {  # node -> parameter paths allowed to change
     "Code in JavaScript": [("jsCode",)],
     "build flagged record1": [("jsCode",)],
     "Respond to Webhook": [("responseBody",)],
-    "send to managment table1": [("query",), ("options", "queryReplacement"), ("options", "queryBatching")],
-    "send to performance node1": [("query",), ("options", "queryReplacement"), ("options", "queryBatching")],
+    "update to overall total2": [("query",)],   # migration 013: SELECT * FROM public.recompute_sast($1, $2)
+    # blank ratings stay NULL (website_src/rating.js)
+    "2. Format Final Results1": [("jsCode",)],
+    "Map to Target Format3": [("jsCode",)],
+    "build the record1": [("jsCode",)],
     "Insert or update rows in a table1": [("options", "queryBatching"), ("@", "alwaysOutputData")],
     "get instructor id7": [("query",), ("options", "queryReplacement")],   # + body read by webhook name, id first
     "get subject id6": [("query",), ("options", "queryReplacement")],      # body.subject_id first, array params
@@ -157,8 +184,8 @@ REMARK_LOOP_WAIT = "Wait1"
 REMARK_LOOP_FEED = "insert data to student remarks2"
 FLAGGED_FCM = "Get staff FCM for flagged scan"
 PG_QUERY_BATCHING = {"single", "transaction", "independently"}   # n8n Postgres v2 option values
-EXPECTED_REMOVED_EDGES = {("If1", "main", 0, "Management Node1", 0), ("If1", "main", 0, "Performance1", 0),
-                          ("If14", "main", 1, RAW_LOOP, 0), (RAW_LOOP, "main", 1, RAW_UPSERT, 0),
+# (edges of the removed SAST_DEAD_NODES are left out of both sides of the comparison)
+EXPECTED_REMOVED_EDGES = {("If14", "main", 1, RAW_LOOP, 0), (RAW_LOOP, "main", 1, RAW_UPSERT, 0),
                           # Loop Over Items8 is fed back once per group (alert branch no longer feeds Wait1)
                           ("If25", "main", 0, REMARK_LOOP_WAIT, 0),
                           ("PushNotificaton for sentiment analysisi5", "main", 0, REMARK_LOOP_WAIT, 0),
@@ -176,8 +203,7 @@ EXPECTED_ADDED_EDGES = {(RAW_LOOP, "main", 0, RAW_UPSERT_GATE, 0),
                         (RAW_LOOP, "main", 1, RAW_SKIP_IF, 0),
                         (RAW_SKIP_IF, "main", 0, RAW_LOOP, 0),
                         (RAW_SKIP_IF, "main", 1, RAW_UPSERT, 0),
-                        (RAW_UPSERT_GATE, "main", 0, "Management Node1", 0),
-                        (RAW_UPSERT_GATE, "main", 0, "Performance1", 0),
+                        (RAW_UPSERT_GATE, "main", 0, SAST_PAIRS, 0),
                         ("get existing scan image id", "main", 0, "get instructor id7", 0),
                         ("get existing scan image id1", "main", 0, "get instructor id9", 0),
                         ("Is not a SAST form?", "main", 1, "Phone Remark Check", 0),
@@ -818,8 +844,10 @@ def main(argv):
         check(not changed, f"nodes outside the website front end unchanged (canvas positions aside) except the "
                            f"credential swap and the shared edits {sorted(EDITED_SHARED)}" + (f": {changed}" if changed else ""))
         removed = sorted(set(onodes) - set(by_name))
-        check(all(r in REMOVED_NODES or r.startswith("Website ") for r in removed),
-              f"only draft website nodes removed from the original: {removed}")
+        check(all(r in REMOVED_NODES or r in SAST_DEAD_NODES or r.startswith("Website ") for r in removed)
+              and all(d in removed for d in SAST_DEAD_NODES),
+              f"only draft website nodes and the old aggregate chains (migration 013) removed from the original: "
+              f"{removed}")
 
         def edge_set(c, exclude):
             es = set()
@@ -834,12 +862,13 @@ def main(argv):
             return es
         old_web = {n for n in onodes if n.startswith("Website ") or n in
                    ("SAST from Website", "Prepare Website Scan", "Ready for Main Flow (Website)")}
-        e_old = edge_set(orig["connections"], old_web)
+        e_old = edge_set(orig["connections"], old_web | set(SAST_DEAD_NODES))
         e_new = edge_set(conns, website)
         added, removed_e = e_new - e_old, e_old - e_new
         ok = added == EXPECTED_ADDED_EDGES and removed_e == EXPECTED_REMOVED_EDGES
         check(ok, "shared-flow connections unchanged except the aggregate re-route "
-                  "(If1 -x-> Management Node1/Performance1; Loop Over Items3[done] -> Raw Upsert Done -> both)"
+                  "(old Management/Performance chains removed; Loop Over Items3[done] -> Raw Upsert Done -> "
+                  "Code in JavaScript8)"
               + ("" if ok else f"; +{sorted(added)} -{sorted(removed_e)}"))
 
         cij = by_name["Code in JavaScript"]["parameters"]["jsCode"]
@@ -870,15 +899,80 @@ def main(argv):
           "(Instructor message2, grouped remark AI); phone/website/correction mappers never set it (If22)"
           + (f": import_type in {leak}" if leak else ""))
 
-    # ---- aggregate fix: same SQL + ordering guaranteed by structure
-    rec_sql = (HERE / "website_src" / "recompute_aggregates.sql").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
-    check(all(by_name[n]["parameters"]["query"] == rec_sql for n in MAIN_RECOMPUTE_NODES)
-          and all(by_name[n]["parameters"]["options"]["queryReplacement"]
-                  == "={{ [ $json.instructor_id, $json.term_id ?? null, $json.subject_id ] }}"
-                  for n in MAIN_RECOMPUTE_NODES),
-          "send to managment table1 / send to performance node1 run recompute_aggregates.sql with "
-          "[instructor_id, term_id, subject_id]")
-    order_ok = (all(inbound(h) == [(RAW_UPSERT_GATE, 0)] for h in AGG_CHAIN_HEADS)
+    # ---- aggregates (migration 013): one recompute_sast path, entered once per execution
+    rn = by_name.get(SAST_RECOMPUTE, {})
+    rp = rn.get("parameters", {})
+    dead_left = [d for d in SAST_DEAD_NODES if d in by_name or json.dumps(d)[1:-1] in text]
+    agg_ok = (rp.get("operation") == "executeQuery" and rp.get("query") == SAST_RECOMPUTE_SQL
+              and rp.get("options", {}).get("queryReplacement") == SAST_RECOMPUTE_PARAMS
+              and "queryBatching" not in rp.get("options", {})
+              and rn.get("onError") == "continueRegularOutput"
+              and rn.get("credentials", {}).get("postgres", {}).get("name") == "Postgres account"
+              and targets(conns, RAW_UPSERT_GATE, 0) == [SAST_PAIRS]
+              and inbound(SAST_PAIRS) == [(RAW_UPSERT_GATE, 0)]
+              and targets(conns, SAST_PAIRS, 0) == [SAST_RECOMPUTE]
+              and inbound(SAST_RECOMPUTE) == [(SAST_PAIRS, 0)]
+              and targets(conns, SAST_RECOMPUTE, 0) == [SAST_ALERT_IF]
+              and inbound(SAST_ALERT_IF) == [(SAST_RECOMPUTE, 0)]
+              and "$('If1').all()" in by_name.get(SAST_PAIRS, {}).get("parameters", {}).get("jsCode", "")
+              and "$json.combined_score_mean" in json.dumps(by_name.get(SAST_ALERT_IF, {}).get("parameters", {}))
+              and not dead_left)
+    check(agg_ok, "aggregates: Raw Upsert Done -> Code in JavaScript8 -> update to overall total2 "
+          "(SELECT * FROM public.recompute_sast($1, $2), [instructor_id, term_id], continue on error) -> If28 "
+          "(its only input, so each low-score alert fires once); old Management/Performance chains gone"
+          + (f": still present {dead_left}" if dead_left else ""))
+
+    # ---- If28 fires only for a real number below 3 (NULL / '' / undefined must not alert)
+    if28 = by_name.get(SAST_ALERT_IF, {})
+    c28 = (if28.get("parameters", {}).get("conditions", {}).get("conditions") or [{}])[0]
+    expr28 = str(c28.get("leftValue", ""))
+    op28 = c28.get("operator", {})
+    def _if28(v):
+        if v is None or v == "":
+            return False
+        try:
+            return float(v) < 3
+        except (TypeError, ValueError):
+            return False
+    cases28 = [(None, False), ("", False), ("2.99", True), (3, False), (4.5, False)]
+    shape28 = ("!== null" in expr28 and "!== undefined" in expr28 and "!== ''" in expr28
+               and "Number($json.combined_score_mean) < 3" in expr28
+               and op28 == {"type": "boolean", "operation": "true", "singleValue": True})
+    check(shape28 and all(_if28(v) == e for v, e in cases28),
+          "If28: true only for a real number < 3 (boolean expression guards NULL/''/undefined; "
+          "NULL/'' false, '2.99' true, 3 and 4.5 false)")
+
+    # ---- blank ratings stay NULL (CHECK 1..5): rating() copies + no 'missing rating -> 0'
+    r_src = (HERE / "website_src" / "rating.js").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
+    r_body = "\n".join(ln for ln in r_src.split("\n") if ln.strip() and not ln.lstrip().startswith("//"))
+    r_copies = {}
+    for n in nodes:
+        code = n["parameters"].get("jsCode", "")
+        if "function rating(" in code:
+            i = code.find(RATING_START)
+            j = code.find(RATING_END, i)
+            r_copies[n["name"]] = code[code.index("\n", i) + 1:j].rstrip("\n") if i >= 0 and j > i else None
+    rating_bad = [f"{k}: copy differs from website_src/rating.js" for k, v in r_copies.items() if v != r_body]
+    if set(r_copies) != RATING_NODES:
+        rating_bad.append(f"rating nodes {sorted(set(r_copies) ^ RATING_NODES)}")
+    zero_re = re.compile(r"""(?:\b[mpMP]\d+\b|[mpMP]\$\{\w+\}).{0,40}?(?:\?\?|\|\|)\s*0\b|"""
+                         r"""formattedResults\[`[mp]\$\{i\}`\]\s*:\s*0\b""")
+    for name in RATING_MAPPERS:
+        code = by_name.get(name, {}).get("parameters", {}).get("jsCode")
+        if code is None:
+            rating_bad.append(f"{name}: missing")
+            continue
+        hits = [ln.strip() for ln in code.split("\n") if zero_re.search(ln)]
+        if hits:
+            rating_bad.append(f"{name}: missing rating -> 0: {hits[:2]}")
+    cij_r = by_name["Code in JavaScript"]["parameters"]["jsCode"]
+    missing_cols = [f"{p}{i}" for p in "mp" for i in range(1, 11) if f"{p}{i}: rating(r['{p.upper()}{i}'])," not in cij_r]
+    if missing_cols:
+        rating_bad.append(f"Code in JavaScript: no rating() for {missing_cols}")
+    check(not rating_bad, f"blank ratings stay NULL: one identical copy of website_src/rating.js in {len(r_copies)} nodes "
+          "(Code in JavaScript applies it to all 20 columns before the raw upsert), no mapper turns a missing "
+          "rating into 0" + (f": {rating_bad}" if rating_bad else ""))
+    order_ok = (inbound(SAST_PAIRS) == [(RAW_UPSERT_GATE, 0)]
                 and inbound(RAW_UPSERT_GATE) == [(RAW_LOOP, 0)]
                 and targets(conns, RAW_LOOP, 1) == [RAW_SKIP_IF]
                 and targets(conns, RAW_SKIP_IF, 1) == [RAW_UPSERT]
@@ -959,10 +1053,6 @@ def main(argv):
     check(not minimal_bad, "no Postgres node reads $json from an HTTP node that returns no body (Prefer: return=minimal)"
           + (f": {minimal_bad}" if minimal_bad else ""))
 
-    lock_ok = all(by_name[n]["parameters"]["options"].get("queryBatching") == "transaction"
-                  and "pg_advisory_xact_lock(hashtext('ievaluate:recompute_aggregates'))" in by_name[n]["parameters"]["query"]
-                  for n in MAIN_RECOMPUTE_NODES)
-    check(lock_ok, "recompute nodes take a transaction-level advisory lock first (queryBatching = transaction)")
     # Everything reachable from If1 WITHOUT passing through the raw upsert or the loop's
     # "done" output could run before the raw row is stored. Nodes downstream of the
     # upsert (e.g. the If14 error branch -> Website Save Gate) run after it by definition.
@@ -980,7 +1070,7 @@ def main(argv):
                     continue
                 for c in lst or []:
                     st.append(c["node"])
-    early = [n for n in MAIN_RECOMPUTE_NODES + AGG_CHAIN_HEADS if n in before]
+    early = [n for n in (SAST_PAIRS, SAST_RECOMPUTE, SAST_ALERT_IF) if n in before]
     check(order_ok and not early, "recompute runs only after the raw upsert "
           "(reachable from If1 only through Loop Over Items3[done])"
           + (f": reachable early: {early}" if early else ""))
