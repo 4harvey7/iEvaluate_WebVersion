@@ -25,8 +25,18 @@ skipped/before-batch/. The website can then ask (through the heartbeat) to add
 them to the open batch or to set them aside for good (skipped/discarded/<date>/,
 never deleted).
 
+Started by hand (2.5.0+): the "Start Scan Watcher" shortcut (desktop / Start
+menu) runs start_watcher.bat; "Stop Scan Watcher" (STOP.bat) stops it and tells
+the website. It no longer starts by itself at log-on (IT can still turn that on
+with install_task.bat).
+
+One copy at a time (2.5.0+): the running watcher holds an exclusive lock on
+watcher.lock next to this script for as long as it runs. A second copy prints
+"Scan Watcher is already running" and exits with code 7 (start_watcher.bat then
+stops instead of retrying). One-shot modes (--offline) don't take the lock.
+
 Run:  py -3 folder_watcher.py            (or: py -3 folder_watcher.py --config other.json)
-      py -3 folder_watcher.py --offline  tell the website this laptop stopped (UNINSTALL does this)
+      py -3 folder_watcher.py --offline  tell the website this laptop stopped (STOP / UNINSTALL do this)
 """
 from __future__ import annotations
 
@@ -57,8 +67,10 @@ except ImportError:  # pragma: no cover
     print("Pillow is not installed. Run:  py -3 -m pip install -r requirements.txt")
     raise
 
-VERSION = "2.4.4"
+VERSION = "2.5.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCK_FILE_NAME = "watcher.lock"    # single instance (2.5.0+), next to this script
+EXIT_ALREADY_RUNNING = 7           # start_watcher.bat stops its restart loop on this code
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
 STABLE_POLLS_REQUIRED = 2          # size+mtime unchanged for this many polls
@@ -1105,8 +1117,32 @@ class Watcher:
             time.sleep(self.cfg.poll_seconds)
 
 
+_instance_lock = None  # open handle of watcher.lock; kept open for the life of the process
+
+
+def acquire_instance_lock(path: str | None = None):
+    """Take the single-instance lock: an exclusive, non-blocking lock on the
+    first byte of watcher.lock. Returns the open file (keep it open - closing it
+    or ending the process releases the lock, also after a crash or a kill), or
+    None when another watcher already holds it."""
+    path = path or os.path.join(SCRIPT_DIR, LOCK_FILE_NAME)
+    f = open(path, "a+b")
+    try:
+        f.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover - the watcher runs on Windows; this keeps tests portable
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 def send_offline(cfg: Config) -> bool:
-    """Tell the website this laptop stopped watching (UNINSTALL, Ctrl+C), so its
+    """Tell the website this laptop stopped watching (STOP, UNINSTALL, Ctrl+C), so its
     light turns red now instead of ~40 s later. Best effort, never raises.
     Servers without this endpoint answer 404; nothing changes then."""
     try:
@@ -1125,11 +1161,18 @@ def send_offline(cfg: Config) -> bool:
 
 
 def main() -> None:
+    global _instance_lock
     parser = argparse.ArgumentParser(description="iEvaluate scan folder watcher")
     parser.add_argument("--config", default=os.path.join(SCRIPT_DIR, "watcher_config.json"))
     parser.add_argument("--offline", action="store_true",
-                        help="only tell the website this laptop stopped watching, then exit (used by UNINSTALL)")
+                        help="only tell the website this laptop stopped watching, then exit (used by STOP / UNINSTALL)")
     args = parser.parse_args()
+    if not args.offline:
+        # Before logging: a second copy must not write to (or rotate) watcher.log.
+        _instance_lock = acquire_instance_lock()
+        if _instance_lock is None:
+            print("Scan Watcher is already running")
+            sys.exit(EXIT_ALREADY_RUNNING)
     setup_logging()
     try:
         cfg = load_config(args.config)

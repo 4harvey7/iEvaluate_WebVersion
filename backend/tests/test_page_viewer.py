@@ -517,7 +517,7 @@ def test_approving_on_the_review_page_updates_the_row_score(env, monkeypatch):
     db, client = env()
     monkeypatch.setattr(reviews, "_n8n", lambda: FakeCorrection())
     body = {"expected_version": 3, "instructor_id": PEDRO, "subject_id": IT101, "student_id": "2021-0001",
-            "remarks": "", "ratings": {"m1": 2, "p1": 4}}
+            "remarks": "", "ratings": {"m1": 2, "m2": 2, "m3": 4, "p1": 4, "p2": 3}}
     r = client.post(f"/reviews/queue/{db.tables['failed_scan_queue'][0]['id']}/approve", json=body)
     assert r.status_code == 200, r.text
     s = _row(db, I_FLAG)["result_summary"]

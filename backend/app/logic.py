@@ -39,6 +39,11 @@ IDENTITY_VALUES = ("match", "unreadable", "mismatch", "unverified")
 # An item in another batch with one of these final statuses means the image was
 # already counted or is waiting for review (rejected = not a form, nothing stored).
 REUSED_IMAGE_STATUSES = ("success", "flagged", "duplicate")
+# Rules n8n discards a sheet by itself (answer field auto_rejected; the sheet is
+# stored in failed_scan_queue already discarded and counted as flagged).
+DUPLICATE_STAMP_REASON = "duplicate_stamp"
+AUTO_REJECT_RULES = (DUPLICATE_STAMP_REASON,)
+STAMP_NO_RE = re.compile(r"^[0-9]{3,12}$")
 
 
 # ---------------------------------------------------------------- station keys
@@ -308,6 +313,16 @@ def validate_n8n_response(body: Any) -> dict:
     if status == "success" and flagged:
         status = "flagged"
 
+    # Stamp numbers (migration 015): a sheet whose stamp is already stored for the
+    # term is stored by n8n already discarded and answered 'flagged' with
+    # auto_rejected 'duplicate_stamp'. The reason is what the live batch page
+    # labels "Already scanned", so it is always kept on the item.
+    auto_rejected = body.get("auto_rejected")
+    auto_rejected = auto_rejected if auto_rejected in AUTO_REJECT_RULES and status == "flagged" else None
+    if auto_rejected and auto_rejected not in reasons:
+        reasons = [auto_rejected] + reasons[:49]
+    stamp_no = _clean_str(body.get("stamp_no"), 20)
+
     return {
         "status": status,
         "flagged": status == "flagged",
@@ -315,6 +330,8 @@ def validate_n8n_response(body: Any) -> dict:
         "review_reasons": reasons,
         "identity_check": identity,
         "message": _clean_str(body.get("message"), 1000),
+        "auto_rejected": auto_rejected,
+        "stamp_no": stamp_no if stamp_no and STAMP_NO_RE.match(stamp_no) else None,
     }
 
 

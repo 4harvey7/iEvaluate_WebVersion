@@ -1,5 +1,5 @@
 @echo off
-REM Helper (do not double-click). Used by INSTALL.bat, UNINSTALL.bat, CHECK.bat.
+REM Helper (do not double-click). Used by INSTALL.bat, STOP.bat, CHECK.bat.
 REM   watcher_process.bat stop    stop every running Scan Watcher on this computer
 REM                               (from ANY folder, including old installs)
 REM   watcher_process.bat check   exit code 0 = a Scan Watcher is running, 1 = not running

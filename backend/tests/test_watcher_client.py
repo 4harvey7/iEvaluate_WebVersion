@@ -309,7 +309,7 @@ def test_kept_for_review_counts_as_delivered(make):
 
 
 def test_version():
-    assert fw.VERSION == "2.4.4"
+    assert fw.VERSION == "2.5.0"
 
 
 # ---------------------------------------------------------------- online light (2.4.4)

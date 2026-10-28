@@ -297,8 +297,8 @@ class FakeResp:
 
 
 class FakeN8n:
-    def __init__(self, status=200, raises=None, on_post=None):
-        self.status, self.raises, self.on_post = status, raises, on_post
+    def __init__(self, status=200, raises=None, on_post=None, body=None):
+        self.status, self.raises, self.on_post, self.body = status, raises, on_post, body
         self.calls = []
 
     def post(self, url, json=None, headers=None):
@@ -307,7 +307,7 @@ class FakeN8n:
             raise self.raises
         if self.on_post:
             self.on_post(url, json)
-        return FakeResp(self.status)
+        return FakeResp(self.status, self.body)
 
 
 def user(uid, role="SAO_STAFF"):
@@ -339,6 +339,7 @@ def env(monkeypatch):
             raise AssertionError("tests must never reach the real Supabase")
         monkeypatch.setattr(audit_module, "get_supabase", _no_db)
         reviews._mig.update(missing_until=0.0, warned=False)
+        reviews._stamp_mig.update(missing_until=0.0, warned=False)
         reviews._ctx_cache.clear()
         app.dependency_overrides[require_staff] = lambda: user(as_user, role)
         state.update(db=db, n8n=fake_n8n, audits=audits)
@@ -352,11 +353,12 @@ def env(monkeypatch):
     yield _setup
     app.dependency_overrides.clear()
     reviews._mig.update(missing_until=0.0, warned=False)
+    reviews._stamp_mig.update(missing_until=0.0, warned=False)
 
 
 def approve_body(**kw):
     body = {"expected_version": 3, "instructor_id": PEDRO, "subject_id": IT101, "student_id": "2021-0001",
-            "remarks": "Good", "ratings": {"m1": 4, "m2": 4, "p1": 5}}
+            "remarks": "Good", "ratings": {"m1": 4, "m2": 4, "m4": 3, "m5": 3, "p1": 5}}   # 5 answered (min-answered rule)
     body.update(kw)
     return body
 
@@ -591,6 +593,41 @@ def test_invalid_subject_and_ratings(env):
         r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(ratings=bad))
         assert r.status_code == 400 and r.json()["detail"]["code"] == "invalid_ratings", bad
     assert n8n.calls == []
+
+
+def test_approve_needs_five_answered_items(env):
+    """Teacher rule: fewer than 5 of the 20 items answered -> the form can't be credited."""
+    db, n8n, client = env()
+    for few in ({}, {"m1": 4}, {"m1": 4, "m2": "", "p1": 5, "p2": 3, "p10": 2, "m10": None}):
+        r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(ratings=few))
+        assert r.status_code == 400, few
+        d = r.json()["detail"]
+        assert d["code"] == "too_few_answers" and d["minimum"] == 5
+        assert d["answered"] == sum(1 for v in few.values() if v not in (None, ""))
+        assert d["message"].startswith(f"Only {d['answered']} of the 20 items are answered.")
+    assert n8n.calls == []
+    row = db.row("failed_scan_queue", Q1)
+    assert row["status"] == "pending" and row.get("review_state") is None  # untouched
+    r = client.post(f"/reviews/queue/{Q1}/approve",
+                    json=approve_body(ratings={"m1": 1, "m2": 1, "m3": 1, "p1": 1, "p2": 1}))   # exactly 5
+    assert r.status_code == 200, r.text
+    assert len(n8n.calls) == 1
+
+
+def test_auto_discarded_row_is_serialized_as_automatic():
+    row = {"id": Q1, "task_id": "web:x:1", "status": "discarded", "review_action": "rejected",
+           "review_reasons": ["too_few_answers_3_of_20"], "partial_data": {},
+           "review_correction": {"action": "rejected", "auto": True, "rule": "min_answered_5",
+                                 "note": "Fewer than 5 of the 20 items were answered (only 3), so this form was "
+                                         "discarded automatically and is not counted.",
+                                 "reviewed_by": None, "reviewed_by_name": "Automatic rule"}}
+    out = rl.serialize_queue_row(row, {})
+    assert out["auto_discarded"] is True and out["validated_by_name"] == "Automatic rule"
+    assert out["review_note_by_reviewer"].startswith("Fewer than 5 of the 20 items were answered (only 3)")
+    assert out["review_reasons"] == ["too_few_answers_3_of_20"]
+    staff = {**row, "review_correction": {"action": "rejected", "note": "torn", "reviewed_by_name": "Sara"}}
+    assert rl.serialize_queue_row(staff, {})["auto_discarded"] is False
+    assert rl.answered_count(rl.validate_ratings({"m1": 5, "p10": "1", "m2": ""})) == 2
 
 
 def test_timeout_leaves_submitting_then_list_finalises(env):
@@ -854,3 +891,283 @@ def test_suggestions_ignore_unchecked_keys():
     s = rl.suggestions({"instructor_match": "bogus", "suggested_instructor_id": PEDRO},
                        {"instructor": {"id": JUAN, "name": "Juan"}, "subject": {"id": IT101, "code": "IT 101", "name": "x"}})
     assert s["instructor_match"] == "unchecked" and s["suggested_instructor"]["id"] == JUAN
+
+
+# ------------------------------------------------------------------ stamp numbers (migration 015)
+Q5 = "d0000000-0000-0000-0000-000000000005"        # discarded by n8n: stamp already scanned
+ORIG_TASK = f"web:{OTHER_BATCH}:bbbb000000000009"   # the form that was stored first
+ORIG_ITEM = "f0000000-0000-0000-0000-000000000009"
+STAMP_DUP = {"raw_id": 900, "task_id": ORIG_TASK, "batch_id": OTHER_BATCH, "submitted_date": "2026-10-01",
+             "instructor_id": JUAN, "subject_id": IT102, "term_id": TERM, "stamp_no": "0100005"}
+
+
+def add_stamp_rows(db):
+    """Q1 read with one stamp; Q5 auto-rejected as a duplicate of raw row 900."""
+    db.row("failed_scan_queue", Q1).update(stamp_no="0100004", stamp_source="gemini")
+    db.row("failed_scan_queue", Q1)["partial_data"].update(stamp_status="ok", stamp_candidates=["0100004"],
+                                                           stamp_raw=["0100004"])
+    db.tables["failed_scan_queue"].append({
+        "id": Q5, "task_id": f"web:{BATCH}:aaaa000000000005", "user_id": STAFF, "term_id": TERM, "table_found": True,
+        "grid_source": "python", "status": "discarded", "validated_by": None, "validated_at": None,
+        "review_reasons": ["duplicate_stamp", "low_confidence"], "omr_comparison": None, "validation_status": "flagged",
+        "scan_image_id": None, "batch_id": BATCH, "created_at": _ago(minutes=30),
+        "stamp_no": "0100005", "stamp_source": "gemini",
+        "partial_data": {"filename": "p5.jpg", "student_id": "2021-0005",
+                         "ratings": {"m1": 4, "m2": 4, "m3": 4, "m4": 4, "m5": 4},
+                         "stamp_status": "ok", "stamp_candidates": ["0100005"], "stamp_raw": ["0100005"],
+                         "duplicate_of": dict(STAMP_DUP)},
+        "updated_at": _ago(minutes=30), "review_version": 2, "review_state": None, "review_action": "rejected",
+        "review_error": None, "review_submitted_at": None, "review_claimed_by": None, "review_claimed_at": None,
+        "review_correction": {"action": "rejected", "auto": True, "rule": "duplicate_stamp", "reviewed_by": None,
+                              "reviewed_by_name": "Automatic rule", "at": _ago(minutes=30),
+                              "note": "Discarded automatically: this form was already scanned (stamp 0100005)."},
+    })
+    db.tables["sast_all_raw_data_survey"] = [
+        {"id": 900, "task_id": ORIG_TASK, "submitted_date": "2026-10-01", "instructor_ID": JUAN, "subject_id": IT102,
+         "term_id": TERM, "student_id": "2021-0099", "stamp_no": "0100005", "stamp_source": "gemini"}]
+    db.tables["scan_batch_items"] = [{"id": ORIG_ITEM, "batch_id": OTHER_BATCH, "task_id": ORIG_TASK, "status": "success"}]
+
+
+def override_body(**kw):
+    body = {"expected_version": 2, "stamp_no": "0100006", "note": "Stamp was misread as 0100005."}
+    body.update(kw)
+    return body
+
+
+def test_old_rows_without_stamp_keys_serialize():
+    out = rl.serialize_queue_row({"id": Q2, "status": "pending", "partial_data": {"filename": "x.jpg"}}, {})
+    assert out["stamp_no"] is None and out["stamp_source"] is None and out["stamp_status"] is None
+    assert out["stamp_candidates"] == [] and out["duplicate_of"] is None and out["auto_duplicate"] is False
+    assert out["stamp_override"] is None and out["saved_raw"] is None
+    odd = rl.serialize_queue_row({"id": Q2, "status": "pending", "stamp_no": "12ab", "stamp_source": "gemini",
+                                  "partial_data": {"stamp_status": "weird", "stamp_candidates": ["0012", "x", 7, "0012"],
+                                                   "duplicate_of": "nope"}}, {})
+    assert odd["stamp_no"] is None and odd["stamp_source"] is None and odd["stamp_status"] is None
+    assert odd["stamp_candidates"] == ["0012"] and odd["duplicate_of"] is None
+    assert rl.normalize_stamp_no(" 0100 005 ") == "0100005" and rl.normalize_stamp_no("") is None
+    for bad in ("12", "12a45", "1234567890123", "01-005", True, 1.5):
+        with pytest.raises(ValueError):
+            rl.normalize_stamp_no(bad)
+
+
+def test_list_shows_stamp_and_already_scanned_original(env):
+    db, _, client = env()
+    add_stamp_rows(db)
+    d = client.get(f"/reviews/batch/{BATCH}").json()
+    assert d["stamp_ready"] is True
+    q = by_id(d["queue"])
+    assert q[Q1]["stamp_no"] == "0100004" and q[Q1]["stamp_source"] == "gemini" and q[Q1]["stamp_status"] == "ok"
+    assert q[Q1]["stamp_candidates"] == ["0100004"] and q[Q1]["auto_duplicate"] is False
+    dup = q[Q5]
+    assert dup["auto_duplicate"] is True and dup["auto_discarded"] is True and dup["status"] == "discarded"
+    assert dup["duplicate_of"] == {**STAMP_DUP, "instructor_name": "Juan Dela Cruz", "subject_code": "IT 102",
+                                   "subject_name": "Programming 1", "from_website": True, "item_id": ORIG_ITEM}
+    assert q[Q2]["stamp_no"] is None and q[Q2]["duplicate_of"] is None  # older row: no stamp keys
+
+
+def test_approve_sends_the_read_stamp_when_the_page_sends_none(env):
+    db, n8n, client = env()
+    add_stamp_rows(db)
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body())  # older page: no stamp keys
+    assert r.status_code == 200, r.text
+    payload = n8n.calls[0][1]
+    assert payload["stamp_no"] == "0100004" and payload["stamp_source"] == "staff"
+    stored = db.row("failed_scan_queue", Q1)
+    assert stored["stamp_no"] == "0100004" and stored["stamp_source"] == "staff"
+    assert r.json()["row"]["correction"]["stamp_no"] == "0100004"
+    assert any(a[1] == "scan_review_approved" and a[2]["stamp_no"] == "0100004" for a in env.state["audits"])
+
+
+def test_approve_typed_stamp_and_invalid_stamp(env):
+    db, n8n, client = env()
+    add_stamp_rows(db)
+    for bad in ("12", "12a45", "1234567890123"):
+        r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no=bad))
+        assert r.status_code == 400 and r.json()["detail"]["code"] == "invalid_stamp", bad
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100007", no_stamp=True))
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "invalid_stamp"
+    assert n8n.calls == [] and db.row("failed_scan_queue", Q1)["review_state"] is None
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no=" 0100007 "))
+    assert r.status_code == 200, r.text
+    assert n8n.calls[0][1]["stamp_no"] == "0100007" and n8n.calls[0][1]["stamp_source"] == "staff"
+
+
+def test_approve_stamp_required_and_no_stamp(env):
+    db, n8n, client = env()
+    db.row("failed_scan_queue", Q1)["review_reasons"] = ["instructor_mismatch_found", "multiple_stamps"]
+    db.row("failed_scan_queue", Q1)["partial_data"].update(stamp_status="multiple", stamp_candidates=["0100004", "0100005"])
+    for body in (approve_body(), approve_body(stamp_no=None), approve_body(stamp_no="")):
+        r = client.post(f"/reviews/queue/{Q1}/approve", json=body)
+        assert r.status_code == 400 and r.json()["detail"]["code"] == "stamp_required"
+    assert n8n.calls == []
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(no_stamp=True))
+    assert r.status_code == 200, r.text
+    assert n8n.calls[0][1]["stamp_no"] is None and n8n.calls[0][1]["stamp_source"] is None
+    corr = db.row("failed_scan_queue", Q1)["review_correction"]
+    assert corr["no_stamp"] is True and corr["stamp_no"] is None
+    assert r.json()["row"]["correction"]["no_stamp"] is True
+
+
+def test_no_stamp_reason_means_no_stamp_is_fine(env):
+    db, n8n, client = env()  # Q1 has no stamp and no stamp reason (scanned before stamps)
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no=None))
+    assert r.status_code == 200 and n8n.calls[0][1]["stamp_no"] is None
+
+
+def test_approve_duplicate_stamp_is_refused_before_sending(env):
+    db, n8n, client = env()
+    add_stamp_rows(db)
+    db.row("failed_scan_queue", Q1)["term_id"] = None  # the batch's term is used
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100005"))
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["code"] == "duplicate_stamp" and "0100005" in d["message"]
+    assert d["duplicate_of"]["raw_id"] == 900 and d["duplicate_of"]["instructor_name"] == "Juan Dela Cruz"
+    assert d["duplicate_of"]["item_id"] == ORIG_ITEM and d["duplicate_of"]["submitted_date"] == "2026-10-01"
+    assert n8n.calls == [] and db.row("failed_scan_queue", Q1)["review_version"] == 3
+    # The same form's own stored row (same task_id) is not a duplicate.
+    db.tables["sast_all_raw_data_survey"][0]["task_id"] = db.row("failed_scan_queue", Q1)["task_id"]
+    assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100005")).status_code == 200
+
+
+def test_approve_n8n_answers_duplicate_stamp(env):
+    answer = {"success": False, "code": "duplicate_stamp", "message": "Stamp already saved.", "duplicate_of": dict(STAMP_DUP)}
+    db, n8n, client = env(n8n=FakeN8n(status=409, body=answer))
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100005"))  # not in raw yet: n8n catches it
+    assert r.status_code == 409, r.text
+    d = r.json()["detail"]
+    assert d["code"] == "duplicate_stamp" and d["duplicate_of"]["raw_id"] == 900 and d["duplicate_of"]["from_website"] is True
+    assert d["row"]["status"] == "pending" and d["row"]["review_state"] is None
+    stored = db.row("failed_scan_queue", Q1)
+    assert stored["status"] == "pending" and stored["review_state"] is None and stored["review_version"] == 5
+    assert any(a[1] == "scan_review_duplicate_stamp" for a in env.state["audits"])
+    # Fixed stamp, sent again with the new version: credited.
+    env.state["n8n"].status, env.state["n8n"].body = 200, None
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(expected_version=5, stamp_no="0100008"))
+    assert r.status_code == 200 and r.json()["row"]["status"] == "validated"
+
+
+def test_override_auto_duplicate(env):
+    db, n8n, client = env()
+    add_stamp_rows(db)
+    url = f"/reviews/queue/{Q5}/override"
+    r = client.post(url, json=override_body(note="   "))
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "note_required"
+    r = client.post(f"/reviews/queue/{Q1}/override", json=override_body(expected_version=3))
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "not_auto_duplicate"
+    r = client.post(url, json=override_body(expected_version=1))
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "stale_row"
+    r = client.post(url, json=override_body(stamp_no="0100005"))  # still the stored form's stamp
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "duplicate_stamp"
+    r = client.post(url, json=override_body(stamp_no="01x"))
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "invalid_stamp"
+    assert db.row("failed_scan_queue", Q5)["status"] == "discarded"
+
+    r = client.post(url, json=override_body())  # any staff member with access to the batch
+    assert r.status_code == 200, r.text
+    row = r.json()["row"]
+    assert row["status"] == "pending" and row["auto_duplicate"] is False and row["review_action"] is None
+    assert row["stamp_no"] == "0100006" and row["stamp_source"] == "override"
+    assert row["review_reasons"] == ["low_confidence"]
+    assert row["stamp_override"]["by_name"] == user(STAFF).full_name and row["stamp_override"]["previous_stamp"] == "0100005"
+    assert row["stamp_override"]["new_stamp"] == "0100006" and row["stamp_override"]["note"].startswith("Stamp was misread")
+    stored = db.row("failed_scan_queue", Q5)
+    assert stored["partial_data"]["stamp_override"]["by"] == STAFF
+    assert stored["partial_data"]["stamp_override"]["previous_correction"]["rule"] == "duplicate_stamp"
+    assert any(a[1] == "scan_review_stamp_override" for a in env.state["audits"])
+    # Then credited the usual way; the override stamp is sent as such.
+    r = client.post(f"/reviews/queue/{Q5}/approve",
+                    json=approve_body(expected_version=row["review_version"], instructor_id=JUAN, stamp_no="0100006"))
+    assert r.status_code == 200, r.text
+    assert n8n.calls[0][1]["stamp_no"] == "0100006" and n8n.calls[0][1]["stamp_source"] == "override"
+    assert db.row("failed_scan_queue", Q5)["stamp_source"] == "override"
+    # Not an auto-duplicate any more.
+    r = client.post(url, json=override_body(expected_version=r.json()["row"]["review_version"]))
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "not_auto_duplicate"
+
+
+def test_override_without_a_stamp(env):
+    db, n8n, client = env()
+    add_stamp_rows(db)
+    r = client.post(f"/reviews/queue/{Q5}/override", json=override_body(stamp_no=None, note="Different sheet, stamp smudged"))
+    assert r.status_code == 200, r.text
+    row = r.json()["row"]
+    assert row["status"] == "pending" and row["stamp_no"] is None and row["stamp_source"] is None
+    r = client.post(f"/reviews/queue/{Q5}/approve", json=approve_body(expected_version=row["review_version"], instructor_id=JUAN))
+    assert r.status_code == 200 and n8n.calls[0][1]["stamp_no"] is None
+
+
+def test_fix_stamp_on_a_pending_row(env):
+    db, _, client = env()
+    add_stamp_rows(db)
+    url = f"/reviews/queue/{Q1}/stamp"
+    assert client.post(url, json={"expected_version": 3, "stamp_no": "1x"}).json()["detail"]["code"] == "invalid_stamp"
+    assert client.post(url, json={"expected_version": 2, "stamp_no": "0100009"}).json()["detail"]["code"] == "stale_row"
+    r = client.post(url, json={"expected_version": 3, "stamp_no": "0100005"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "duplicate_stamp"
+    r = client.post(url, json={"expected_version": 3, "stamp_no": "0100009"})
+    assert r.status_code == 200, r.text
+    row = r.json()["row"]
+    assert row["stamp_no"] == "0100009" and row["stamp_source"] == "staff" and row["review_version"] == 4
+    assert db.row("failed_scan_queue", Q1)["partial_data"]["stamp_fix"]["by_name"] == user(STAFF).full_name
+    assert any(a[1] == "scan_review_stamp_fixed" for a in env.state["audits"])
+    assert client.post(f"/reviews/queue/{Q3}/stamp", json={"expected_version": 5, "stamp_no": "0100010"}).status_code == 409
+
+
+def test_admin_edits_a_saved_stamp(env):
+    db, _, client = env()
+    add_stamp_rows(db)
+    q3_task = db.row("failed_scan_queue", Q3)["task_id"]
+    db.tables["sast_all_raw_data_survey"].append(
+        {"id": 901, "task_id": q3_task, "submitted_date": "2026-10-02", "instructor_ID": JUAN, "subject_id": IT101,
+         "term_id": TERM, "student_id": "2021-0003", "stamp_no": "0100003", "stamp_source": "gemini"})
+    url = "/reviews/raw/901/stamp"
+    r = client.post(url, json={"stamp_no": "0100011", "note": "typo"})
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "admin_only"  # SAO_STAFF
+    # Staff don't get the saved row; admins do (it carries the raw id for "Edit stamp").
+    assert by_id(client.get(f"/reviews/batch/{BATCH}").json()["queue"])[Q3]["saved_raw"] is None
+    env.as_user(ADMIN, "SAO_ADMIN")
+    saved = by_id(client.get(f"/reviews/batch/{BATCH}").json()["queue"])[Q3]["saved_raw"]
+    assert saved == {"id": 901, "stamp_no": "0100003", "stamp_source": "gemini", "stamp_ready": True}
+    r = client.post(url, json={"stamp_no": "0100005"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "duplicate_stamp"
+    assert r.json()["detail"]["duplicate_of"]["raw_id"] == 900
+    assert client.post(url, json={"stamp_no": "abc"}).status_code == 400
+    assert client.post("/reviews/raw/999/stamp", json={"stamp_no": "0100011"}).status_code == 404
+    r = client.post(url, json={"stamp_no": "0100011", "note": "typo"})
+    assert r.status_code == 200, r.text
+    assert r.json()["raw"] == {"id": 901, "task_id": q3_task, "stamp_no": "0100011", "stamp_source": "staff"}
+    raw = next(x for x in db.tables["sast_all_raw_data_survey"] if x["id"] == 901)
+    assert raw["stamp_no"] == "0100011" and raw["stamp_source"] == "staff"
+    assert db.row("failed_scan_queue", Q3)["stamp_no"] == "0100011"  # kept in step
+    assert any(a[1] == "raw_stamp_edited" and a[2]["previous_stamp"] == "0100003" for a in env.state["audits"])
+    r = client.post(url, json={"stamp_no": None})  # remove it
+    assert r.status_code == 200 and raw["stamp_no"] is None and raw["stamp_source"] is None
+
+
+def test_before_migration_015_the_page_keeps_working(env):
+    db, n8n, client = env()
+    db.missing = {"failed_scan_queue": rl.STAMP_COLUMN_NAMES, "sast_all_raw_data_survey": rl.STAMP_COLUMN_NAMES}
+    d = client.get(f"/reviews/batch/{BATCH}").json()
+    assert d["migration_ready"] is True and d["stamp_ready"] is False
+    assert {x["id"] for x in d["queue"]} == {Q1, Q2, Q3} and by_id(d["queue"])[Q1]["stamp_no"] is None
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100004"))
+    assert r.status_code == 200, r.text  # duplicate check skipped, stored without the stamp columns
+    assert n8n.calls[0][1]["stamp_no"] == "0100004" and "stamp_no" not in db.row("failed_scan_queue", Q1)
+    r = client.post(f"/reviews/queue/{Q2}/stamp", json={"expected_version": 1, "stamp_no": "0100004"})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "stamp_migration_required"
+    env.as_user(ADMIN, "SAO_ADMIN")
+    r = client.post("/reviews/raw/1/stamp", json={"stamp_no": "0100004"})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "stamp_migration_required"
+    # Applied later: picked up again once the retry window passes.
+    db.missing = {}
+    reviews._stamp_mig.update(missing_until=0.0)
+    assert client.get(f"/reviews/batch/{BATCH}").json()["stamp_ready"] is True
+
+
+def test_is_missing_stamp_column():
+    assert rl.is_missing_stamp_column(APIError({"code": "42703", "message": "column failed_scan_queue.stamp_no does not exist"}))
+    assert rl.is_missing_stamp_column(APIError({"code": "PGRST204",
+                                                "message": "Could not find the 'stamp_source' column of 'failed_scan_queue' in the schema cache"}))
+    assert not rl.is_missing_stamp_column(APIError({"code": "42703", "message": "column failed_scan_queue.review_version does not exist"}))
+    assert not rl.is_missing_review_column(APIError({"code": "42703", "message": "column failed_scan_queue.stamp_no does not exist"}))

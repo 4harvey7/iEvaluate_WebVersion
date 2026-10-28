@@ -402,6 +402,10 @@ def ingest_scan(body: IngestScan, station: dict = Depends(require_station)):
             "message": result["message"],
             "simulated": False,
             "idempotent": False,
+            # n8n discarded the sheet by itself ('duplicate_stamp': its stamp was already
+            # scanned this term); counted as flagged, shown as "Already scanned".
+            "auto_rejected": result.get("auto_rejected"),
+            "stamp_no": result.get("stamp_no"),
         }
     finally:
         # Whatever marking answered (or not): keep the page's picture + score for the

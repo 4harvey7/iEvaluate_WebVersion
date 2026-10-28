@@ -368,3 +368,34 @@ def test_reused_image_lookup_error_never_fails_the_scan(setup, monkeypatch):
     assert r.status_code == 200 and r.json()["status"] == "success"
     assert "reused_image" not in cap.payload
     assert sb.completes()[0]["p_status"] == "success"
+
+
+# ---------------------------------------------------------------- stamp numbers (migration 015)
+DUPLICATE_STAMP = {
+    "status": "flagged", "flagged": True, "review_reasons": ["duplicate_stamp"], "auto_rejected": "duplicate_stamp",
+    "stamp_no": "0100005",
+    "message": "Discarded automatically: this form was already scanned (stamp 0100005), so it is not counted.",
+}
+
+
+def test_duplicate_stamp_is_stored_flagged_with_its_reason(setup):
+    # Stored by n8n already discarded: counted as flagged, the live page shows "Already scanned".
+    sb, n8n, client = setup(claimed(), DUPLICATE_STAMP)
+    r = client.post("/scans/ingest", json=_payload())
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] == "flagged" and d["auto_rejected"] == "duplicate_stamp" and d["stamp_no"] == "0100005"
+    (c,) = sb.completes()
+    assert c["p_status"] == "flagged" and c["p_review_reasons"] == ["duplicate_stamp"]
+    assert c["p_message"].startswith("Discarded automatically: this form was already scanned")
+
+
+def test_auto_rejected_without_the_reason_still_gets_it():
+    v = logic.validate_n8n_response({**DUPLICATE_STAMP, "review_reasons": ["low_confidence"]})
+    assert v["review_reasons"] == ["duplicate_stamp", "low_confidence"] and v["auto_rejected"] == "duplicate_stamp"
+    # Unknown rules, bad stamps and other statuses are ignored.
+    v = logic.validate_n8n_response({"status": "flagged", "auto_rejected": "whatever", "stamp_no": "12ab"})
+    assert v["auto_rejected"] is None and v["stamp_no"] is None and v["review_reasons"] == []
+    v = logic.validate_n8n_response({"status": "success", "flagged": False, "auto_rejected": "duplicate_stamp"})
+    assert v["auto_rejected"] is None and v["review_reasons"] == []
+    assert logic.validate_n8n_response({"status": "success"})["auto_rejected"] is None

@@ -1,8 +1,10 @@
 @echo off
 REM ===========================================================================
 REM  "Is it working?" Double-click this file. It changes nothing.
-REM  Shows: is the watcher running, does it auto-start, does the scan folder
-REM  exist, and the last messages from watcher.log in plain words.
+REM  Shows: is the watcher running (it is started by hand with the "Start Scan
+REM  Watcher" shortcut, so "turned off" is normal), does the scan folder exist,
+REM  and the last messages from watcher.log in plain words. An auto-start that
+REM  IT turned on (install_task.bat) is shown as a note.
 REM ===========================================================================
 setlocal EnableExtensions DisableDelayedExpansion
 title Scan Watcher - Is it working?
@@ -36,12 +38,22 @@ if not defined PY goto no_python
 if not exist "%APPDIR%\setup_helper.py" goto no_python
 
 %PY% "%APPDIR%\setup_helper.py" report --dir "%APPDIR%" --running %RUNNING% --autostart %AUTOSTART%
+if errorlevel 2 goto turned_off
 if errorlevel 1 goto problem
 
 color 2F
 echo  ==============================================================
 echo    Looks good. The light on the website should be green.
 echo    Test: scan one page. It should show up on the website.
+echo  ==============================================================
+goto end
+
+:turned_off
+color 1F
+echo  ==============================================================
+echo    Nothing is broken. The Scan Watcher is just turned off.
+echo    Before scanning, double-click "Start Scan Watcher" on the
+echo    desktop. Then the light on the website turns green.
 echo  ==============================================================
 goto end
 
@@ -57,7 +69,7 @@ goto end
 color 4F
 echo.
 if "%RUNNING%"=="1" echo   [OK]  The Scan Watcher is running.
-if "%RUNNING%"=="0" echo   [!!]  The Scan Watcher is NOT running.
+if "%RUNNING%"=="0" echo   [i]   The Scan Watcher is turned off. Double-click Start Scan Watcher.
 echo   [!!]  The helper program is missing. Double-click INSTALL to fix this.
 echo.
 goto end

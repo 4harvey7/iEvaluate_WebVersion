@@ -32,6 +32,10 @@ STEP 4 - Wait
     Do not type anything. Just wait.
     The window turns green and says "ALL DONE".
     Close the window.
+    Two shortcuts are now on the desktop (and in the Start menu, in the
+    folder "iEvaluate Scan Watcher"):
+        "Start Scan Watcher"
+        "Stop Scan Watcher"
 
 STEP 5 - Set up your scanner
     Open your scanner program.
@@ -44,6 +48,11 @@ STEP 6 - Look at the website
     The light should be green. It says "Online".
 
 That's it! Keep the laptop on and connected to the internet.
+
+EVERY DAY: the Scan Watcher does NOT start by itself when you turn the
+laptop on. Before you scan, double-click "Start Scan Watcher" on the
+desktop (or in the Start menu). When you are done for the day, you can
+double-click "Stop Scan Watcher".
 
 
 HOW DO I KNOW IT WORKS?
@@ -59,9 +68,12 @@ SOMETHING WENT WRONG?
 ---------------------
 If you see ...                           Do this ...
 
-The light is red ("Offline")         ->  Turn the laptop on. Connect it to
-                                         the internet. Wait 1 minute.
-                                         Still red? Restart the laptop.
+The light is red ("Offline")         ->  The Scan Watcher is not running.
+                                         On the scanner laptop, double-click
+                                         "Start Scan Watcher" (desktop or
+                                         Start menu). Wait 1 minute.
+                                         Still red? Check the laptop is on
+                                         and connected to the internet.
 
 "Folder not found"                   ->  Check the folder on the website.
                                          Change it to C:\Scans. Wait 1 minute.
@@ -124,7 +136,16 @@ MOVING TO A NEW LAPTOP
 TO REMOVE IT
 ------------
     Double-click "UNINSTALL" in the ScanWatcher folder.
+    It stops the Scan Watcher and removes the "Start Scan Watcher" and
+    "Stop Scan Watcher" shortcuts.
     Your scans are NOT deleted.
+
+
+OLD LAPTOPS (installed before version 2.5.0)
+--------------------------------------------
+Older installs start the Scan Watcher by themselves when you log on.
+To switch to the new way, download the installer again and double-click
+INSTALL again. It removes the old auto-start.
 
 
 Please keep the ScanWatcher folder. You need CHECK and UNINSTALL later.

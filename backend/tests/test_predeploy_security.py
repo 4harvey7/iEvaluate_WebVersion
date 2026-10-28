@@ -327,7 +327,7 @@ def test_heartbeat_never_sends_a_network_folder(monkeypatch):
 
 
 def test_watcher_version():
-    assert fw.VERSION == "2.4.4"
+    assert fw.VERSION == "2.5.0"
 
 
 @pytest.mark.parametrize("remote", ["//srv/share/scans", "\\\\srv\\share\\scans", "\\\\?\\UNC\\srv\\share\\x"])

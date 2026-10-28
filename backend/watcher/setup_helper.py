@@ -9,6 +9,9 @@
         Exit 0 if the server in the settings file answers at all, 1 if not.
     python setup_helper.py report --dir <install folder> --running 0|1 --autostart 0|1
         Prints an "is it working?" report in plain words (CHECK.bat).
+        Exit: 0 all fine, running | 2 all fine, but turned off (started by hand
+              since 2.5.0 - not a problem) | 1 something needs fixing.
+        --autostart 1 (IT turned on install_task.bat) is only a note.
 """
 from __future__ import annotations
 
@@ -120,6 +123,8 @@ def cmd_online(args) -> int:
 # --------------------------------------------------------------------------- report
 HINTS = [
     # (text found in the log, plain-words meaning) - first match wins, newest line first
+    ("Told the website this laptop is offline", "The Scan Watcher was stopped. Double-click Start Scan Watcher "
+                                                "before scanning."),
     ("Station key rejected", "The website does not accept this laptop's key any more (a new installer was "
                              "downloaded for this station). Download the installer again and run INSTALL."),
     ("Config problem", "The settings file is broken. Download the installer from the website and run INSTALL."),
@@ -166,22 +171,26 @@ def _plain(line: str) -> str:
     return line
 
 
+TURNED_OFF = "The Scan Watcher is turned off. Double-click Start Scan Watcher."
+AUTOSTART_NOTE = "It also starts by itself at log-on; turn this off with uninstall_task.bat"
+
+
 def cmd_report(args) -> int:
+    """Exit 0 = all fine and running, 2 = all fine but turned off, 1 = something to fix."""
     app_dir = os.path.abspath(args.dir)
     cfg_path = os.path.join(app_dir, "watcher_config.json")
     ok = True
+    running = args.running == "1"
     print()
-    if args.running == "1":
+    # Since 2.5.0 the watcher is started by hand ("Start Scan Watcher"), so
+    # "turned off" is normal, not a problem - and so is "no auto-start".
+    if running:
         print("  [OK]  The Scan Watcher is running.")
     else:
-        ok = False
-        print("  [!!]  The Scan Watcher is NOT running.")
-        print("        Fix: restart the laptop, or double-click INSTALL again.")
+        print(f"  [i]   {TURNED_OFF}")
+        print("        (The shortcut is on the desktop. Start it before scanning.)")
     if args.autostart == "1":
-        print("  [OK]  It starts by itself when the laptop starts.")
-    else:
-        ok = False
-        print("  [!!]  It does NOT start by itself. Fix: double-click INSTALL again.")
+        print(f"  [i]   {AUTOSTART_NOTE}")
 
     folder = None
     try:
@@ -235,7 +244,9 @@ def cmd_report(args) -> int:
             print("    " + meaning)
     print()
     print(f"  (Full log: {log_path})")
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    return 0 if running else 2
 
 
 def main() -> int:

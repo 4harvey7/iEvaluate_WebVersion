@@ -15,9 +15,9 @@ it before they can see **INSTALL** (step 3 says so).
    - If you see "Windows protected your PC": click **"More info"**, then **"Run anyway"**.
    - If you see "Open File - Security Warning": click **"Run"**.
    - If you see "Do you want to allow this app to make changes": click **"Yes"**.
-4. Wait. Do not type anything. When the window turns green and says **"ALL DONE"**, close the window.
+4. Wait. Do not type anything. When the window turns green and says **"ALL DONE"**, close the window. Two shortcuts, **"Start Scan Watcher"** and **"Stop Scan Watcher"**, are now on the desktop.
 5. In your scanner program, look for **"Save to"**, **"Destination"** or **"Folder"**. Choose **C:\Scans**.
-6. Look at the website. The light should be green (**"Online"**). Scan one page to test it.
+6. Look at the website. The light should be green (**"Online"**). Scan one page to test it. From now on, double-click **"Start Scan Watcher"** before you scan. It does not start by itself.
 
 ## How do I know it works?
 
@@ -27,7 +27,7 @@ Start a batch for this station on the website, scan one page, wait one minute: t
 
 | If you see | Do this |
 |---|---|
-| Red light "Offline" | Turn the laptop on and connect it to the internet. Wait 1 minute. Still red? Restart the laptop. |
+| Red light "Offline" | The Scan Watcher isn't running. On the scanner laptop, double-click "Start Scan Watcher" (desktop or Start menu). Wait 1 minute. Still red? Check the laptop is on and connected to the internet. |
 | "Folder not found" | On the website, change the folder to C:\Scans. Wait 1 minute. |
 | "That folder isn't allowed" | The folder is too big (like the whole Desktop). On the website, change it to C:\Scans. |
 | The window closes right away | Right-click the ScanWatcher file, click "Extract All" first, then double-click INSTALL in the new folder. |
@@ -55,9 +55,9 @@ Do steps 1-6 on the new laptop. The old laptop stops sending scans (every new do
     "On the website, open \"Scanner setup\". Choose your scanner station. Click \"Download installer\".",
     "Open your Downloads folder. Right-click the ScanWatcher file. Click \"Extract All\", then \"Extract\".",
     "In the new window, double-click the \"ScanWatcher\" folder, then double-click \"INSTALL\".",
-    "Wait. Do not type anything. When the window turns green and says \"ALL DONE\", close the window.",
+    "Wait. Do not type anything. When the window turns green and says \"ALL DONE\", close the window. Two shortcuts, \"Start Scan Watcher\" and \"Stop Scan Watcher\", are now on the desktop.",
     "In your scanner program, look for \"Save to\", \"Destination\" or \"Folder\". Choose C:\\Scans.",
-    "Look at the website. The light should be green (\"Online\"). Scan one page to test it."
+    "Look at the website. The light should be green (\"Online\"). Scan one page to test it. From now on, double-click \"Start Scan Watcher\" before you scan. It does not start by itself."
   ],
   "windows_warnings": [
     { "see": "Windows protected your PC", "do": "Click \"More info\", then \"Run anyway\"." },
@@ -65,7 +65,7 @@ Do steps 1-6 on the new laptop. The old laptop stops sending scans (every new do
     { "see": "Do you want to allow this app to make changes", "do": "Click \"Yes\"." }
   ],
   "troubleshooting": [
-    { "see": "Red light \"Offline\"", "do": "Turn the laptop on and connect it to the internet. Wait 1 minute. Still red? Restart the laptop." },
+    { "see": "Red light \"Offline\"", "do": "The Scan Watcher isn't running. On the scanner laptop, double-click \"Start Scan Watcher\" (desktop or Start menu). Wait 1 minute. Still red? Check the laptop is on and connected to the internet." },
     { "see": "\"Folder not found\"", "do": "On the website, change the folder to C:\\Scans. Wait 1 minute." },
     { "see": "\"That folder isn't allowed\"", "do": "The folder is too big (like the whole Desktop). On the website, change it to C:\\Scans." },
     { "see": "The window closes right away", "do": "Right-click the ScanWatcher file, click \"Extract All\" first, then double-click INSTALL in the new folder." },

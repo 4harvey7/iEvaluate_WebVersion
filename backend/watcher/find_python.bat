@@ -1,5 +1,5 @@
 @echo off
-REM Helper (do not double-click). Used by INSTALL.bat, start_watcher.bat, CHECK.bat.
+REM Helper (do not double-click). Used by INSTALL.bat, start_watcher.bat, CHECK.bat, STOP.bat.
 REM Sets PY to a command that runs Python 3.10 or newer, for example
 REM   py -3      or      "C:\Users\me\AppData\Local\Programs\Python\Python312\python.exe"
 REM PY stays empty when no usable Python is found.

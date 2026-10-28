@@ -27,8 +27,11 @@ FILES = [
     "folder_watcher.py",
     "requirements.txt",
     "setup_helper.py",
-    # helpers used by the three .bat files above
+    # what the Start / Stop shortcuts open (made by shortcuts.bat)
     "start_watcher.bat",
+    "STOP.bat",
+    # helpers used by the .bat files above
+    "shortcuts.bat",
     "find_python.bat",
     "watcher_process.bat",
     "install_task.bat",

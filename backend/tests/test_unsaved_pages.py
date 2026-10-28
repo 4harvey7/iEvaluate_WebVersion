@@ -549,7 +549,7 @@ def test_to_review_makes_a_normal_queue_row_and_approve_works(env):
 
     # the existing approve flow takes it from here
     body = {"expected_version": q["review_version"], "instructor_id": JUAN, "subject_id": IT101, "student_id": "2021-0042",
-            "remarks": "", "ratings": {"m1": 5}}
+            "remarks": "", "ratings": {"m1": 5, "m2": 5, "m3": 5, "m4": 5, "m5": 5}}
     a = client.post(f"/reviews/queue/{q['id']}/approve", json=body)
     assert a.status_code == 200, a.text
     (_, payload, _) = env.state["correction"].calls[0]

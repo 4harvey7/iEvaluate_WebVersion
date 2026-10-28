@@ -40,7 +40,7 @@ from app.batch_access import is_batch_owner
 from app.db import get_settings, get_supabase, is_valid_uuid
 from app.logic import COUNTER_FOR_STATUS, parse_ts, sniff_image_type
 from app.routers import scans as scans_router
-from app.security import INSTRUCTOR_ROLES, CurrentUser, require_staff, role_maps
+from app.security import INSTRUCTOR_ROLES, CurrentUser, require_admin, require_staff, role_maps
 
 router = APIRouter()
 log = logging.getLogger("ievaluate.reviews")
@@ -54,6 +54,9 @@ NOT_YOUR_BATCH_MSG = (
     "Only the staff member who started this batch, or an SAO admin, can review these forms."
 )
 NOT_WEBSITE_MSG = "This form isn't from a website batch. Review it in the iEvaluate app."
+# min-answered rule (teacher, 2026-10-08)
+TOO_FEW_ANSWERS_MSG = ("Only {n} of the 20 items are answered. A form needs at least {min} answered items to be "
+                       "counted. Fill in any answers that were missed from the scan, or discard the form.")
 
 
 # ------------------------------------------------------------------ migration 005 state
@@ -85,6 +88,79 @@ def mark_migration_present() -> None:
             log.info("review columns (migration 005) are available.")
         _mig["missing_until"] = 0.0
         _mig["warned"] = False
+
+
+# ------------------------------------------------------------------ migration 015 state (stamp numbers)
+# Same idea for failed_scan_queue.stamp_no / stamp_source: before migration 015
+# the page works as before (no stamps shown); the columns are retried every 5 minutes.
+_stamp_mig = {"missing_until": 0.0, "warned": False}
+
+
+def stamp_columns_available() -> bool:
+    with _mig_lock:
+        return time.monotonic() >= _stamp_mig["missing_until"]
+
+
+def mark_stamp_missing(exc: Exception) -> None:
+    with _mig_lock:
+        first = not _stamp_mig["warned"]
+        _stamp_mig["missing_until"] = time.monotonic() + _RETRY_SECONDS
+        _stamp_mig["warned"] = True
+    if first:
+        log.warning("stamp columns are missing (%s). Apply migrations/015_stamp_no.sql; "
+                    "until then stamp numbers are not shown or checked.", getattr(exc, "code", None) or exc)
+
+
+def mark_stamp_present() -> None:
+    with _mig_lock:
+        if _stamp_mig["missing_until"] or _stamp_mig["warned"]:
+            log.info("stamp columns (migration 015) are available.")
+        _stamp_mig["missing_until"] = 0.0
+        _stamp_mig["warned"] = False
+
+
+def _maybe_stamp_column_error(exc: Exception) -> bool:
+    """A stamp column is named, or a bare 'undefined column' (which column is unknown)."""
+    if rl.is_missing_stamp_column(exc):
+        return True
+    return (isinstance(exc, APIError) and str(getattr(exc, "code", "") or "") in ("42703", "PGRST204")
+            and not str(getattr(exc, "message", "") or "").strip())
+
+
+def _select_fsq(sb, columns: str, build: Callable) -> list[dict]:
+    """Queue rows with the stamp columns when migration 015 is there, else
+    without them. build(query) adds the filters to the selected query."""
+    if stamp_columns_available():
+        try:
+            data = build(sb.table(FSQ).select(f"{columns}, {rl.QUEUE_STAMP_COLUMNS}")).execute().data or []
+        except APIError as e:
+            if not _maybe_stamp_column_error(e):
+                raise
+            data = build(sb.table(FSQ).select(columns)).execute().data or []  # raises if it was another column
+            mark_stamp_missing(e)
+            return data
+        mark_stamp_present()
+        return data
+    return build(sb.table(FSQ).select(columns)).execute().data or []
+
+
+def _update_fsq(sb, vals: dict, stamp_vals: dict | None, build: Callable, required: bool = False) -> dict | None:
+    """Conditional queue update that also writes the stamp columns (migration
+    015). Without them: written without the stamp, or 503 when the stamp is
+    the point of the action (required)."""
+    if stamp_vals and (required or stamp_columns_available()):
+        try:
+            res = build(sb.table(FSQ).update({**vals, **stamp_vals})).execute()
+        except APIError as e:
+            if not rl.is_missing_stamp_column(e):
+                raise
+            mark_stamp_missing(e)
+            if required:
+                raise _err(503, "stamp_migration_required", rl.STAMP_MIGRATION_MSG)
+        else:
+            mark_stamp_present()
+            return _first(res)
+    return _first(build(sb.table(FSQ).update(vals)).execute())
 
 
 # ------------------------------------------------------------------ n8n client
@@ -308,8 +384,8 @@ def _get_queue_row(sb, row_id: str, need_review: bool) -> dict:
     if not is_valid_uuid(row_id):
         raise _err(404, "not_found", "This form was not found. It may have been removed.")
     try:
-        rows = (sb.table(FSQ).select(_cols(rl.QUEUE_BASE_COLUMNS, rl.QUEUE_REVIEW_COLUMNS, need_review))
-                .eq("id", row_id).limit(1).execute().data)
+        rows = _select_fsq(sb, _cols(rl.QUEUE_BASE_COLUMNS, rl.QUEUE_REVIEW_COLUMNS, need_review),
+                           lambda q: q.eq("id", row_id).limit(1))
     except APIError as e:
         if need_review and rl.is_missing_review_column(e):
             mark_migration_missing(e)
@@ -342,8 +418,120 @@ def _get_import_error(sb, error_id: int, need_review: bool) -> dict:
     return rows[0]
 
 
-def _serialize_queue(sb, row: dict, batch: dict) -> dict:
-    return rl.serialize_queue_row(row, _batch_context(sb, batch), _names(sb, rl.people_ids([row], [])))
+def _serialize_queue(sb, row: dict, batch: dict, user: CurrentUser | None = None) -> dict:
+    ctx = _stamp_context(sb, [row], bool(user and user.is_admin))
+    names = {**ctx["people"], **_names(sb, rl.people_ids([row], []))}
+    return rl.serialize_queue_row(row, _batch_context(sb, batch), names, stamp_ctx=ctx)
+
+
+# ------------------------------------------------------------------ stamp numbers (migration 015)
+RAW = "sast_all_raw_data_survey"
+RAW_DUP_COLUMNS = "id, task_id, submitted_date, instructor_ID, subject_id, term_id, stamp_no"
+
+
+def _in_chunks(sb, table: str, cols: str, col: str, values: list[str]) -> list[dict]:
+    out: list[dict] = []
+    for i in range(0, len(values), ID_CHUNK):
+        out += sb.table(table).select(cols).in_(col, values[i:i + ID_CHUNK]).execute().data or []
+    return out
+
+
+def _stamp_context(sb, rows: list[dict], admin: bool = False) -> dict:
+    """What the stamp part of the rows needs (review_logic.stamp_fields): names
+    and subject codes of the forms they duplicate, the batch item that opens a
+    website original in the page viewer, and (admins) the saved raw row of each
+    credited form. Best effort: a failed lookup only leaves those fields empty."""
+    ctx: dict = {"people": {}, "subjects": {}, "items": {}, "saved": {}}
+    ids = rl.stamp_lookup_ids(rows)
+    try:
+        if ids["people"]:
+            ctx["people"] = _names(sb, ids["people"])
+        if ids["subjects"]:
+            ctx["subjects"] = {str(s["id"]): {"code": s.get("subject_code"), "name": s.get("subject_name")}
+                               for s in _in_chunks(sb, "subjects", "id, subject_code, subject_name", "id", ids["subjects"])}
+        if ids["tasks"]:
+            ctx["items"] = {str(i["task_id"]): str(i["id"])
+                            for i in _in_chunks(sb, "scan_batch_items", "id, task_id", "task_id", ids["tasks"])
+                            if i.get("task_id") and i.get("id")}
+    except APIError:
+        log.exception("could not look up the forms that review rows duplicate")
+    tasks = sorted({str(r["task_id"]) for r in rows if r.get("status") == "validated" and r.get("task_id")})
+    if admin and tasks:
+        ctx["saved"] = _saved_raw_rows(sb, tasks)
+    return ctx
+
+
+def _saved_raw_rows(sb, tasks: list[str]) -> dict:
+    """task_id -> {id, stamp_no, stamp_source} of the stored results (the admin's "Edit stamp")."""
+    with_stamp = stamp_columns_available()
+    try:
+        try:
+            rows = _in_chunks(sb, RAW, "id, task_id, stamp_no, stamp_source" if with_stamp else "id, task_id", "task_id", tasks)
+        except APIError as e:
+            if not (with_stamp and rl.is_missing_stamp_column(e)):
+                raise
+            mark_stamp_missing(e)
+            rows, with_stamp = _in_chunks(sb, RAW, "id, task_id", "task_id", tasks), False
+    except APIError:
+        log.exception("could not read the saved results of credited forms")
+        return {}
+    out = {}
+    for r in rows:
+        if r.get("task_id") and r.get("id") is not None:
+            stamp = rl.stamp_no_or_none(r.get("stamp_no"))
+            out[str(r["task_id"])] = {"id": r["id"], "stamp_no": stamp,
+                                      "stamp_source": rl.stamp_source_or_none(r.get("stamp_source"), stamp),
+                                      "stamp_ready": with_stamp}
+    return out
+
+
+def _stamp_or_400(value: Any) -> str | None:
+    try:
+        return rl.normalize_stamp_no(value)
+    except ValueError:
+        raise _err(400, "invalid_stamp", "The stamp number must be 3 to 12 digits (numbers only), exactly as printed.")
+
+
+def _stamp_term(row: dict, batch: dict | None) -> str | None:
+    term = row.get("term_id") or (batch or {}).get("term_id")
+    return str(term) if term and is_valid_uuid(str(term)) else None
+
+
+def _stamp_duplicate(sb, term_id: str | None, stamp_no: str | None, task_id: str | None = None,
+                     raw_id: int | None = None) -> dict | None:
+    """The stored result (sast_all_raw_data_survey) that already has this stamp
+    for the term, other than this form itself (same task_id, or the raw row
+    being edited). None when there is none, or before migration 015."""
+    if not stamp_no or not term_id:
+        return None
+    try:
+        rows = (sb.table(RAW).select(RAW_DUP_COLUMNS).eq("term_id", term_id).eq("stamp_no", stamp_no)
+                .limit(5).execute().data or [])
+    except APIError as e:
+        if rl.is_missing_stamp_column(e):
+            mark_stamp_missing(e)
+            return None
+        raise
+    for r in rows:
+        if raw_id is not None and str(r.get("id")) == str(raw_id):
+            continue
+        if task_id is not None and r.get("task_id") == task_id:
+            continue
+        return rl.duplicate_from_raw(r)
+    return None
+
+
+def _duplicate_stamp_error(sb, dup: dict | None, stamp_no: str | None, message: str, **extra) -> HTTPException:
+    """409 duplicate_stamp with the stored form it clashes with (enriched for the page)."""
+    dup = dup or {"stamp_no": stamp_no}
+    ctx = _stamp_context(sb, [{"partial_data": {"duplicate_of": dup}}])
+    enriched = rl.enrich_duplicate(rl.clean_duplicate_of(dup), ctx["people"], ctx)
+    return _err(409, "duplicate_stamp", message.format(stamp=stamp_no or (enriched or {}).get("stamp_no") or "?"),
+                duplicate_of=enriched, stamp_no=stamp_no, **extra)
+
+
+DUPLICATE_STAMP_MSG = ("Stamp {stamp} is already on a form that is saved for this term, so this sheet would be counted "
+                       "twice. Check the stamp number on the sheet. If this sheet really was scanned before, discard it.")
 
 
 def _serialize_import(sb, row: dict) -> dict:
@@ -376,14 +564,15 @@ def _load_lists(sb, batch_id: str, user: CurrentUser, full_access: bool, since_d
                     q = q.gte("updated_at", rl.since_filter_value(since_dt))
                 return q.order("created_at").limit(MAX_ROWS)
 
-            queue = queue_q(sb.table(FSQ).select(_cols(rl.QUEUE_BASE_COLUMNS, rl.QUEUE_REVIEW_COLUMNS, ready))).execute().data or []
+            queue = _select_fsq(sb, _cols(rl.QUEUE_BASE_COLUMNS, rl.QUEUE_REVIEW_COLUMNS, ready), queue_q)
             imports = []
             if full_access:
                 imports = import_q(sb.table(IE).select(_cols(rl.IMPORT_BASE_COLUMNS, rl.IMPORT_REVIEW_COLUMNS, ready))).execute().data or []
             flight_q, flight_ie = [], []
             if ready:
-                flight_q = (_scoped_queue(sb.table(FSQ).select(f"{rl.QUEUE_BASE_COLUMNS}, {rl.QUEUE_REVIEW_COLUMNS}"), batch_id, user, full_access)
-                            .in_("review_state", list(rl.REVIEW_STATES)).limit(200).execute().data or [])
+                flight_q = _select_fsq(sb, f"{rl.QUEUE_BASE_COLUMNS}, {rl.QUEUE_REVIEW_COLUMNS}",
+                                       lambda q: _scoped_queue(q, batch_id, user, full_access)
+                                       .in_("review_state", list(rl.REVIEW_STATES)).limit(200))
                 if full_access:
                     flight_ie = (sb.table(IE).select(f"{rl.IMPORT_BASE_COLUMNS}, {rl.IMPORT_REVIEW_COLUMNS}")
                                  .like("task_id", web_like).in_("review_state", list(rl.REVIEW_STATES))
@@ -506,8 +695,9 @@ def list_batch_reviews(batch_id: str, since: str | None = Query(default=None, ma
             unsaved_rows, open_rows = _settle_unsaved(sb, batch, unsaved_rows, open_rows, settings, now)
         unsaved_pending = sum(1 for r in open_rows if r.get("status") in (uv.NEEDS_REVIEW, uv.SENDING))
     ctx = _batch_context(sb, batch)
-    names = _names(sb, sorted(set(rl.people_ids(queue, imports)) | {
-        str(r["acted_by"]) for r in unsaved_rows if is_valid_uuid(str(r.get("acted_by") or ""))}))
+    stamp_ctx = _stamp_context(sb, queue, user.is_admin)
+    names = {**stamp_ctx["people"], **_names(sb, sorted(set(rl.people_ids(queue, imports)) | {
+        str(r["acted_by"]) for r in unsaved_rows if is_valid_uuid(str(r.get("acted_by") or ""))}))}
     stamp = rl.iso(now)
     retry_ready = bool(getattr(settings, "n8n_batch_webhook_url", ""))
     return {
@@ -517,6 +707,8 @@ def list_batch_reviews(batch_id: str, since: str | None = Query(default=None, ma
         "migration_ready": ready,
         "correction_ready": bool(getattr(settings, "n8n_correction_webhook_url", "")),
         "import_correction_ready": bool(getattr(settings, "n8n_import_error_webhook_url", "")),
+        # Stamp numbers (migration 015) are read and checked.
+        "stamp_ready": stamp_columns_available(),
         "access": "full" if full_access else "own",
         "batch": {
             "id": batch["id"],
@@ -530,7 +722,7 @@ def list_batch_reviews(batch_id: str, since: str | None = Query(default=None, ma
         "counts": counts,
         # task_ids of forms that were credited but are now waiting in Import errors.
         "import_pending_tasks": pending_tasks,
-        "queue": [rl.serialize_queue_row(r, ctx, names, now) for r in queue],
+        "queue": [rl.serialize_queue_row(r, ctx, names, now, stamp_ctx) for r in queue],
         "import_errors": [rl.serialize_import_error(r, names, now) for r in imports],
         # "Couldn't be saved": pages marking didn't store (Try again / Type in the answers).
         "unsaved_ready": unsaved_ready,
@@ -810,35 +1002,54 @@ def claim_queue_row(row_id: str, body: ClaimBody | None = None, user: CurrentUse
 def _post_correction(url: str, payload: dict) -> tuple[str, str]:
     """-> ('ok', '') | ('unknown', '') when n8n may still be working on it
     (timeout / dropped connection) | ('failed', plain-English reason)."""
+    result, message, _ = _send_correction(url, payload)
+    if result == "duplicate_stamp":  # only the queue correction carries a stamp
+        return "failed", "Marking could not process the correction. Check the form and send it again."
+    return result, message
+
+
+def _answer_body(resp) -> Any:
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if isinstance(body, list) and len(body) == 1:
+        body = body[0]
+    return body
+
+
+def _send_correction(url: str, payload: dict) -> tuple[str, str, dict | None]:
+    """_post_correction, plus ('duplicate_stamp', message, DUP) when n8n
+    refused the correction because the stamp is already stored for the term
+    (HTTP 409 {success: false, code: 'duplicate_stamp', duplicate_of}); nothing was saved."""
     secret = getattr(get_settings(), "n8n_webhook_secret", "") or ""
     headers = {"X-Webhook-Secret": secret} if secret else {}
     try:
         resp = _n8n().post(url, json=payload, headers=headers)
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         log.warning("correction webhook unreachable: %s", type(e).__name__)
-        return "failed", "Marking could not be reached, so the correction was not sent. Try again in a minute."
+        return "failed", "Marking could not be reached, so the correction was not sent. Try again in a minute.", None
     except httpx.TimeoutException:
         log.warning("correction webhook timed out (task %s); left submitting", payload.get("task_id"))
-        return "unknown", ""
+        return "unknown", "", None
     except httpx.HTTPError as e:
         log.warning("correction webhook connection dropped (%s, task %s); left submitting", type(e).__name__, payload.get("task_id"))
-        return "unknown", ""
+        return "unknown", "", None
     if resp.status_code in (401, 403):
         log.error("correction webhook rejected the secret (HTTP %s)", resp.status_code)
-        return "failed", "Marking refused the server's credentials (a setup problem). Ask IT to check N8N_WEBHOOK_SECRET."
+        return "failed", "Marking refused the server's credentials (a setup problem). Ask IT to check N8N_WEBHOOK_SECRET.", None
+    body = _answer_body(resp)
+    if (isinstance(body, dict) and body.get("code") == rl.DUPLICATE_STAMP
+            and (resp.status_code == 409 or body.get("success") is False)):
+        log.info("correction refused by marking: duplicate stamp (task %s)", payload.get("task_id"))
+        return "duplicate_stamp", str(body.get("message") or "")[:500], rl.clean_duplicate_of(body.get("duplicate_of"))
     if not 200 <= resp.status_code < 300:
         log.warning("correction webhook returned HTTP %s (task %s)", resp.status_code, payload.get("task_id"))
         return "failed", (f"Marking answered with an error (HTTP {resp.status_code}), so the correction may not be saved. "
-                          "Check the form and send it again.")
-    try:
-        body = resp.json()
-    except ValueError:
-        body = None
-    if isinstance(body, list) and len(body) == 1:
-        body = body[0]
+                          "Check the form and send it again."), None
     if isinstance(body, dict) and body.get("success") is False:
-        return "failed", "Marking could not process the correction. Check the form and send it again."
-    return "ok", ""
+        return "failed", "Marking could not process the correction. Check the form and send it again.", None
+    return "ok", "", None
 
 
 def _mark_submit_failed(sb, table: str, row_id, message: str) -> dict | None:
@@ -869,6 +1080,27 @@ class ApproveBody(BaseModel):
     remarks: str = Field(default="", max_length=4000)
     ratings: dict[str, Any] = Field(default_factory=dict)
     confirm_overwrite: bool = False
+    # Stamp number (migration 015). Left out by an older page: the row's own stamp is kept.
+    stamp_no: str | None = Field(default=None, max_length=40)
+    no_stamp: bool = False  # staff checked: the sheet has no stamp
+
+
+STAMP_REQUIRED_MSG = ("Marking couldn't read one stamp number on this sheet. Type the number stamped on the sheet, "
+                      "or choose \"Form has no stamp\".")
+STAMP_AND_NO_STAMP_MSG = "Either type the stamp number or choose \"Form has no stamp\", not both."
+
+
+def _approve_stamp(row: dict, body: ApproveBody) -> str | None:
+    """The stamp number to save with the correction (None = the form has no stamp)."""
+    typed = "stamp_no" in body.model_fields_set
+    stamp = _stamp_or_400(body.stamp_no) if typed else rl.stamp_no_or_none(row.get("stamp_no"))
+    if body.no_stamp:
+        if typed and stamp:
+            raise _err(400, "invalid_stamp", STAMP_AND_NO_STAMP_MSG)
+        return None
+    if stamp is None and rl.has_stamp_reason(rl.reasons_list(row.get("review_reasons"))):
+        raise _err(400, "stamp_required", STAMP_REQUIRED_MSG)
+    return stamp
 
 
 @router.post("/queue/{row_id}/approve")
@@ -883,6 +1115,11 @@ def approve_queue_row(row_id: str, body: ApproveBody, user: CurrentUser = Depend
     except rl.ReviewConflict as c:
         raise _conflict(c)
     ratings = _ratings_or_400(body.ratings)
+    answered = rl.answered_count(ratings)
+    if answered < rl.MIN_ANSWERED:
+        raise _err(400, "too_few_answers", TOO_FEW_ANSWERS_MSG.format(n=answered, min=rl.MIN_ANSWERED),
+                   answered=answered, minimum=rl.MIN_ANSWERED)
+    stamp_no = _approve_stamp(row, body)
     instructor, subject = _check_people(sb, body.instructor_id, body.subject_id)
     url = getattr(settings, "n8n_correction_webhook_url", "")
     if not url:
@@ -891,18 +1128,24 @@ def approve_queue_row(row_id: str, body: ApproveBody, user: CurrentUser = Depend
     student_id = rl.clean_student_id(body.student_id)
     remarks = rl.clean_remarks(body.remarks)
     term_id = row.get("term_id") or batch.get("term_id")
+    # One sheet, one stamp per term: the same paper is never counted twice.
+    dup = _stamp_duplicate(sb, _stamp_term(row, batch), stamp_no, task_id=row.get("task_id"))
+    if dup is not None:
+        raise _duplicate_stamp_error(sb, dup, stamp_no, DUPLICATE_STAMP_MSG)
     if student_id and not body.confirm_overwrite:
         existing = _other_raw_row(sb, instructor["id"], subject["id"], term_id, student_id, row.get("task_id"))
         if existing is not None:
             raise _would_overwrite(existing, student_id)
 
     action = rl.review_action_for(instructor["id"], subject["id"], batch)
+    stamp_source = rl.stamp_source_for_approve(row, stamp_no)
     stamp = rl.iso(now)
     correction = {
         "action": action,
         "instructor_id": instructor["id"], "instructor_name": rl.full_name(instructor),
         "subject_id": subject["id"], "subject_code": subject.get("subject_code"),
         "student_id": student_id, "remarks": remarks, "ratings": ratings, "term_id": term_id,
+        "stamp_no": stamp_no, "stamp_source": stamp_source, "no_stamp": stamp_no is None and bool(body.no_stamp),
         "confirm_overwrite": bool(body.confirm_overwrite),
         "reviewed_by": user.id, "reviewed_by_name": user.full_name, "submitted_at": stamp,
     }
@@ -913,23 +1156,33 @@ def approve_queue_row(row_id: str, body: ApproveBody, user: CurrentUser = Depend
     if not started:
         _raise_current_conflict(_get_queue_row(sb, row_id, need_review=True), body.expected_version, rl.QUEUE_PENDING)
 
-    payload = rl.correction_payload(row, instructor, subject, ratings, student_id, remarks, term_id, user.id, stamp)
-    result, message = _post_correction(url, payload)
+    payload = rl.correction_payload(row, instructor, subject, ratings, student_id, remarks, term_id, user.id, stamp,
+                                    stamp_no=stamp_no, stamp_source=stamp_source)
+    result, message, n8n_dup = _send_correction(url, payload)
     meta = {"failed_scan_id": row["id"], "task_id": row.get("task_id"), "batch_id": row.get("batch_id"),
-            "action": action, "instructor_id": instructor["id"], "subject_id": subject["id"]}
+            "action": action, "instructor_id": instructor["id"], "subject_id": subject["id"], "stamp_no": stamp_no}
+    if result == "duplicate_stamp":
+        # Marking saved nothing: the form waits for review again, as it was.
+        back = _first(sb.table(FSQ).update({"review_state": None, "review_error": None})
+                      .eq("id", row["id"]).eq("review_state", "submitting").execute()) \
+            or {**started, "review_state": None, "review_error": None}
+        audit(user.id, "scan_review_duplicate_stamp", meta)
+        raise _duplicate_stamp_error(sb, n8n_dup or {"stamp_no": stamp_no, "term_id": _stamp_term(row, batch)},
+                                     stamp_no, DUPLICATE_STAMP_MSG, row=_serialize_queue(sb, back, batch, user))
     if result == "failed":
         failed = _mark_submit_failed(sb, FSQ, row["id"], message) or {**started, "review_state": "submit_failed", "review_error": message}
         audit(user.id, "scan_review_submit_failed", meta)
-        raise _err(502, "correction_failed", message, row=_serialize_queue(sb, failed, batch))
+        raise _err(502, "correction_failed", message, row=_serialize_queue(sb, failed, batch, user))
     if result == "unknown":
         audit(user.id, "scan_review_submitted", meta)
-        return {"ok": True, "outcome": "submitted", "row": _serialize_queue(sb, started, batch)}
+        return {"ok": True, "outcome": "submitted", "row": _serialize_queue(sb, started, batch, user)}
 
-    done = _first(sb.table(FSQ).update({
+    done = _update_fsq(sb, {
         "status": "validated", "review_state": None, "review_error": None, "review_action": action,
         "validated_by": user.id, "validated_at": rl.iso(rl.now_utc()),
         "review_claimed_by": None, "review_claimed_at": None,
-    }).eq("id", row["id"]).eq("review_state", "submitting").execute())
+    }, {"stamp_no": stamp_no, "stamp_source": stamp_source},
+        lambda q: q.eq("id", row["id"]).eq("review_state", "submitting"))
     if not done:
         done = _get_queue_row(sb, row_id, need_review=True)
     # n8n answers right after marking the row validated and runs the shared flow
@@ -941,7 +1194,7 @@ def approve_queue_row(row_id: str, body: ApproveBody, user: CurrentUser = Depend
     page_images.set_summary_for_task(sb, str(row.get("batch_id")), row.get("task_id"),
                                      page_scores.from_correction(ratings, instructor, subject, student_id))
     audit(user.id, "scan_review_approved", {**meta, "outcome": outcome})
-    return {"ok": True, "outcome": outcome, "row": _serialize_queue(sb, done, batch)}
+    return {"ok": True, "outcome": outcome, "row": _serialize_queue(sb, done, batch, user)}
 
 
 class RejectBody(BaseModel):
@@ -970,6 +1223,158 @@ def reject_queue_row(row_id: str, body: RejectBody, user: CurrentUser = Depends(
         _raise_current_conflict(_get_queue_row(sb, row_id, need_review=True), body.expected_version, rl.QUEUE_PENDING)
     audit(user.id, "scan_review_rejected", {"failed_scan_id": row["id"], "task_id": row.get("task_id"), "batch_id": row.get("batch_id")})
     return {"ok": True, "outcome": "rejected", "row": _serialize_queue(sb, done, batch)}
+
+
+# ------------------------------------------------------------------ queue: stamp number (migration 015)
+NOT_AUTO_DUPLICATE_MSG = ("Only a form that was discarded automatically because its stamp was already scanned "
+                          "can be taken back this way.")
+OVERRIDE_NOTE_REQUIRED_MSG = "Write why this form should be counted after all (for example: the stamp was misread)."
+OVERRIDE_DUPLICATE_MSG = ("Stamp {stamp} is still on another form that is saved for this term. Type the correct stamp "
+                          "number, or save this form without a stamp.")
+RAW_DUPLICATE_MSG = "Stamp {stamp} is already on another form that is saved for this term, so nothing was changed."
+RAW_NOT_FOUND_MSG = "This saved form was not found. It may have been removed."
+
+
+class OverrideBody(BaseModel):
+    expected_version: int = Field(ge=0, le=2_000_000_000)
+    stamp_no: str | None = Field(default=None, max_length=40)  # None / "" = save the form without a stamp
+    note: str = Field(default="", max_length=500)
+
+
+@router.post("/queue/{row_id}/override")
+def override_duplicate_stamp(row_id: str, body: OverrideBody, user: CurrentUser = Depends(require_staff)):
+    """Take back a form n8n discarded as already scanned (duplicate stamp): it
+    goes back to Needs review with the stamp typed here (stamp_source
+    'override') or without a stamp, and is then credited the usual way. Who,
+    why and the stamps before/after are kept in partial_data.stamp_override."""
+    sb = get_supabase()
+    now = rl.now_utc()
+    row = _get_queue_row(sb, row_id, need_review=True)
+    batch = _require_queue_access(sb, row, user)
+    current = rl.version_of(row)
+    if not rl.is_auto_duplicate(row):
+        raise _err(409, "not_auto_duplicate", NOT_AUTO_DUPLICATE_MSG, form_status=row.get("status"), current_version=current)
+    if int(body.expected_version) != current:
+        raise _err(409, "stale_row", "This form changed meanwhile. Look at the new version, then try again.",
+                   current_version=current)
+    note = " ".join((body.note or "").split())[:500]
+    if not note:
+        raise _err(400, "note_required", OVERRIDE_NOTE_REQUIRED_MSG)
+    stamp_no = _stamp_or_400(body.stamp_no)
+    dup = _stamp_duplicate(sb, _stamp_term(row, batch), stamp_no, task_id=row.get("task_id"))
+    if dup is not None:
+        raise _duplicate_stamp_error(sb, dup, stamp_no, OVERRIDE_DUPLICATE_MSG)
+
+    p = dict(rl.as_dict(row.get("partial_data")))
+    previous = rl.stamp_no_or_none(row.get("stamp_no")) or rl.stamp_no_or_none(rl.as_dict(p.get("duplicate_of")).get("stamp_no"))
+    p["stamp_override"] = {"by": user.id, "by_name": user.full_name, "note": note, "at": rl.iso(now),
+                           "previous_stamp": previous, "new_stamp": stamp_no,
+                           "previous_correction": rl.as_dict(row.get("review_correction")) or None}
+    reasons = [r for r in rl.reasons_list(row.get("review_reasons")) if r != rl.DUPLICATE_STAMP]
+    done = _update_fsq(sb, {
+        "status": rl.QUEUE_PENDING, "review_action": None, "review_state": None, "review_error": None,
+        "review_correction": None, "validated_by": None, "validated_at": None,
+        "review_reasons": reasons, "partial_data": p,
+        "review_claimed_by": user.id, "review_claimed_at": rl.iso(now),
+    }, {"stamp_no": stamp_no, "stamp_source": "override" if stamp_no else None},
+        lambda q: q.eq("id", row["id"]).eq("review_version", body.expected_version).eq("status", "discarded"),
+        required=True)
+    if not done:
+        fresh = _get_queue_row(sb, row_id, need_review=True)
+        if not rl.is_auto_duplicate(fresh):
+            raise _err(409, "already_resolved", "This form was already dealt with, so nothing was changed.",
+                       form_status=fresh.get("status"), current_version=rl.version_of(fresh))
+        raise _err(409, "stale_row", "This form changed meanwhile. Look at the new version, then try again.",
+                   current_version=rl.version_of(fresh))
+    audit(user.id, "scan_review_stamp_override", {
+        "failed_scan_id": row["id"], "task_id": row.get("task_id"), "batch_id": row.get("batch_id"),
+        "previous_stamp": previous, "new_stamp": stamp_no, "note": note})
+    return {"ok": True, "outcome": "reopened", "row": _serialize_queue(sb, done, batch, user)}
+
+
+class StampBody(BaseModel):
+    expected_version: int = Field(ge=0, le=2_000_000_000)
+    stamp_no: str | None = Field(default=None, max_length=40)  # None / "" = no stamp
+
+
+@router.post("/queue/{row_id}/stamp")
+def fix_queue_stamp(row_id: str, body: StampBody, user: CurrentUser = Depends(require_staff)):
+    """Fix the stamp number of a form still waiting for review (stamp_source
+    'staff'; who and when in partial_data.stamp_fix). Approving the form also
+    carries the stamp, so this is only needed to store it on its own."""
+    sb = get_supabase()
+    now = rl.now_utc()
+    row = _get_queue_row(sb, row_id, need_review=True)
+    batch = _require_queue_access(sb, row, user)
+    try:
+        rl.check_can_act(row, body.expected_version, now)
+    except rl.ReviewConflict as c:
+        raise _conflict(c)
+    stamp_no = _stamp_or_400(body.stamp_no)
+    dup = _stamp_duplicate(sb, _stamp_term(row, batch), stamp_no, task_id=row.get("task_id"))
+    if dup is not None:
+        raise _duplicate_stamp_error(sb, dup, stamp_no, DUPLICATE_STAMP_MSG)
+    p = dict(rl.as_dict(row.get("partial_data")))
+    previous = rl.stamp_no_or_none(row.get("stamp_no"))
+    p["stamp_fix"] = {"by": user.id, "by_name": user.full_name, "at": rl.iso(now),
+                      "previous_stamp": previous, "new_stamp": stamp_no}
+    done = _update_fsq(sb, {"partial_data": p}, {"stamp_no": stamp_no, "stamp_source": "staff" if stamp_no else None},
+                       lambda q: q.eq("id", row["id"]).eq("review_version", body.expected_version)
+                       .eq("status", rl.QUEUE_PENDING), required=True)
+    if not done:
+        _raise_current_conflict(_get_queue_row(sb, row_id, need_review=True), body.expected_version, rl.QUEUE_PENDING)
+    audit(user.id, "scan_review_stamp_fixed", {"failed_scan_id": row["id"], "task_id": row.get("task_id"),
+                                               "batch_id": row.get("batch_id"), "previous_stamp": previous,
+                                               "new_stamp": stamp_no})
+    return {"ok": True, "outcome": "stamp_saved", "row": _serialize_queue(sb, done, batch, user)}
+
+
+class RawStampBody(BaseModel):
+    stamp_no: str | None = Field(default=None, max_length=40)  # None / "" = remove the stamp
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/raw/{raw_id}/stamp")
+def edit_raw_stamp(raw_id: int, body: RawStampBody, user: CurrentUser = Depends(require_admin)):
+    """SAO admin: change the stamp number of a form that is already saved
+    (sast_all_raw_data_survey). The form's review row is kept in step."""
+    sb = get_supabase()
+    stamp_no = _stamp_or_400(body.stamp_no)
+    note = " ".join((body.note or "").split())[:500] or None
+    try:
+        rows = sb.table(RAW).select("id, task_id, term_id, stamp_no, stamp_source").eq("id", raw_id).limit(1).execute().data
+    except APIError as e:
+        if rl.is_missing_stamp_column(e):
+            mark_stamp_missing(e)
+            raise _err(503, "stamp_migration_required", rl.STAMP_MIGRATION_MSG)
+        raise
+    if not rows:
+        raise _err(404, "not_found", RAW_NOT_FOUND_MSG)
+    raw = rows[0]
+    term = str(raw.get("term_id") or "")
+    previous = rl.stamp_no_or_none(raw.get("stamp_no"))
+    dup = _stamp_duplicate(sb, term if is_valid_uuid(term) else None, stamp_no, raw_id=raw["id"])
+    if dup is not None:
+        raise _duplicate_stamp_error(sb, dup, stamp_no, RAW_DUPLICATE_MSG)
+    vals = {"stamp_no": stamp_no, "stamp_source": "staff" if stamp_no else None}
+    try:
+        sb.table(RAW).update(vals).eq("id", raw["id"]).execute()
+    except APIError as e:
+        if str(getattr(e, "code", "") or "") == "23505":  # stored meanwhile (unique term + stamp)
+            raise _duplicate_stamp_error(sb, _stamp_duplicate(sb, term, stamp_no, raw_id=raw["id"]), stamp_no,
+                                         RAW_DUPLICATE_MSG)
+        if rl.is_missing_stamp_column(e):
+            mark_stamp_missing(e)
+            raise _err(503, "stamp_migration_required", rl.STAMP_MIGRATION_MSG)
+        raise
+    if raw.get("task_id"):
+        try:
+            sb.table(FSQ).update(vals).eq("task_id", raw["task_id"]).execute()
+        except APIError:
+            log.exception("could not copy the stamp to the review row of task %s", raw.get("task_id"))
+    audit(user.id, "raw_stamp_edited", {"raw_id": raw["id"], "task_id": raw.get("task_id"),
+                                        "previous_stamp": previous, "new_stamp": stamp_no, "note": note})
+    return {"ok": True, "raw": {"id": raw["id"], "task_id": raw.get("task_id"), **vals}}
 
 
 # ------------------------------------------------------------------ import errors: resolve / discard

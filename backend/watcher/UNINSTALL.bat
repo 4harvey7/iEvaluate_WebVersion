@@ -1,8 +1,9 @@
 @echo off
 REM ===========================================================================
 REM  Removes the Scan Watcher from this computer. Double-click this file.
-REM  Stops the watcher and removes the auto-start. Scans and the scan folder
-REM  are NOT touched. Program files stay in %LOCALAPPDATA%\ScanWatcher
+REM  Stops the watcher (STOP.bat: also tells the website), removes the Start /
+REM  Stop shortcuts and any auto-start. Scans and the scan folder are NOT
+REM  touched. Program files stay in %LOCALAPPDATA%\ScanWatcher
 REM  (delete that folder by hand if you want them gone).
 REM ===========================================================================
 setlocal EnableExtensions DisableDelayedExpansion
@@ -13,6 +14,11 @@ set "HERE=%~dp0"
 set "DEST=%LOCALAPPDATA%\ScanWatcher"
 set "TOOLS=%DEST%"
 if not exist "%TOOLS%\watcher_process.bat" set "TOOLS=%HERE:~0,-1%"
+REM An older install in DEST may not have these yet: then use the ones here.
+set "SW_STOPPER=%TOOLS%\STOP.bat"
+if not exist "%SW_STOPPER%" set "SW_STOPPER=%HERE%STOP.bat"
+set "SW_SHORTCUTS=%TOOLS%\shortcuts.bat"
+if not exist "%SW_SHORTCUTS%" set "SW_SHORTCUTS=%HERE%shortcuts.bat"
 
 cls
 echo.
@@ -26,29 +32,30 @@ echo   This stops the Scan Watcher on this computer.
 echo   Your scans and the scan folder are NOT deleted.
 echo.
 
-if not exist "%TOOLS%\watcher_process.bat" goto missing_files
+if not exist "%SW_STOPPER%" goto missing_files
+if not exist "%SW_SHORTCUTS%" goto missing_files
 if not exist "%TOOLS%\uninstall_task.bat" goto missing_files
 
 echo  --------------------------------------------------------------
-echo   Step 1 of 2:  Stopping the Scan Watcher
+echo   Step 1 of 3:  Stopping the Scan Watcher
 echo  --------------------------------------------------------------
-call "%TOOLS%\watcher_process.bat" stop
-call "%TOOLS%\watcher_process.bat" check
-if not errorlevel 1 goto still_running
-echo   [OK] Stopped.
-call :tell_website
-goto stopped_done
-:still_running
-echo   [!] It is still running. Restart the computer to stop it.
-:stopped_done
+call "%SW_STOPPER%" /quiet
 echo.
 
 echo  --------------------------------------------------------------
-echo   Step 2 of 2:  Removing the auto-start
+echo   Step 2 of 3:  Removing the Start / Stop shortcuts
+echo  --------------------------------------------------------------
+call "%SW_SHORTCUTS%" remove /quiet
+if errorlevel 1 echo   [!] Some shortcuts are left. Delete "Start Scan Watcher" and "Stop Scan Watcher" from the desktop by hand.
+if not errorlevel 1 echo   [OK] Shortcuts removed.
+echo.
+
+echo  --------------------------------------------------------------
+echo   Step 3 of 3:  Removing any auto-start
 echo  --------------------------------------------------------------
 call "%TOOLS%\uninstall_task.bat" /quiet
 if errorlevel 1 goto autostart_left
-echo   [OK] It will no longer start by itself.
+echo   [OK] It will not start by itself.
 
 color 2F
 echo.
@@ -77,24 +84,6 @@ echo.
 echo   Press any key to close this window.
 pause >nul
 exit /b 1
-
-:tell_website
-REM Watcher 2.4.4+: tell the website now, so its light turns red right away
-REM instead of after ~40 s. Best effort (a few seconds at most); without
-REM internet, or with an older watcher, the light still turns red by itself.
-set "SW_CFG=%DEST%\watcher_config.json"
-if not exist "%SW_CFG%" set "SW_CFG=%HERE%watcher_config.json"
-set "SW_PYFILE=%HERE%folder_watcher.py"
-if not exist "%SW_PYFILE%" set "SW_PYFILE=%TOOLS%\folder_watcher.py"
-if not exist "%SW_CFG%" goto :eof
-if not exist "%SW_PYFILE%" goto :eof
-set "PY="
-if exist "%TOOLS%\find_python.bat" (call "%TOOLS%\find_python.bat") else if exist "%HERE%find_python.bat" call "%HERE%find_python.bat"
-if not defined PY goto :eof
-%PY% "%SW_PYFILE%" --offline --config "%SW_CFG%" >nul 2>&1
-if errorlevel 1 goto :eof
-echo   [OK] The website now shows this laptop as offline.
-goto :eof
 
 :missing_files
 color 4F

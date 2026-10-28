@@ -8,8 +8,11 @@ REM   1. checks the files (was the zip extracted? is watcher_config.json here?)
 REM   2. finds Python 3.10+ (installs Python 3.12 with winget if missing)
 REM   3. stops any running watcher, installs requirements.txt with pip
 REM   4. copies the program to %LOCALAPPDATA%\ScanWatcher, creates the scan folder
-REM   5. auto-start at log-on (install_task.bat: Start-up folder shortcut)
-REM   6. starts the watcher now (minimized window)
+REM   5. removes any old auto-start at log-on (uninstall_task.bat) and makes the
+REM      "Start Scan Watcher" / "Stop Scan Watcher" shortcuts on the desktop and
+REM      in the Start menu (shortcuts.bat). Since 2.5.0 the watcher is started by
+REM      hand; IT can still turn auto-start on with install_task.bat.
+REM   6. starts the watcher now, once (minimized window)
 REM ===========================================================================
 setlocal EnableExtensions DisableDelayedExpansion
 title Scan Watcher - Installer
@@ -40,7 +43,7 @@ set "CHK=%HERE:.zip\=%"
 if /i not "%CHK%"=="%HERE%" goto not_extracted
 set "CHK=%HERE:\AppData\Local\Temp\=%"
 if /i not "%CHK%"=="%HERE%" goto not_extracted
-for %%F in (folder_watcher.py requirements.txt setup_helper.py start_watcher.bat find_python.bat watcher_process.bat install_task.bat uninstall_task.bat) do if not exist "%HERE%%%F" goto not_extracted
+for %%F in (folder_watcher.py requirements.txt setup_helper.py start_watcher.bat find_python.bat watcher_process.bat install_task.bat uninstall_task.bat STOP.bat shortcuts.bat) do if not exist "%HERE%%%F" goto not_extracted
 if not exist "%HERE%watcher_config.json" goto no_config
 echo   [OK] All files are here.
 
@@ -103,7 +106,7 @@ if errorlevel 3 if not errorlevel 4 goto bad_config
 if /i "%HERE%"=="%DEST%\" goto copied
 if not exist "%DEST%\" mkdir "%DEST%" >nul 2>&1
 if not exist "%DEST%\" goto copy_failed
-for %%F in (folder_watcher.py requirements.txt setup_helper.py start_watcher.bat find_python.bat watcher_process.bat install_task.bat uninstall_task.bat INSTALL.bat UNINSTALL.bat CHECK.bat "HOW TO INSTALL.txt" "TECHNICAL NOTES.txt") do if exist "%HERE%%%~F" copy /y "%HERE%%%~F" "%DEST%\" >nul 2>&1
+for %%F in (folder_watcher.py requirements.txt setup_helper.py start_watcher.bat find_python.bat watcher_process.bat install_task.bat uninstall_task.bat STOP.bat shortcuts.bat INSTALL.bat UNINSTALL.bat CHECK.bat "HOW TO INSTALL.txt" "TECHNICAL NOTES.txt") do if exist "%HERE%%%~F" copy /y "%HERE%%%~F" "%DEST%\" >nul 2>&1
 copy /y "%HERE%watcher_config.json" "%DEST%\watcher_config.json" >nul 2>&1
 fc /b "%HERE%watcher_config.json" "%DEST%\watcher_config.json" >nul 2>&1
 if errorlevel 1 goto copy_failed
@@ -126,13 +129,17 @@ if "%CFGRESULT%"=="4" echo   [!] Could not make the scan folder "%SCANDIR%". The
 if "%CFGRESULT%"=="5" echo   [!] The scan folder "%SCANDIR%" is not allowed. Change it on the website to C:\Scans.
 
 REM ------------------------------------------------------------------ Step 5
-call :step 5 "Making it start by itself when the computer starts"
-set "AUTOSTART_OK=1"
-call "%DEST%\install_task.bat" /quiet
-if errorlevel 1 set "AUTOSTART_OK=0"
-if "%AUTOSTART_OK%"=="1" echo   [OK] It will start by itself every time you log on.
-if "%AUTOSTART_OK%"=="0" echo   [!] Auto-start could not be set up. It runs now, but after a restart
-if "%AUTOSTART_OK%"=="0" echo       you must double-click INSTALL again. Ask your IT contact for help.
+call :step 5 "Making the Start / Stop shortcuts"
+REM The watcher no longer starts at log-on: remove an auto-start left by an
+REM older install (Start-up shortcut or scheduled task).
+call "%DEST%\uninstall_task.bat" /quiet
+if errorlevel 1 echo   [!] An old auto-start could not be removed. Ask your IT contact for help.
+set "SHORTCUTS_OK=1"
+call "%DEST%\shortcuts.bat" create /quiet
+if errorlevel 1 set "SHORTCUTS_OK=0"
+if "%SHORTCUTS_OK%"=="1" echo   [OK] "Start Scan Watcher" and "Stop Scan Watcher" are on the desktop.
+if "%SHORTCUTS_OK%"=="0" echo   [!] The shortcuts could not be made. To start the Scan Watcher, open
+if "%SHORTCUTS_OK%"=="0" echo       "%DEST%" and double-click start_watcher.bat.
 
 REM ------------------------------------------------------------------ Step 6
 call :step 6 "Starting the Scan Watcher"
@@ -171,6 +178,11 @@ echo.
 echo   Set your scanner to save files in:   %SCANDIR%
 echo.
 echo   Then look at the website. The light should be green.
+echo.
+echo   NEXT TIME: before scanning, double-click "Start Scan Watcher"
+echo   on the desktop. To stop it, double-click "Stop Scan Watcher"
+echo   or close its window.
+echo.
 echo   To check this laptop later, double-click CHECK.
 echo.
 echo   Press any key to close this window.

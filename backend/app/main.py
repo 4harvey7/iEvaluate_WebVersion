@@ -132,7 +132,13 @@ def health():
 @app.get("/config")
 def client_config(user: CurrentUser = Depends(require_staff)):
     s = get_settings()
+    try:
+        from app.routers.batches import _current_term_id
+        term_id = _current_term_id()
+    except Exception:
+        term_id = None
     return {
+        "current_term_id": term_id,
         "simulation_mode": s.simulation_mode,
         "pipeline_configured": bool(s.n8n_batch_webhook_url),
         "abandoned_batch_hours": s.abandoned_batch_hours,

@@ -33,6 +33,9 @@ FORM_MATCH_FAILED = "form_match_failed"
 
 RATING_KEYS = tuple(f"m{i}" for i in range(1, 11)) + tuple(f"p{i}" for i in range(1, 11))
 LETTER_RATINGS = {"O": 5, "VS": 4, "S": 3, "F": 2, "US": 1}
+# Teacher rule (2026-10-08): a form with fewer answered items is discarded, never credited
+# (n8n stores such a scan as discarded; migration 014 leaves such a raw row out of the means).
+MIN_ANSWERED = 5
 
 QUEUE_PENDING = "pending"
 IMPORT_PENDING = "pending"
@@ -72,6 +75,20 @@ REVIEW_COLUMN_NAMES = (
 
 WEB_TASK_RE = re.compile(r"^web:([0-9a-fA-F-]{36}):")
 
+# Numbering-machine stamp (migration 015): digits only, 3-12 long, kept exactly as
+# printed (leading zeros too). One stamp per term: (term_id, stamp_no) is unique in
+# the raw results table.
+STAMP_RE = re.compile(r"^[0-9]{3,12}$")
+STAMP_SOURCES = ("gemini+python", "gemini", "staff", "override")
+STAMP_STATUSES = ("ok", "unconfirmed", "missing", "unreadable", "multiple")
+STAMP_REASONS = ("stamp_missing", "stamp_unreadable", "multiple_stamps", "stamp_unconfirmed")
+DUPLICATE_STAMP = "duplicate_stamp"   # review reason and review_correction.rule of an auto-rejected form
+QUEUE_STAMP_COLUMNS = "stamp_no, stamp_source"
+STAMP_COLUMN_NAMES = ("stamp_no", "stamp_source")
+STAMP_MIGRATION_MSG = (
+    "Stamp numbers need a database update first. Ask IT to apply migrations/015_stamp_no.sql."
+)
+
 MIGRATION_REQUIRED_MSG = (
     "This needs a database update first. Ask IT to apply migrations/005_scan_review_queue.sql."
 )
@@ -107,6 +124,18 @@ def is_missing_review_column(exc: Exception) -> bool:
         return True
     # Same rule as the watcher columns for a bare "undefined column" error.
     return is_missing_column_error(exc) and "watcher_" not in msg
+
+
+# ---------------------------------------------------------------- migration 015
+def is_missing_stamp_column(exc: Exception) -> bool:
+    """True when a query failed because migration 015 (stamp_no / stamp_source)
+    has not been applied yet."""
+    if not isinstance(exc, APIError):
+        return False
+    code = str(getattr(exc, "code", "") or "")
+    msg = str(getattr(exc, "message", "") or "").lower()
+    return (code in ("42703", "PGRST204") or "column" in msg or "schema cache" in msg) and any(
+        c in msg for c in STAMP_COLUMN_NAMES)
 
 
 # ---------------------------------------------------------------- errors
@@ -376,12 +405,136 @@ def validate_ratings(value: Any) -> dict:
     return out
 
 
+def answered_count(ratings: dict) -> int:
+    """How many of the 20 items have a rating (validate_ratings output)."""
+    return sum(1 for k in RATING_KEYS if ratings.get(k) is not None)
+
+
 def clean_student_id(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or ""))[:50]
 
 
 def clean_remarks(value: Any) -> str:
     return str(value or "").strip()[:4000]
+
+
+# ---------------------------------------------------------------- stamp numbers
+def normalize_stamp_no(value: Any) -> str | None:
+    """A stamp number typed by staff -> digits string, None when blank.
+    Spaces are ignored; anything else must be 3-12 digits (raises ValueError)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("stamp number must be digits")
+    s = re.sub(r"\s+", "", str(value))
+    if not s:
+        return None
+    if not STAMP_RE.match(s):
+        raise ValueError("stamp number must be 3 to 12 digits")
+    return s
+
+
+def stamp_no_or_none(value: Any) -> str | None:
+    """A stored stamp number, or None when it is missing / not a valid stamp."""
+    s = str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+    return s if STAMP_RE.match(s) else None
+
+
+def stamp_source_or_none(value: Any, stamp_no: str | None) -> str | None:
+    if not stamp_no:
+        return None
+    return value if value in STAMP_SOURCES else None
+
+
+def stamp_candidates(partial: dict) -> list[str]:
+    out: list[str] = []
+    for c in (partial.get("stamp_candidates") if isinstance(partial.get("stamp_candidates"), list) else [])[:10]:
+        s = stamp_no_or_none(c)
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def has_stamp_reason(reasons: list[str]) -> bool:
+    return any(r in STAMP_REASONS for r in reasons)
+
+
+def stamp_source_for_approve(row: dict, stamp_no: str | None) -> str | None:
+    """'override' when staff keep the stamp an override set, else 'staff' (None without a stamp)."""
+    if not stamp_no:
+        return None
+    if row.get("stamp_source") == "override" and stamp_no_or_none(row.get("stamp_no")) == stamp_no:
+        return "override"
+    return "staff"
+
+
+def clean_duplicate_of(value: Any) -> dict | None:
+    """The 'already stored' row (DUP object of the stamp contract), read defensively."""
+    d = as_dict(value)
+    if not d:
+        return None
+    raw_id = d.get("raw_id")
+    if isinstance(raw_id, bool):
+        raw_id = None
+    try:
+        raw_id = int(raw_id) if raw_id is not None and str(raw_id).strip() != "" else None
+    except (TypeError, ValueError):
+        raw_id = None
+    task_id = _text(d.get("task_id"), 200) or None
+    out = {
+        "raw_id": raw_id,
+        "task_id": task_id,
+        "batch_id": _uuid_or_none(d.get("batch_id")) or batch_id_from_task(task_id),
+        "submitted_date": _text(d.get("submitted_date"), 30) or None,
+        "instructor_id": _uuid_or_none(d.get("instructor_id")),
+        "subject_id": _uuid_or_none(d.get("subject_id")),
+        "term_id": _uuid_or_none(d.get("term_id")),
+        "stamp_no": stamp_no_or_none(d.get("stamp_no")),
+    }
+    return out if any(v is not None for v in out.values()) else None
+
+
+def duplicate_from_raw(raw: dict) -> dict:
+    """DUP object from a sast_all_raw_data_survey row."""
+    return clean_duplicate_of({
+        "raw_id": raw.get("id"), "task_id": raw.get("task_id"), "submitted_date": raw.get("submitted_date"),
+        "instructor_id": raw.get("instructor_ID"), "subject_id": raw.get("subject_id"),
+        "term_id": raw.get("term_id"), "stamp_no": raw.get("stamp_no"),
+    }) or {}
+
+
+def enrich_duplicate(dup: dict | None, names: dict | None = None, dup_ctx: dict | None = None) -> dict | None:
+    """DUP + what the page shows: instructor name, subject code and, for a page
+    scanned on the website, the batch item that opens it in the page viewer."""
+    if not dup:
+        return None
+    names = names or {}
+    ctx = dup_ctx or {}
+    subj = (ctx.get("subjects") or {}).get(dup.get("subject_id") or "") or {}
+    item_id = (ctx.get("items") or {}).get(dup.get("task_id") or "")
+    return {
+        **dup,
+        "instructor_name": names.get(str(dup.get("instructor_id"))) or (ctx.get("people") or {}).get(
+            str(dup.get("instructor_id"))) or None,
+        "subject_code": subj.get("code") or None,
+        "subject_name": subj.get("name") or None,
+        "from_website": bool(dup.get("batch_id")),
+        "item_id": item_id if dup.get("batch_id") and item_id else None,
+    }
+
+
+def _stamp_note(value: Any) -> dict | None:
+    """partial_data.stamp_override / stamp_fix -> what the page shows."""
+    d = as_dict(value)
+    if not d:
+        return None
+    return {
+        "by_name": _text(d.get("by_name"), 200) or None,
+        "note": _text(d.get("note"), 500) or None,
+        "at": _text(d.get("at"), 40) or None,
+        "previous_stamp": stamp_no_or_none(d.get("previous_stamp")),
+        "new_stamp": stamp_no_or_none(d.get("new_stamp")),
+    }
 
 
 # ---------------------------------------------------------------- suggestions
@@ -494,7 +647,50 @@ def _stamp(row: dict) -> str | None:
     return row.get("updated_at") or row.get("validated_at") or row.get("resolved_at") or row.get("created_at")
 
 
-def serialize_queue_row(row: dict, batch_ctx: dict, names: dict | None = None, now: datetime | None = None) -> dict:
+def is_auto_duplicate(row: dict) -> bool:
+    """n8n rejected the form by itself: its stamp was already stored for the term."""
+    corr = as_dict(row.get("review_correction"))
+    return row.get("status") == "discarded" and corr.get("rule") == DUPLICATE_STAMP
+
+
+def stamp_fields(row: dict, names: dict | None = None, stamp_ctx: dict | None = None) -> dict:
+    """Stamp number part of a serialized queue row. Rows from before migration
+    015 (no stamp columns / keys) come out as all-empty."""
+    p = as_dict(row.get("partial_data"))
+    stamp_no = stamp_no_or_none(row.get("stamp_no"))
+    status = p.get("stamp_status") if p.get("stamp_status") in STAMP_STATUSES else None
+    saved = ((stamp_ctx or {}).get("saved") or {}).get(row.get("task_id") or "")
+    return {
+        "stamp_no": stamp_no,
+        "stamp_source": stamp_source_or_none(row.get("stamp_source"), stamp_no),
+        "stamp_status": status,
+        "stamp_candidates": stamp_candidates(p),
+        "duplicate_of": enrich_duplicate(clean_duplicate_of(p.get("duplicate_of")), names, stamp_ctx),
+        "auto_duplicate": is_auto_duplicate(row),
+        "stamp_override": _stamp_note(p.get("stamp_override")),
+        # The stored result of a credited form (admins only: "Edit stamp").
+        "saved_raw": saved if isinstance(saved, dict) else None,
+    }
+
+
+def stamp_lookup_ids(rows: list[dict]) -> dict:
+    """Ids the stamp part of the rows needs from the database (see stamp_fields)."""
+    people, subjects, tasks = set(), set(), set()
+    for r in rows:
+        dup = clean_duplicate_of(as_dict(r.get("partial_data")).get("duplicate_of"))
+        if not dup:
+            continue
+        if dup.get("instructor_id"):
+            people.add(dup["instructor_id"])
+        if dup.get("subject_id"):
+            subjects.add(dup["subject_id"])
+        if dup.get("batch_id") and dup.get("task_id"):
+            tasks.add(dup["task_id"])
+    return {"people": sorted(people), "subjects": sorted(subjects), "tasks": sorted(tasks)}
+
+
+def serialize_queue_row(row: dict, batch_ctx: dict, names: dict | None = None, now: datetime | None = None,
+                        stamp_ctx: dict | None = None) -> dict:
     names = names or {}
     now = now or now_utc()
     p = as_dict(row.get("partial_data"))
@@ -536,9 +732,13 @@ def serialize_queue_row(row: dict, batch_ctx: dict, names: dict | None = None, n
         "validated_at": row.get("validated_at"),
         "validated_by_name": (names.get(str(validated_by)) if validated_by else None) or _text(corr.get("reviewed_by_name"), 200) or None,
         "review_note_by_reviewer": _text(corr.get("note"), 500) or None,
+        # n8n stored it already discarded (min-answered rule), no person involved
+        "auto_discarded": corr.get("auto") is True and corr.get("action") == "rejected",
         # What the website last sent for this form (prefills a retry after a
         # failed send; "credited to" once done). None if nothing was sent.
         "correction": _correction_summary(corr),
+        # Numbering-machine stamp (migration 015; auto_duplicate = discarded by n8n as already scanned).
+        **stamp_fields(row, names, stamp_ctx),
     }
 
 
@@ -556,6 +756,8 @@ def _correction_summary(corr: dict) -> dict | None:
         "ratings": {k: normalize_rating(ratings.get(k)) for k in RATING_KEYS},
         "reviewed_by_name": _text(corr.get("reviewed_by_name"), 200) or None,
         "submitted_at": corr.get("submitted_at"),
+        "stamp_no": stamp_no_or_none(corr.get("stamp_no")),
+        "no_stamp": corr.get("no_stamp") is True,
     }
 
 
@@ -611,9 +813,11 @@ def people_ids(queue: list[dict], imports: list[dict]) -> list[str]:
 
 # ---------------------------------------------------------------- n8n payloads
 def correction_payload(row: dict, instructor: dict, subject: dict, ratings: dict, student_id: str,
-                       remarks: str, term_id: str | None, reviewer_id: str, timestamp: str) -> dict:
+                       remarks: str, term_id: str | None, reviewer_id: str, timestamp: str,
+                       stamp_no: str | None = None, stamp_source: str | None = None) -> dict:
     """Body for the existing 'sast-manual-correction' webhook (the same keys
-    the Flutter correction screen sends), plus the ids and reviewer."""
+    the Flutter correction screen sends), plus the ids, reviewer and the stamp
+    number (null = the form has no stamp; stamp_source 'staff' | 'override')."""
     payload = {
         "failed_scan_id": row.get("id"),
         "task_id": row.get("task_id"),
@@ -634,6 +838,8 @@ def correction_payload(row: dict, instructor: dict, subject: dict, ratings: dict
         "correction_source": "website_review",
         "reviewed_by": reviewer_id,
         "timestamp": timestamp,
+        "stamp_no": stamp_no or None,
+        "stamp_source": (stamp_source if stamp_source in ("staff", "override") else "staff") if stamp_no else None,
     })
     return payload
 
