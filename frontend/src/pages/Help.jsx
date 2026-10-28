@@ -7,7 +7,12 @@ import { InstallSteps, ScannerStatus, useStation } from "../scanner.jsx";
 const TROUBLE = [
   {
     q: "Red light \"Offline\"",
-    a: <>Turn the laptop on and connect it to the internet. Wait 1 minute. Still red? Restart the laptop.</>,
+    a: (
+      <>
+        The Scan Watcher isn't running. On the scanner laptop, double-click <strong>Start Scan Watcher</strong> (on the
+        desktop or in the Start menu). Wait 1 minute. Still red? Check the laptop is on and connected to the internet.
+      </>
+    ),
   },
   {
     q: "\"Folder not found\"",
@@ -184,12 +189,13 @@ export default function Help({ stationId, onStationMissing }) {
       <section className="section" aria-labelledby="help-daily">
         <h2 id="help-daily">Every day</h2>
         <ol className="steps plain">
-          <li><span className="step-num" aria-hidden="true">1</span><div className="step-text">Log in. On <Link to="/">Home</Link>, check that the scanner laptop light is green.</div></li>
-          <li><span className="step-num" aria-hidden="true">2</span><div className="step-text">Click <Link to="/start">Start a batch</Link>. Choose the instructor and the subject, then click <strong>Start scanning</strong>.</div></li>
-          <li><span className="step-num" aria-hidden="true">3</span><div className="step-text">Put the sheets in the scanner and scan them. Each page shows up on the screen within a few seconds.</div></li>
-          <li><span className="step-num" aria-hidden="true">4</span><div className="step-text">Look at anything marked <strong>Needs a look</strong>, <strong>Rejected</strong> or <strong>Failed</strong>. Scan rejected or failed sheets again.</div></li>
-          <li><span className="step-num" aria-hidden="true">5</span><div className="step-text">When the stack is done, click <strong>Finish and close batch</strong>. Then start the next batch.</div></li>
-          <li><span className="step-num" aria-hidden="true">6</span><div className="step-text">When you're finished for the day, click <strong>Log out</strong>.</div></li>
+          <li><span className="step-num" aria-hidden="true">1</span><div className="step-text">Double-click <strong>Start Scan Watcher</strong> on the scanner laptop (on the desktop or in the Start menu).</div></li>
+          <li><span className="step-num" aria-hidden="true">2</span><div className="step-text">Log in. On <Link to="/">Home</Link>, check that the scanner laptop light is green.</div></li>
+          <li><span className="step-num" aria-hidden="true">3</span><div className="step-text">Click <Link to="/start">Start a batch</Link>. Choose the instructor and the subject, then click <strong>Start scanning</strong>.</div></li>
+          <li><span className="step-num" aria-hidden="true">4</span><div className="step-text">Put the sheets in the scanner and scan them. Each page shows up on the screen within a few seconds.</div></li>
+          <li><span className="step-num" aria-hidden="true">5</span><div className="step-text">Look at anything marked <strong>Needs a look</strong>, <strong>Rejected</strong> or <strong>Failed</strong>. Scan rejected or failed sheets again.</div></li>
+          <li><span className="step-num" aria-hidden="true">6</span><div className="step-text">When the stack is done, click <strong>Finish and close batch</strong>. Then start the next batch.</div></li>
+          <li><span className="step-num" aria-hidden="true">7</span><div className="step-text">When you're finished for the day, click <strong>Log out</strong>. You can also double-click <strong>Stop Scan Watcher</strong> on the scanner laptop.</div></li>
         </ol>
       </section>
 

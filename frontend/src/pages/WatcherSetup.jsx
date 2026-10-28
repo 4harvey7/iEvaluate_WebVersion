@@ -274,7 +274,7 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
             <li>Put <code>watcher_config.json</code> in that same folder.</li>
             <li>Open a terminal in that folder and run:<pre>py -3 -m pip install -r requirements.txt</pre></li>
             <li>Double-click <code>start_watcher.bat</code> to test. Within about 30 seconds the light on this page should turn green.</li>
-            <li>Double-click <code>install_task.bat</code> so it starts automatically at every log-on (and restarts if it stops).</li>
+            <li>Double-click <code>install_task.bat</code> only if IT wants it to start automatically at every log-on (and restart if it stops). Otherwise people start it by hand with a Start Scan Watcher shortcut.</li>
           </ol>
           <div className="warning-box small">
             Sent files move to <code>processed\&lt;date&gt;\</code> inside the scan folder. Files saved before the batch

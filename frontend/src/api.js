@@ -293,6 +293,12 @@ export const api = {
   claimReview: (id, release = false) => request(`/reviews/queue/${q(id)}/claim`, { method: "POST", body: { release } }),
   approveReview: (id, body) => request(`/reviews/queue/${q(id)}/approve`, { method: "POST", body }),
   rejectReview: (id, body) => request(`/reviews/queue/${q(id)}/reject`, { method: "POST", body }),
+  // Stamp numbers. Take back a form discarded as already scanned: { expected_version, stamp_no | null, note }.
+  overrideStamp: (id, body) => request(`/reviews/queue/${q(id)}/override`, { method: "POST", body }),
+  // Fix the stamp of a form still waiting for review: { expected_version, stamp_no | null }.
+  fixStamp: (id, body) => request(`/reviews/queue/${q(id)}/stamp`, { method: "POST", body }),
+  // SAO admin: change the stamp of a saved form: { stamp_no | null, note }.
+  editRawStamp: (rawId, body) => request(`/reviews/raw/${q(rawId)}/stamp`, { method: "POST", body }),
   resolveImportError: (id, body) => request(`/reviews/import-errors/${q(id)}/resolve`, { method: "POST", body }),
   discardImportError: (id, body) => request(`/reviews/import-errors/${q(id)}/discard`, { method: "POST", body }),
   // Pages marking couldn't save: send the kept copy again, or turn it into a

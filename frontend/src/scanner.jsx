@@ -131,7 +131,7 @@ export function getScannerState(station, now = Date.now()) {
       tone: "red",
       key: "offline",
       title: "Offline",
-      message: `the scanner laptop is off or not connected (last seen ${timeAgo(station.last_seen_at, now)})`,
+      message: `the Scan Watcher isn't running on the scanner laptop (last seen ${timeAgo(station.last_seen_at, now)})`,
     };
   }
   if (err === "unsafe_path") {
@@ -236,6 +236,46 @@ export function useStation(stationId, { intervalMs = STATUS_POLL_MS, onMissing }
   return { station, setStation, error, loading, refresh };
 }
 
+// Shown wherever the light is red because the Scan Watcher isn't running.
+export function WatcherOffHint() {
+  return (
+    <>
+      On the scanner laptop, double-click <strong>Start Scan Watcher</strong> (on the desktop or in the Start menu). Also
+      check the laptop is on and connected to the internet.
+    </>
+  );
+}
+
+// "2.4.4" < "2.5.0": compares dotted numbers. Returns -1, 0 or 1 (0 if either is unreadable).
+export function compareVersions(a, b) {
+  const pa = String(a ?? "").match(/\d+/g);
+  const pb = String(b ?? "").match(/\d+/g);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = Number(pa[i] || 0);
+    const y = Number(pb[i] || 0);
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+// From 2.5.0 the Scan Watcher no longer starts by itself at log-on.
+const NO_AUTO_START_VERSION = "2.5.0";
+
+export function hasOldWatcher(station) {
+  return Boolean(station?.watcher_version) && compareVersions(station.watcher_version, NO_AUTO_START_VERSION) < 0;
+}
+
+export function OldWatcherNote({ station }) {
+  if (!hasOldWatcher(station)) return null;
+  return (
+    <div className="muted small">
+      This laptop still starts the Scan Watcher by itself &ndash; download the installer and run INSTALL again to change
+      this.
+    </div>
+  );
+}
+
 function StatusText({ state }) {
   return (
     <>
@@ -264,9 +304,10 @@ export function ScannerStatus({ station, variant = "badge", showDetails = true, 
 
   const queued = Number(station?.watcher_queued_files) || 0;
   const switching = isSwitchingFolder(station);
+  const oldWatcher = hasOldWatcher(station);
   const advice = {
     not_installed: "Follow the install steps to set it up. It only takes a few minutes.",
-    offline: "Check that the scanner laptop is turned on, logged in and connected to the internet.",
+    offline: <WatcherOffHint />,
     not_found: "Check the folder name below, or create that folder on the scanner laptop.",
     access_denied: "Pick a different folder, such as C:\\Scans, in the Scan folder setting and click Save folder.",
     unsafe_path:
@@ -296,6 +337,11 @@ export function ScannerStatus({ station, variant = "badge", showDetails = true, 
             )}
             {switching && <li className="switching">Switching to the new folder&hellip; (up to 30 seconds)</li>}
             {advice && <li className="advice">{advice}</li>}
+            {oldWatcher && (
+              <li>
+                <OldWatcherNote station={station} />
+              </li>
+            )}
           </ul>
         )}
         {hint && <div className="muted small">{hint}</div>}
@@ -429,12 +475,21 @@ export function installSteps(where = "setup") {
         <li>If you see "Do you want to allow this app to make changes": click <strong>"Yes"</strong>.</li>
       </ul>
     </>,
-    <>Wait. Do not type anything. When the window turns green and says <strong>"ALL DONE"</strong>, close the window.</>,
+    <>
+      Wait. Do not type anything. When the window turns green and says <strong>"ALL DONE"</strong>, close the window.
+      Two shortcuts, <strong>"Start Scan Watcher"</strong> and <strong>"Stop Scan Watcher"</strong>, are now on the desktop.
+    </>,
     <>In your scanner program, look for <strong>"Save to"</strong>, <strong>"Destination"</strong> or <strong>"Folder"</strong>. Choose <strong>C:\Scans</strong>.</>,
     where === "setup" ? (
-      <>Come back here. The light should turn green (<strong>"Online"</strong>). Scan one page to test it.</>
+      <>
+        Come back here. The light should turn green (<strong>"Online"</strong>). Scan one page to test it. From now on,
+        double-click <strong>"Start Scan Watcher"</strong> before you scan. It does not start by itself.
+      </>
     ) : (
-      <>Look at the website. The light should be green (<strong>"Online"</strong>). Scan one page to test it.</>
+      <>
+        Look at the website. The light should be green (<strong>"Online"</strong>). Scan one page to test it. From now on,
+        double-click <strong>"Start Scan Watcher"</strong> before you scan. It does not start by itself.
+      </>
     ),
   ];
 }

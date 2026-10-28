@@ -9,6 +9,7 @@ import ReviewBatches from "./pages/ReviewBatches.jsx";
 import Activation from "./pages/Activation.jsx";
 import WatcherSetup from "./pages/WatcherSetup.jsx";
 import Help from "./pages/Help.jsx";
+import SastGuide, { GuideModal } from "./pages/SastGuide.jsx";
 import { api, loadSession, onUnauthorized } from "./api.js";
 import { ConfirmDialog, KeyReveal, Loading, PageHeader } from "./components.jsx";
 import { Icon } from "./icons.jsx";
@@ -35,6 +36,46 @@ function writeStationId(id) {
   } catch {
     /* ignore */
   }
+}
+
+const GUIDE_ROLES = ["SAO_STAFF", "SAO_ADMIN"];
+const guideKey = (userId) => `sastGuideAck:${userId}`;
+
+// Shows the SAST guide once per semester (current term id vs the last one acknowledged).
+function useGuideGate(profile) {
+  const [show, setShow] = useState(false);
+  const [termId, setTermId] = useState(null);
+  const allowed = !!profile && (GUIDE_ROLES.includes(profile.role) || !!profile.is_admin);
+  useEffect(() => {
+    if (!allowed) return undefined;
+    let cancelled = false;
+    api
+      .config()
+      .then((c) => {
+        if (cancelled || !c?.current_term_id) return;
+        setTermId(c.current_term_id);
+        let acked = null;
+        try {
+          acked = localStorage.getItem(guideKey(profile.id));
+        } catch {
+          /* storage blocked */
+        }
+        if (acked !== String(c.current_term_id)) setShow(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [allowed, profile?.id]);
+  const ack = useCallback(() => {
+    try {
+      if (termId) localStorage.setItem(guideKey(profile.id), String(termId));
+    } catch {
+      /* ignore */
+    }
+    setShow(false);
+  }, [termId, profile?.id]);
+  return { show: show && allowed, ack };
 }
 
 function Brand() {
@@ -291,6 +332,9 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
           )}
 
           <div className="nav-group">Support</div>
+          <NavLink to="/sast-guidelines">
+            <Icon name="help" /> SAST Guidelines
+          </NavLink>
           <NavLink to="/help">
             <Icon name="help" /> Help
           </NavLink>
@@ -408,6 +452,7 @@ export default function App() {
     );
   }
 
+  const guide = useGuideGate(profile);
   const keyForStation = stationKey?.stationId === stationId ? stationKey.key : null;
 
   return (
@@ -461,10 +506,13 @@ export default function App() {
               )
             }
           />
+          <Route path="/sast-guidelines" element={<SastGuide />} />
           <Route path="/help" element={<Help stationId={stationId} onStationMissing={handleStationMissing} />} />
           <Route path="*" element={<Navigate to="/" />} />
         </Routes>
       </Shell>
+
+      {guide.show && <GuideModal onAck={guide.ack} />}
 
       {pendingAction && (
         <ConfirmDialog

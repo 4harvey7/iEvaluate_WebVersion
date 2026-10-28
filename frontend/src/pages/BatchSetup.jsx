@@ -4,7 +4,7 @@ import { api } from "../api.js";
 import { useSearch } from "../useSearch.js";
 import { Loading, PageHeader } from "../components.jsx";
 import { Icon } from "../icons.jsx";
-import { ScannerStatus, SkippedPagesCard, getScannerState, useStation } from "../scanner.jsx";
+import { ScannerStatus, SkippedPagesCard, WatcherOffHint, getScannerState, useStation } from "../scanner.jsx";
 
 function InstructorPicker({ departments, selected, onSelect, inputId }) {
   const [query, setQuery] = useState("");
@@ -367,8 +367,14 @@ export default function BatchSetup({ stationId, onStationMissing }) {
       </div>
       {station && !scannerReady && (
         <div className="warning-box small">
-          The scanner laptop isn't ready, so scans won't arrive yet. You can still start the batch, but it's best to fix
-          this first: <Link to="/scanner-setup">go to Step 1: Scanner setup</Link>.
+          {getScannerState(station).key === "offline" ? (
+            <WatcherOffHint />
+          ) : (
+            <>
+              The scanner laptop isn't ready, so scans won't arrive yet. You can still start the batch, but it's best to fix
+              this first: <Link to="/scanner-setup">go to Step 1: Scanner setup</Link>.
+            </>
+          )}
         </div>
       )}
 

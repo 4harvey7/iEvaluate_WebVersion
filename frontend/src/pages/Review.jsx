@@ -4,7 +4,7 @@ import { api, REVIEW_DRAFT_PREFIX } from "../api.js";
 import { ConfirmDialog, EmptyState, Loading, PageHeader, timeAgo, useNow } from "../components.jsx";
 import { Icon } from "../icons.jsx";
 import { useSearch } from "../useSearch.js";
-import { friendlyReason, importErrorText, matchText, reviewErrorText, unsavedStateText } from "../messages.js";
+import { duplicateOfText, friendlyReason, importErrorText, matchText, reviewErrorText, unsavedStateText } from "../messages.js";
 import { PageViewer, ScanImage, ScoreChip, scoreFromRatings } from "../pageViewer.jsx";
 
 // Live = polling through the backend (the browser never talks to Supabase).
@@ -121,9 +121,11 @@ function queueState(row, importRow, pendingTasks) {
     if (movedToImports(row, importRow, pendingTasks)) return { label: "Now in Import errors", tone: "flagged" };
     return { label: "Done", tone: "success" };
   }
+  if (row.status === "discarded" && row.auto_duplicate) return { label: "Already scanned", tone: "duplicate" };
   if (row.status === "discarded") return { label: "Discarded", tone: "duplicate" };
   if (row.status !== "pending") return { label: "Done", tone: "success" };
   if (row.review_state === "submit_failed") return { label: "Not sent - try again", tone: "error" };
+  if (hasStampReason(row)) return { label: "Check stamp", tone: "flagged" };
   if (hasInstructorMismatch(row)) return { label: "Check instructor", tone: "flagged" };
   if (hasSubjectMismatch(row)) return { label: "Check subject", tone: "flagged" };
   return { label: "Needs a look", tone: "flagged" };
@@ -149,6 +151,8 @@ function queueDefaults(row) {
     student_id: (c ? c.student_id : row.student_id) || "",
     remarks: (c ? c.remarks : row.remarks) || "",
     ratings: { ...((c ? c.ratings : row.ratings) || {}) },
+    stamp_no: (c ? c.stamp_no : row.stamp_no) || "",
+    no_stamp: !!c?.no_stamp,
   };
 }
 
@@ -171,8 +175,21 @@ function cleanRatings(ratings) {
   return out;
 }
 
-function sendBody(values, version, confirmOverwrite) {
-  return {
+// Teacher rule: a form with fewer answered items can't be credited (the server refuses it too).
+const MIN_ANSWERED = 5;
+const answeredCount = (ratings) => Object.values(cleanRatings(ratings)).filter((v) => v !== null).length;
+
+// Numbering-machine stamp: digits only, 3 to 12, kept exactly as printed (leading zeros too).
+// One stamp = one paper: a stamp already saved this term can't be credited again.
+const STAMP_REASONS = new Set(["stamp_missing", "stamp_unreadable", "multiple_stamps", "stamp_unconfirmed"]);
+const cleanStamp = (v) => String(v ?? "").replace(/\s+/g, "");
+const stampValid = (v) => /^[0-9]{3,12}$/.test(cleanStamp(v));
+const hasStampReason = (row) => (row.review_reasons || []).some((r) => STAMP_REASONS.has(r));
+
+// withStamp: send the editor's stamp. Without it (bulk, or an old draft that has
+// no stamp yet) the server keeps the stamp that was read from the sheet.
+function sendBody(values, version, confirmOverwrite, withStamp = false) {
+  const body = {
     expected_version: version,
     instructor_id: values.instructor?.id,
     subject_id: values.subject?.id,
@@ -181,6 +198,11 @@ function sendBody(values, version, confirmOverwrite) {
     ratings: cleanRatings(values.ratings),
     confirm_overwrite: !!confirmOverwrite,
   };
+  if (withStamp && values.stamp_no !== undefined) {
+    body.no_stamp = !!values.no_stamp;
+    body.stamp_no = values.no_stamp ? null : cleanStamp(values.stamp_no) || null;
+  }
+  return body;
 }
 
 // Mismatch forms whose only problem is "the sheet names someone else, and we
@@ -192,6 +214,7 @@ function bulkGroups(rows, drafts) {
     if (drafts[`q:${r.id}`]) continue; // being edited: leave it to the editor
     const reasons = r.review_reasons || [];
     if (!reasons.length || !reasons.every((x) => MISMATCH_FOUND.has(x))) continue;
+    if (answeredCount(r.ratings) < MIN_ANSWERED) continue; // can't be credited as it is
     const si = r.suggested_instructor;
     const ss = r.suggested_subject;
     if (!si?.id || !ss?.id) continue;
@@ -568,11 +591,230 @@ function ReasonList({ reasons }) {
   );
 }
 
+// ------------------------------------------------------------------ stamp number
+// The saved form a stamp clashes with; a website page opens in the page viewer
+// (only for people who may open that batch), otherwise its date and instructor.
+function DuplicateOriginal({ dup }) {
+  const [viewing, setViewing] = useState(false);
+  if (!dup) return null;
+  const text = duplicateOfText(dup);
+  const canView = dup.from_website && dup.batch_id && dup.item_id;
+  return (
+    <p className="small">
+      Already saved with stamp <strong>{dup.stamp_no || "?"}</strong>{text ? `: ${text}` : ""}.{" "}
+      {canView && (
+        <button type="button" className="link-btn" onClick={() => setViewing(true)}>View that page</button>
+      )}
+      {viewing && (
+        <PageViewer title={`Saved form with stamp ${dup.stamp_no || ""}`.trim()} batchId={dup.batch_id} itemId={dup.item_id} onClose={() => setViewing(false)} />
+      )}
+    </p>
+  );
+}
+
+function StampField({ row, values, onChange, idPrefix }) {
+  const candidates = row.stamp_candidates || [];
+  const typed = cleanStamp(values.stamp_no);
+  const invalid = !values.no_stamp && typed !== "" && !stampValid(typed);
+  const askNoStamp = hasStampReason(row) || values.no_stamp;
+  let hint = "";
+  if (!values.no_stamp && typed && typed === row.stamp_no) {
+    if (row.stamp_source === "gemini" || row.stamp_source === "gemini+python") hint = "Read from the sheet automatically. Check it against the sheet.";
+    else if (row.stamp_source === "override") hint = "Set when this form was taken back from \"Already scanned\".";
+  }
+  return (
+    <div className="stamp-field">
+      <label htmlFor={`${idPrefix}-stamp`}>Stamp number</label>
+      {candidates.length > 1 && (
+        <div className="filter-chips" role="group" aria-label="Stamp numbers found on the sheet">
+          {candidates.map((c) => {
+            const on = !values.no_stamp && typed === c;
+            return (
+              <button type="button" key={c} className={`chip ${on ? "selected" : ""}`} aria-pressed={on} onClick={() => onChange({ stamp_no: c, no_stamp: false })}>
+                {c}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <input
+        id={`${idPrefix}-stamp`}
+        value={values.no_stamp ? "" : values.stamp_no || ""}
+        inputMode="numeric"
+        maxLength={20}
+        autoComplete="off"
+        placeholder={values.no_stamp ? "No stamp" : "Digits as printed, e.g. 0100005"}
+        disabled={!!values.no_stamp}
+        aria-invalid={invalid}
+        onChange={(e) => onChange({ stamp_no: e.target.value, no_stamp: false })}
+      />
+      {askNoStamp && (
+        <label className="check-inline">
+          <input type="checkbox" checked={!!values.no_stamp} onChange={(e) => onChange({ no_stamp: e.target.checked })} />
+          Form has no stamp
+        </label>
+      )}
+      {invalid && <p className="small" role="status">The stamp number must be 3 to 12 digits, exactly as printed.</p>}
+      {hint && <p className="muted small">{hint}</p>}
+    </div>
+  );
+}
+
+// A form marking discarded because its stamp was already saved this term.
+// Override: a different paper after all (misread stamp): it goes back to Needs review.
+function AlreadyScannedCard({ row, meta, label, onRowUpdate, onRefresh, showToast }) {
+  const [open, setOpen] = useState(false);
+  const [stamp, setStamp] = useState("");
+  const [noStamp, setNoStamp] = useState(false);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState("");
+  const [dup, setDup] = useState(null);
+  const stampNo = row.stamp_no || row.duplicate_of?.stamp_no;
+  const typed = cleanStamp(stamp);
+  const invalid = !noStamp && typed !== "" && !stampValid(typed);
+  const ready = !!note.trim() && (noStamp || stampValid(typed));
+
+  async function submit() {
+    setBusy(true);
+    setProblem("");
+    setDup(null);
+    try {
+      const res = await api.overrideStamp(row.id, {
+        expected_version: row.review_version,
+        stamp_no: noStamp ? null : typed,
+        note: note.trim(),
+      });
+      onRowUpdate(res.row);
+      setOpen(false);
+      showToast(`${label}: taken back. It is waiting under Needs review: check it, then credit it.`);
+    } catch (err) {
+      if (err?.code === "duplicate_stamp") setDup(err.detail?.duplicate_of || null);
+      setProblem(reviewErrorText(err));
+      if (CONFLICT_CODES.has(err?.code) || err?.code === "not_auto_duplicate") onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="warning-box small already-scanned">
+      <strong>Already scanned.</strong> Stamp {stampNo || "?"} is already on a form saved for this term, so this sheet
+      was not counted.
+      <DuplicateOriginal dup={row.duplicate_of} />
+      {!open ? (
+        <div className="btn-row">
+          <button type="button" className="small-btn" disabled={!meta.migration_ready} onClick={() => setOpen(true)}>Override</button>
+        </div>
+      ) : (
+        <div className="override-form">
+          <p>
+            Only override if this is a different paper (for example the stamp was misread). Type the correct stamp
+            number, or save the form without a stamp. It then waits under Needs review to be checked and credited.
+          </p>
+          <label htmlFor={`ov-stamp-${row.id}`}>Correct stamp number</label>
+          <input
+            id={`ov-stamp-${row.id}`}
+            value={noStamp ? "" : stamp}
+            inputMode="numeric"
+            maxLength={20}
+            autoComplete="off"
+            placeholder={noStamp ? "No stamp" : "Digits as printed"}
+            disabled={noStamp || busy}
+            aria-invalid={invalid}
+            onChange={(e) => setStamp(e.target.value)}
+          />
+          <label className="check-inline">
+            <input type="checkbox" checked={noStamp} disabled={busy} onChange={(e) => setNoStamp(e.target.checked)} />
+            Save without a stamp
+          </label>
+          {invalid && <p className="small" role="status">The stamp number must be 3 to 12 digits, exactly as printed.</p>}
+          <label htmlFor={`ov-note-${row.id}`}>Why? (required)</label>
+          <input
+            id={`ov-note-${row.id}`}
+            value={note}
+            maxLength={500}
+            disabled={busy}
+            placeholder="For example: the stamp was misread, this is a different sheet"
+            onChange={(e) => setNote(e.target.value)}
+          />
+          {problem && <div className="error" role="alert">{problem}</div>}
+          {dup && <DuplicateOriginal dup={dup} />}
+          <div className="btn-row">
+            <button type="button" className="primary" disabled={!ready || busy} onClick={submit}>
+              {busy ? "Working..." : "Override"}
+            </button>
+            <button type="button" disabled={busy} onClick={() => setOpen(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// SAO admin: change the stamp of a form that is already saved.
+function SavedStampEditor({ raw, label, showToast, onRefresh }) {
+  const [current, setCurrent] = useState(raw.stamp_no || null);
+  const [editing, setEditing] = useState(false);
+  const [stamp, setStamp] = useState(raw.stamp_no || "");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState("");
+  const [dup, setDup] = useState(null);
+  const typed = cleanStamp(stamp);
+  const invalid = typed !== "" && !stampValid(typed);
+
+  async function save() {
+    setBusy(true);
+    setProblem("");
+    setDup(null);
+    try {
+      const res = await api.editRawStamp(raw.id, { stamp_no: typed || null, note: note.trim() || null });
+      setCurrent(res.raw?.stamp_no || null);
+      setEditing(false);
+      showToast(`${label}: saved stamp ${res.raw?.stamp_no ? `changed to ${res.raw.stamp_no}` : "removed"}.`);
+      onRefresh();
+    } catch (err) {
+      if (err?.code === "duplicate_stamp") setDup(err.detail?.duplicate_of || null);
+      setProblem(reviewErrorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="small saved-stamp">
+      Saved stamp: <strong>{current || "none"}</strong>{" "}
+      {!editing && (
+        <button type="button" className="link-btn" onClick={() => setEditing(true)}>Edit stamp</button>
+      )}
+      {editing && (
+        <div className="override-form">
+          <label htmlFor={`raw-stamp-${raw.id}`}>Stamp number (leave empty to remove it)</label>
+          <input id={`raw-stamp-${raw.id}`} value={stamp} inputMode="numeric" maxLength={20} autoComplete="off"
+            disabled={busy} aria-invalid={invalid} onChange={(e) => setStamp(e.target.value)} />
+          {invalid && <p className="small" role="status">The stamp number must be 3 to 12 digits, exactly as printed.</p>}
+          <label htmlFor={`raw-note-${raw.id}`}>Why? (optional)</label>
+          <input id={`raw-note-${raw.id}`} value={note} maxLength={500} disabled={busy} onChange={(e) => setNote(e.target.value)} />
+          {problem && <div className="error" role="alert">{problem}</div>}
+          {dup && <DuplicateOriginal dup={dup} />}
+          <div className="btn-row">
+            <button type="button" className="primary" disabled={busy || invalid} onClick={save}>{busy ? "Saving..." : "Save stamp"}</button>
+            <button type="button" disabled={busy} onClick={() => setEditing(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ------------------------------------------------------------------ queue editor
-function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, onRowUpdate, onClose, onRefresh, showToast }) {
+function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, isAdmin, onRowUpdate, onClose, onRefresh, showToast }) {
   const key = `q:${row.id}`;
   const defaults = useMemo(() => queueDefaults(row), [row]);
-  const values = draft || defaults;
+  // A draft saved before stamps existed has none: it starts from the stamp read from the sheet.
+  const values = draft ? { stamp_no: row.stamp_no || "", no_stamp: false, ...draft } : defaults;
+  const stampOn = meta.stamp_ready !== false;
   const baseVersion = draft ? draft.base_version : row.review_version;
   const finished = row.status !== "pending";
   const sending = row.review_state === "submitting";
@@ -586,6 +828,7 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
   const [claim, setClaim] = useState(null);
   const [findInstructor, setFindInstructor] = useState(false);
   const [findSubject, setFindSubject] = useState(false);
+  const [duplicate, setDuplicate] = useState(null); // 409 duplicate_stamp detail
   const label = row.filename || "This form";
 
   const edit = (patch) => setDraft(key, { ...values, ...patch, base_version: baseVersion });
@@ -603,7 +846,7 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
       clearInterval(t);
       api.claimReview(row.id, true).catch(() => {});
     };
-  }, [row.id, meta.migration_ready]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [row.id, meta.migration_ready, row.status === "pending"]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const viewer = (claim && !claim.claimed && claim.claimed_by) || row.claimed_by;
   const otherViewer = viewer && viewer.id !== me ? viewer : null;
@@ -615,8 +858,9 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
     }
     setBusy(true);
     setProblem("");
+    setDuplicate(null);
     try {
-      const res = await api.approveReview(row.id, sendBody(vals, baseVersion, confirmOverwrite));
+      const res = await api.approveReview(row.id, sendBody(vals, baseVersion, confirmOverwrite, stampOn));
       onRowUpdate(res.row);
       setDraft(key, null);
       setOverwrite(null);
@@ -634,6 +878,13 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
         const v = err.detail?.row?.review_version;
         setDraft(key, { ...vals, base_version: v ?? baseVersion });
         setOverwrite(null);
+        setProblem(err.message);
+      } else if (err?.code === "duplicate_stamp") {
+        // Nothing was saved. When marking refused it, the row went back to waiting (new version).
+        const v = err.detail?.row?.review_version;
+        setDraft(key, { ...vals, base_version: v ?? baseVersion });
+        setOverwrite(null);
+        setDuplicate(err.detail || {});
         setProblem(err.message);
       } else {
         setOverwrite(null);
@@ -713,7 +964,22 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
       subject: diffS ? { id: bs.id, code: bs.code, name: bs.name } : values.subject,
     });
 
+  const answered = answeredCount(values.ratings);
+  const tooFew = answered < MIN_ANSWERED;
+  const stampTyped = cleanStamp(values.stamp_no);
+  const stampInvalid = stampOn && !values.no_stamp && stampTyped !== "" && !stampValid(stampTyped);
+  const stampMissing = stampOn && hasStampReason(row) && !values.no_stamp && !stampTyped;
+  const stampBlocked = stampInvalid || stampMissing;
+  const ov = row.stamp_override;
+
   const finishedText = (() => {
+    if (row.status === "discarded" && row.auto_duplicate) {
+      const n = row.stamp_no || row.duplicate_of?.stamp_no;
+      return `Discarded automatically: already scanned${n ? ` (stamp ${n})` : ""}, so this form is not counted.`;
+    }
+    if (row.status === "discarded" && row.auto_discarded) {
+      return "Discarded automatically: fewer than 5 of the 20 items were answered, so this form is not counted.";
+    }
     if (row.status === "discarded") {
       return `Discarded${row.validated_by_name ? ` by ${row.validated_by_name}` : ""}${row.review_note_by_reviewer ? `: "${row.review_note_by_reviewer}"` : "."}`;
     }
@@ -721,7 +987,7 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
     const c = row.correction;
     const by = row.validated_by_name ? ` by ${row.validated_by_name}` : "";
     if (c?.instructor?.name && row.review_action) {
-      return `Credited to ${c.instructor.name}${c.subject?.code ? ` · ${c.subject.code}` : ""}${by}.`;
+      return `Credited to ${c.instructor.name}${c.subject?.code ? ` · ${c.subject.code}` : ""}${by}${c.stamp_no ? ` (stamp ${c.stamp_no})` : ""}.`;
     }
     return `Already fixed${by || " elsewhere (for example on the phone app)"}.`;
   })();
@@ -743,6 +1009,18 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
         <div className="error">Not sent: {row.review_error || "the last try failed."}</div>
       )}
       {finished && <div className="success-box small">{finishedText}</div>}
+      {finished && row.status === "discarded" && row.auto_duplicate && (
+        <AlreadyScannedCard row={row} meta={meta} label={label} onRowUpdate={onRowUpdate} onRefresh={onRefresh} showToast={showToast} />
+      )}
+      {finished && isAdmin && row.status === "validated" && row.saved_raw?.id != null && row.saved_raw.stamp_ready && (
+        <SavedStampEditor raw={row.saved_raw} label={label} showToast={showToast} onRefresh={onRefresh} />
+      )}
+      {!finished && ov && (
+        <div className="info-box small">
+          Taken back from "Already scanned"{ov.by_name ? ` by ${ov.by_name}` : ""}{ov.note ? `: "${ov.note}"` : ""}.{" "}
+          {ov.new_stamp ? `Stamp ${ov.previous_stamp ? `changed from ${ov.previous_stamp} ` : ""}to ${ov.new_stamp}.` : "To be saved without a stamp."}
+        </div>
+      )}
 
       <div className="editor-grid">
         <div className="editor-image">
@@ -803,6 +1081,9 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
                 <input id={`sid-${row.id}`} value={values.student_id} maxLength={50} autoComplete="off"
                   onChange={(e) => edit({ student_id: e.target.value })} />
               </div>
+              {stampOn && (
+                <StampField row={row} values={values} idPrefix={`st-${row.id}`} onChange={(patch) => edit(patch)} />
+              )}
             </div>
             <label htmlFor={`rem-${row.id}`}>Remarks</label>
             <textarea id={`rem-${row.id}`} rows={3} maxLength={4000} value={values.remarks}
@@ -817,16 +1098,26 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
           </fieldset>
 
           {problem && <div className="error" role="alert">{problem}</div>}
+          {duplicate && <DuplicateOriginal dup={duplicate.duplicate_of} />}
           {!meta.migration_ready && <p className="muted small">Read-only until the database update (migration 005) is applied.</p>}
           {meta.migration_ready && !meta.correction_ready && <p className="muted small">Sending corrections isn't set up on this server yet.</p>}
           {!finished && (!values.instructor?.id || !values.subject?.id) && problem !== PICK_FIRST_TEXT && (
             <p className="small">{PICK_FIRST_TEXT}</p>
           )}
+          {!finished && tooFew && (
+            <p className="small" role="status">
+              Only {answered} of the 20 items are answered. A form needs at least {MIN_ANSWERED} answered items to be counted:
+              fill in any answers that were missed from the scan, or discard the form.
+            </p>
+          )}
+          {!finished && stampMissing && (
+            <p className="small" role="status">Type the stamp number from the sheet, or choose "Form has no stamp".</p>
+          )}
 
           <div className="editor-actions">
             {!finished && (
               <>
-                <button type="button" className="primary" disabled={!canAct || busy || !values.instructor?.id || !values.subject?.id} onClick={() => send(values)}>
+                <button type="button" className="primary" disabled={!canAct || busy || tooFew || stampBlocked || !values.instructor?.id || !values.subject?.id} onClick={() => send(values)}>
                   <Icon name="check" size={18} />
                   {busy
                     ? "Sending..."
@@ -835,7 +1126,7 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
                       : "Credit"}
                 </button>
                 {batchLabel && (
-                  <button type="button" disabled={!canAct || busy} onClick={toBatch}>{batchLabel}</button>
+                  <button type="button" disabled={!canAct || busy || tooFew || stampBlocked} onClick={toBatch}>{batchLabel}</button>
                 )}
                 <button type="button" className="danger-outline" disabled={!meta.migration_ready || finished || sending || busy} onClick={() => setDiscarding(true)}>
                   Discard
@@ -1157,6 +1448,7 @@ function QueueRow({ row, index, importRow, pendingTasks, open, isNew, hasDraft, 
         <span className="muted small">
           {timeAgo(row.created_at, now)}
           {row.student_id ? ` · Student ${row.student_id}` : ""}
+          {row.stamp_no ? ` · Stamp ${row.stamp_no}` : ""}
         </span>
       </span>
       <span className="rr-problem small">
@@ -1705,6 +1997,7 @@ function ReviewPage({ batchId, profile }) {
                     setDraft={setDraft}
                     meta={meta}
                     me={me}
+                    isAdmin={!!profile?.is_admin}
                     onRowUpdate={(row) => data.mergeRow("queue", row)}
                     onClose={() => setOpenQ(null)}
                     onRefresh={data.refresh}

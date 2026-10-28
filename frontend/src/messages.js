@@ -94,6 +94,13 @@ const REASON_TEXT = {
   student_id_missing: "The student ID on the sheet is blank or couldn't be read. Type it in if it's on the sheet.",
   reused_image:
     "This exact picture was already scanned in another batch. Check it isn't the same form counted twice before approving.",
+  // Numbering-machine stamp on the sheet (one stamp = one paper, counted once per term).
+  duplicate_stamp: "Already scanned: a form with this stamp number is already saved for this term, so this one is not counted.",
+  stamp_missing: "No stamp number was found on the sheet. Type it in if there is one, or choose \"Form has no stamp\".",
+  stamp_unreadable: "The stamp number couldn't be read. Type it in from the sheet, or choose \"Form has no stamp\".",
+  multiple_stamps: "More than one stamp number was found on the sheet. Pick the right one or type it in.",
+  stamp_unconfirmed: "The two stamp readers (the AI and the scanner) did not agree on the stamp number. Check it on the sheet and type it in.",
+  stamp_check_failed: "The stamp check couldn't run; check the stamp number before crediting.",
   batch_reference_invalid: "This batch's instructor, subject or term is no longer valid.",
   batch_check_failed: "The batch check couldn't run for this page. Please check it.",
   internal_error_decide: "Automatic checking stopped part-way for this page. Please check every field.",
@@ -132,6 +139,7 @@ const REASON_PATTERNS = [
   [/^omr_agreement_below_(\d+)$/, (n) => `The answer reader and the AI agree on fewer than ${n}% of the answers.`],
   [/^low_confidence_ocr_(\d+)_rows$/, (n) => `The answer reader was unsure on ${n} answer${n === "1" ? "" : "s"}.`],
   [/^too_many_blanks_(\d+)_of_20$/, (n) => `${n} of the 20 answers are blank.`],
+  [/^too_few_answers_(\d+)_of_20$/, (n) => `Fewer than 5 of the 20 items were answered (only ${n}), so this form can't be counted.`],
   [/^python_weak_gemini_blank_(\d+)_rows$/, (n) => `${n} faint mark${n === "1" ? "" : "s"} may be specks, not answers.`],
   [/^python_weak_disagreement_(\d+)_rows$/, (n) => `The answer reader and the AI read ${n} unclear answer${n === "1" ? "" : "s"} differently.`],
   [/^not_a_sast_form\b/, () => "This doesn't look like an evaluation form."],
@@ -203,7 +211,24 @@ const REVIEW_ERROR_TEXT = {
   correction_not_configured: "Sending corrections isn't set up on this server yet. Ask IT to set it up.",
   invalid_ratings: "Each rating must be 1 to 5, or left blank.",
   not_your_batch: "Only the person who started this batch, or an SAO admin, can do this.",
+  invalid_stamp: "The stamp number must be 3 to 12 digits (numbers only), exactly as printed on the sheet.",
+  stamp_required: "Type the stamp number from the sheet, or choose \"Form has no stamp\".",
+  note_required: "Write why this form should be counted after all.",
+  not_auto_duplicate: "This form isn't waiting as \"already scanned\" any more, so nothing was changed.",
+  stamp_migration_required: "Stamp numbers need a database update first. Ask IT to apply migration 015.",
+  admin_only: "Only an SAO admin can do this.",
 };
+
+// The saved form a stamp number clashes with (409 duplicate_stamp / an auto-rejected form).
+export function duplicateOfText(dup) {
+  if (!dup) return "";
+  const parts = [];
+  if (dup.submitted_date) parts.push(`saved ${dup.submitted_date}`);
+  if (dup.instructor_name) parts.push(`for ${dup.instructor_name}${dup.subject_code ? ` · ${dup.subject_code}` : ""}`);
+  else if (dup.subject_code) parts.push(`for ${dup.subject_code}`);
+  if (!dup.from_website && dup.task_id) parts.push("from the phone app");
+  return parts.join(", ");
+}
 
 export function reviewErrorText(err) {
   if (!err) return "";
@@ -240,3 +265,93 @@ export function itemCode(item) {
   if (item.status && item.status !== "error") return null;
   return codeFromMessage(item.message);
 }
+
+// SAST Guidelines screen. Same text as the mobile app.
+export const SAST_GUIDE = {
+  title: "SAST Guidelines",
+  subtitle: "Read this every semester. Following it keeps SAST results accurate and saves review work.",
+  footer: "Questions? Contact the SAO admin.",
+  servicePlaceholder: "(ask the SAO admin for the service account email)",
+  sections: [
+    {
+      title: "1. Preparing the SAST forms (stamp)",
+      dos: [
+        "Stamp every form with the numbering machine BEFORE handing it out. One stamp per form.",
+        "Stamp upright, in the same spot on every form (top margin, away from the table and the student ID).",
+        "Use dark, fresh ink so every digit is sharp and complete.",
+        "Check the stamp: all digits visible, nothing smudged or cut off.",
+      ],
+      donts: [
+        "Don't stamp a form twice or stamp over the rating table, the header or the student ID.",
+        "Don't photocopy stamped forms or reuse a stamp number. A stamp number already saved this semester is rejected automatically as a duplicate.",
+        "Don't let a worn or dry stamp pad print faint or broken digits; replace the ink first.",
+      ],
+    },
+    {
+      title: "2. Filling in the form (for students; read it to them)",
+      dos: [
+        "Use a black or blue ballpen.",
+        "Write the instructor's full name, the subject code and title, and your student ID clearly in the header.",
+        "Mark each answer with a check (✓) or a slash (/) inside the box of the column you choose.",
+        "Make the mark about the size of the box: not a tiny dot, and not so long that it runs into the next box or row.",
+        "Give exactly one mark per row and answer all 20 items. A form with fewer than 5 answers is not counted.",
+        "Write comments only in the Remarks box. Leave it blank if you have none.",
+      ],
+      donts: [
+        "Don't use an X, shading, a circle or a dot. These are NOT counted.",
+        "Don't put two marks in one row.",
+        "Don't cross out or scribble over an answer; ask for a new form instead.",
+        "Don't use pencil (light pencil can be missed), and don't write over the stamp or the table lines.",
+        "Don't fold, staple or tear the form through the table.",
+      ],
+    },
+    {
+      title: "3. Scanning with the phone or the scanner",
+      dos: [
+        "Lay the form flat on a plain, darker surface so the paper edges stand out.",
+        "Use even light with no shadows or glare. Turn off the flash if it makes a shiny spot.",
+        "Fit the whole page inside the frame, hold the phone straight above the page and keep it still.",
+        "Pick the right paper size (Short or Long).",
+        "Check the preview: the stamp, the header and all 20 rows must be readable.",
+      ],
+      donts: [
+        "Don't scan tilted, curled or folded pages, or with fingers or objects on the paper.",
+        "Don't scan the same form twice.",
+        "Don't crop off the stamp or the edges of the table.",
+      ],
+    },
+    {
+      title: "4. Reviewing flagged scans",
+      dos: [
+        "Open the scan image and compare every flagged item with the paper.",
+        "Type the stamp number exactly as printed when it was not read, including leading zeros.",
+        "Fill in answers the scan missed; discard forms that break the rules above.",
+      ],
+      donts: [
+        "Don't approve a form you have not checked against the image.",
+        "Don't type a stamp number you cannot read on the paper; check the physical form first.",
+      ],
+    },
+    {
+      title: "5. Importing a Google Sheet",
+      dos: [
+        "Name the tab exactly: SAST Survey Data",
+        "Put the column headers in the first row. New layout: ID Number, Name of the Instructor/Professor, Course Handled by the Instructor, items \"1. …\" to \"20. …\", Comments. Old layout: Student ID, Instructor/Professor, Subject Taught, M1–M10, P1–P10, Remarks & Suggestions, Date.",
+        "Items 1–10 are Management and 11–20 are Performance, like the paper form.",
+        "Enter ratings as numbers 1 to 5 (5 = Outstanding, 4 = Very Satisfactory, 3 = Satisfactory, 2 = Fair, 1 = Unsatisfactory).",
+        "Write the instructor as \"Family, First M.\" or \"First Family\", the same name as in iEvaluate.",
+        "Write the course as \"CODE TITLE\", for example: MOBAPP 330 MOBILE APPLICATION DEVELOPMENT",
+        "Use one row per student evaluation.",
+        "Share the sheet with the iEvaluate service account as Viewer: {SERVICE_ACCOUNT_EMAIL}",
+        "Paste the full link (https://docs.google.com/spreadsheets/d/…) and wait until the app says the import finished. It can take several minutes; unmatched rows go to Import Errors for review.",
+      ],
+      donts: [
+        "Don't rename the tab, merge cells, or add title rows, total rows or empty rows between the data.",
+        "Don't type words (like \"Outstanding\") instead of numbers in the rating columns.",
+        "Don't leave the Comments empty with spaces or dashes; leave it truly blank. \"N/A\" is fine (it is saved as empty).",
+        "Don't import the same sheet twice.",
+        "If the app says Google denied access, the sheet was not shared with the service account.",
+      ],
+    },
+  ],
+};

@@ -12,7 +12,7 @@ import {
   outcomeNote,
   rotationText,
 } from "../messages.js";
-import { ScannerStatus, SkippedPagesCard, getScannerState, skippedCount, useStation } from "../scanner.jsx";
+import { OldWatcherNote, ScannerStatus, SkippedPagesCard, getScannerState, skippedCount, useStation } from "../scanner.jsx";
 import { PageViewer, ScoreChip, ScoreLine } from "../pageViewer.jsx";
 
 const POLL_MS = 3000;
@@ -88,6 +88,7 @@ function allItems(batch) {
 }
 
 const REVIEWED_LABEL = { validated: "Reviewed", discarded: "Discarded" };
+const isStampDuplicate = (item) => (item.review_reasons || []).some((r) => String(r).trim().toLowerCase() === "duplicate_stamp");
 
 const IDENTITY_WORDS = { match: "matches", mismatch: "doesn't match", unreadable: "can't read it" };
 
@@ -123,13 +124,18 @@ function ItemRow({ item, now, markingOff, reviewTo, canView, onView }) {
   const mismatch = item.identity && (item.identity.instructor === "mismatch" || item.identity.subject === "mismatch");
   // Flagged pages already fixed on the review page or in the app (queue row no longer pending).
   const reviewed = bucket === "flagged" && item.review_status && item.review_status !== "pending";
+  // Its stamp number was already saved this term: marking discarded it by itself (counted under Flagged).
+  // Taken back on the review page (Override), it is an ordinary flagged form again.
+  const alreadyScanned = bucket === "flagged" && isStampDuplicate(item) && !["pending", "validated"].includes(item.review_status);
   const label = waiting
     ? "Waiting for marking"
     : unreadable
       ? "Failed – couldn't be read"
-      : reviewed
-        ? REVIEWED_LABEL[item.review_status] || "Reviewed"
-        : LABEL[bucket] || "Received";
+      : alreadyScanned
+        ? "Already scanned"
+        : reviewed
+          ? REVIEWED_LABEL[item.review_status] || "Reviewed"
+          : LABEL[bucket] || "Received";
   const rotation = rotationText(item.orientation_applied);
 
   const lines = [];
@@ -161,9 +167,11 @@ function ItemRow({ item, now, markingOff, reviewTo, canView, onView }) {
       ? "flagged"
       : bucket === "failed" || bucket === "errors"
         ? "error"
-        : reviewed
-          ? "reviewed"
-          : item.status;
+        : alreadyScanned
+          ? "duplicate"
+          : reviewed
+            ? "reviewed"
+            : item.status;
   const rowCls = waiting ? "waiting" : bucket === "unsaved" ? "flagged" : bucket === "failed" || bucket === "errors" ? "error" : item.status;
   const at = item.created_at || item.updated_at;
   return (
@@ -189,8 +197,11 @@ function ItemRow({ item, now, markingOff, reviewTo, canView, onView }) {
         <div key={t} className="small item-msg">{t}</div>
       ))}
       <IdentityCheck identity={item.identity} />
-      {bucket === "flagged" && !reviewed && reviewTo && (
+      {bucket === "flagged" && !reviewed && !alreadyScanned && reviewTo && (
         <Link className="small-link" to={reviewTo}>Review this form</Link>
+      )}
+      {alreadyScanned && reviewTo && (
+        <Link className="small-link" to={reviewTo}>See it on the review page (Override if it is a different sheet)</Link>
       )}
       {bucket === "unsaved" && reviewTo && (
         <Link className="small-link" to={`${reviewTo}#couldnt-save`}>Try again or type in the answers</Link>
@@ -330,7 +341,9 @@ export default function ScanningLive({ stationId }) {
   const forgottenHelp = `Only needed if a batch was left open. Available after ${abandonedHours} ${abandonedHours === 1 ? "hour" : "hours"} with no new scans.`;
   // Prefer the full station record; fall back to what the batch tells us.
   const station = liveStation && liveStation.id === batch.station?.id ? { ...batch.station, ...liveStation } : batch.station;
-  const scannerReady = getScannerState(station, now).tone === "green";
+  const scannerState = getScannerState(station, now);
+  const scannerReady = scannerState.tone === "green";
+  const scannerKey = scannerState.key;
   const lastPageAt = batch.last_item_at || station?.watcher_last_file_at || batch.last_scan_at || (items[0] && (items[0].created_at || items[0].updated_at)) || null;
   const queued = Math.max(0, Number(station?.watcher_queued_files) || 0);
   const skipped = skippedCount(station);
@@ -391,11 +404,21 @@ export default function ScanningLive({ stationId }) {
 
       {!scannerReady && (
         <div className="warning-box small">
-          New scans won't arrive until the scanner laptop is working. Open{" "}
-          <Link to="/scanner-setup">Step 1: Scanner setup</Link>{" "}
-          to see what's wrong. This batch stays open meanwhile.
+          {scannerKey === "offline" ? (
+            <>
+              The Scan Watcher is off. Open <strong>Start Scan Watcher</strong> on the scanner laptop. Pages you scan
+              meanwhile wait in the scan folder and are sent once it starts (if this batch is open).
+            </>
+          ) : (
+            <>
+              New scans won't arrive until the scanner laptop is working. Open{" "}
+              <Link to="/scanner-setup">Step 1: Scanner setup</Link>{" "}
+              to see what's wrong. This batch stays open meanwhile.
+            </>
+          )}
         </div>
       )}
+      <OldWatcherNote station={station} />
 
       <SkippedPagesCard
         station={station}

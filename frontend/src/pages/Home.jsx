@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../api.js";
 import { Loading, PageHeader } from "../components.jsx";
 import { Icon } from "../icons.jsx";
-import { ScannerStatus, SkippedPagesCard, getScannerState, hasBeenOnline, useStation } from "../scanner.jsx";
+import { OldWatcherNote, ScannerStatus, SkippedPagesCard, WatcherOffHint, getScannerState, hasBeenOnline, useStation } from "../scanner.jsx";
 
 // "Getting started" checklist: shows what's done and the one next thing to do.
 export default function Home({ stationId, profile, onSwitchStation, onStationMissing }) {
@@ -55,7 +55,10 @@ export default function Home({ stationId, profile, onSwitchStation, onStationMis
       ) : scannerInstalled ? (
         <>
           <ScannerStatus station={station} />
-          <div className="muted small">Open Scanner setup to see how to fix this.</div>
+          <OldWatcherNote station={station} />
+          <div className="muted small">
+            {scanner.key === "offline" ? <WatcherOffHint /> : "Open Scanner setup to see how to fix this."}
+          </div>
         </>
       ) : (
         "Install the scan program on the laptop connected to the scanner. It takes about 5 minutes, once."
