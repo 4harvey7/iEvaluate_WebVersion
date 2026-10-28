@@ -45,8 +45,8 @@ async function run(name, input, nodes = {}, inputs = null) {
     prepareBinaryData: async (buf, fileName, mimeType) => ({ fileName, mimeType, fileSize: buf.length }),
   };
   const quiet = { log() {}, warn() {}, error() {} };
-  const fn = new AsyncFunction('$', '$input', 'Buffer', 'console', codeOf(name));
-  return fn.call({ helpers }, $, $input, Buffer, quiet);
+  const fn = new AsyncFunction('$', '$input', 'Buffer', 'console', 'items', '$json', codeOf(name));
+  return fn.call({ helpers }, $, $input, Buffer, quiet, list.map((json) => ({ json })), list[0]);
 }
 
 const STATUSES = ['success', 'flagged', 'rejected', 'duplicate'];
@@ -62,8 +62,14 @@ const MISSING_REASONS = ['instructor_missing', 'subject_missing', 'student_id_mi
 function assertContract(out, expectStatus) {
   assert.ok(Array.isArray(out) && out.length === 1, 'exactly one item');
   const r = out[0].json;
+  // stamp rule (2026-10-16): the flagged and success answers also carry auto_rejected + stamp_no (additive)
+  const stampKeys = 'auto_rejected' in r || 'stamp_no' in r ? ['auto_rejected', 'stamp_no'] : [];
   assert.deepStrictEqual(Object.keys(r).sort(),
-    ['flagged', 'identity_check', 'message', 'review_reasons', 'status', 'task_id'].sort());
+    ['flagged', 'identity_check', 'message', 'review_reasons', 'status', 'task_id', ...stampKeys].sort());
+  if (stampKeys.length) {
+    assert.ok(r.auto_rejected === null || r.auto_rejected === 'duplicate_stamp', `auto_rejected ${r.auto_rejected}`);
+    assert.ok(r.stamp_no === null || /^[0-9]{3,12}$/.test(r.stamp_no), `stamp_no ${r.stamp_no}`);
+  }
   assert.ok(STATUSES.includes(r.status), `status ${r.status}`);
   if (expectStatus) assert.strictEqual(r.status, expectStatus);
   assert.strictEqual(typeof r.flagged, 'boolean');
@@ -105,9 +111,27 @@ const body = {
 };
 const letters = ['O', 'VS', 'S', 'F', 'US'];
 // override[i] = letter, or '' for a row Python reads blank (detected: false)
-function python({ table = true, override = {}, weak = {}, grid = 'structure-fit', ocr = {} } = {}) {
-  const cell = (i) => (override[i] === ''
-    ? { detected: false, rating_name: null }
+// invalid[i] = 'x' | 'shade' | 'circle' | 'dot' (or null): the check-only OMR rejected that row's mark;
+// it returns the row exactly like a blank one and names the mark in omr_debug[i].invalid_mark.
+// Without invalid the omr_debug entries carry no invalid_mark field at all (an older OMR build).
+// The OMR's stamp block (/process, STAMP_FINDER + STAMP_READER, 2026-10-17): reads = the Python reader's
+// number per stamp-like candidate ('?' = unsure digit); complete reads go to python_numbers.
+function pyStamp(reads = ['0100005'], { like = reads.length, reader = true, sheet = true, extraBoxes = 2 } = {}) {
+  const boxes = reads.map((n, i) => ({ id: `T${i + 1}`, tiles: [`T${i + 1}`], python_read: { version: 2, number: n,
+    complete: !n.includes('?'), stamp_like: true, n_digits: n.length } }));
+  for (let i = 0; i < extraBoxes; i++) {
+    boxes.push({ id: `T${boxes.length + 1}`, tiles: [`T${boxes.length + 1}`], python_read: { version: 2, number: '???????',
+      complete: false, stamp_like: false, n_digits: 7 } });
+  }
+  return { version: 2, enabled: true, python_reader: reader, python_reader_version: 2, count: boxes.length, boxes,
+    tile_sheet_b64: sheet ? 'A'.repeat(400) : null, dpi: 200,
+    ...(reader ? { python_numbers: [...new Set(reads.filter((n) => !n.includes('?')))], python_stamp_like: like, python_read_ms: 420 } : {}),
+    ms: 900 };
+}
+function python({ table = true, override = {}, weak = {}, grid = 'structure-fit', ocr = {}, invalid = {}, stamp } = {}) {
+  const rejected = (i) => Object.prototype.hasOwnProperty.call(invalid, i) && invalid[i] !== null;
+  const cell = (i) => (override[i] === '' || rejected(i)
+    ? { detected: false, rating_name: null, score: 0 }
     : { detected: true, rating_name: override[i] || letters[i % 5] });
   return {
     table_found: table,
@@ -116,8 +140,10 @@ function python({ table = true, override = {}, weak = {}, grid = 'structure-fit'
       management: Array.from({ length: 10 }, (_, i) => cell(i)),
       performance: Array.from({ length: 10 }, (_, i) => cell(i + 10)),
     },
-    omr_debug: Array.from({ length: 20 }, (_, i) => ({ row_index: i, scores: weak[i] || { a: 0.9, b: 0.1 } })),
+    omr_debug: Array.from({ length: 20 }, (_, i) => ({ row_index: i, scores: weak[i] || { a: 0.9, b: 0.1 },
+      ...(Object.prototype.hasOwnProperty.call(invalid, i) ? { invalid_mark: invalid[i] } : {}) })),
     ocr_fields: { instructor: '', subject: '', student_id: '', ...ocr },
+    ...(stamp === null ? {} : { stamp_candidates: stamp || pyStamp() }),
   };
 }
 // Python OCR text that must NEVER be used (the real garbage from a scanner page).
@@ -129,6 +155,9 @@ function geminiResp(fields = {}) {
   const g = {
     instructor: 'Dr. Juan A. Dela Cruz, MIT', subject: 'IT 1O1', ay_semester: '2026 1st Sem',
     remarks: 'Very good teacher', date: '09/20/26', student_id: '2021 0001',
+    stamp_numbers: ['0100005'],   // the numbering-machine stamp (stamp rule): one readable stamp
+    stamp_numbers_page: ['0100005'],                          // two readers: full-page read
+    stamp_reads_tiles: [{ tile: 'T1', number: '0100005' }],   // two readers: tile-sheet read
     document_check: { is_sast_form: true, reason: 'SAST form' },
     scan_quality: { poor_quality: false, issues: [], reason: 'Good quality' },
     ratings, ...fields,
@@ -319,7 +348,9 @@ test('Agreement: AGREEMENT_MIN = 0.30 in both reconcilers; old count-based rules
     const code = codeOf(name);
     assert.match(code, /^const AGREEMENT_MIN = 0\.30;/m, `${name}: one named constant`);
     assert.strictEqual(code.match(/^const AGREEMENT_MIN\b/gm).length, 1);
-    const noComments = code.split('\n').map((l) => l.replace(/^\s*\/\/.*$/, '')).join('\n');
+    // the one allowed read of ocr_fields is the OMR's ink meta (ocr_crosscheck.js), never its OCR text
+    const noComments = code.split('\n').map((l) => l.replace(/^\s*\/\/.*$/, '')).join('\n')
+      .replace('py?.ocr_fields?.ocr_meta', '');
     for (const old of ['omr_disagreement_', 'severe_omr_disagreement_', 'low_confidence_omr_', 'FLAG_DIFF_COUNT',
       'SEVERE_CONFLICT_LIMIT', 'WEAK_CONFLICT_LIMIT', 'ocr_fields']) {
       assert.ok(!noComments.includes(old), `${name} still uses ${old}`);
@@ -547,6 +578,123 @@ test('Phone reconcile: Python OMR crashed -> omr_unavailable (no Gemini-only pas
 test('Phone reconcile: grid_not_detected still dropped when Python read the grid and Gemini agrees (phone rule kept)', async () => {
   assert.deepStrictEqual((await phoneReconcile(python({ table: false }))).review_reasons, []);
 });
+// ---------------------------------------------------------------- check-only rule (omr_debug[].invalid_mark), both reconcilers
+const RECONCILERS = [['website', (py, g) => reconcile(py, g)], ['phone', (py, g) => phoneReconcile(py, g)]];
+// the Python OMR counts only a check/slash: m3 is an x, which Gemini reads as 'O'
+test('Check-only: an x row + a Gemini letter stays blank (source invalid_mark), no conflict, no fill, no too_many_blanks', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await rec(python({ invalid: { 2: 'x' } }), geminiWith({ m3: 'O' }));
+    const c = r.comparisons.find((x) => x.question === 'm3');
+    assert.strictEqual(r.ratings.m3, null, which);
+    assert.strictEqual(c.source, 'invalid_mark', which);
+    assert.strictEqual(c.invalid_mark, 'x', which);
+    assert.strictEqual(c.gemini_raw, 5, `${which}: Gemini's own reading kept for the record`);
+    // nothing for a downstream fallback (Flutter _extractScore / backend _one_rating: used -> python -> gemini)
+    assert.deepStrictEqual([c.used, c.python, c.gemini], [null, null, null], which);
+    assert.strictEqual(c.agree, true, `${which}: not a Python-vs-Gemini conflict`);
+    assert.strictEqual(c.resolved_by, null, which);
+    assert.deepStrictEqual(r.review_reasons, [], `${which}: one x row alone is not flagged`);
+    assert.strictEqual(r.needs_review, false, which);
+    assert.strictEqual(r.agreement_percent, 100, which);
+    assert.strictEqual(r.omr_agreement.filled_from_gemini, 0, which);
+    assert.strictEqual(r.omr_agreement.invalid_mark_rows, 1, which);
+    assert.strictEqual(r.review_note,
+      'm3: scanner saw an x (not counted). Only a check or slash mark counts, so those answers stay blank.', which);
+    assert.match(r.summary, /^19\/20 answered, 1 non-check mark\(s\) not counted, agreement 100% — clean$/, which);
+    // the other rows are untouched
+    assert.strictEqual(r.ratings.m1, 5, which);
+    assert.ok(r.comparisons.filter((x) => x.question !== 'm3').every((x) => x.invalid_mark === null && !('gemini_raw' in x)), which);
+  }
+});
+test('Check-only: invalid_mark missing (older OMR) or null -> old behaviour, Gemini fills a Python blank', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    for (const py of [python({ override: { 2: '' } }), python({ override: { 2: '' }, invalid: { 2: null } })]) {
+      const r = await rec(py, geminiWith({ m3: 'O' }));
+      const c = r.comparisons.find((x) => x.question === 'm3');
+      assert.strictEqual(r.ratings.m3, 5, which);
+      assert.strictEqual(c.source, 'gemini_fill', which);
+      assert.strictEqual(c.invalid_mark, null, which);
+      assert.strictEqual(r.omr_agreement.filled_from_gemini, 1, which);
+      assert.strictEqual(r.omr_agreement.invalid_mark_rows, 0, which);
+      assert.strictEqual(r.review_note, null, which);
+    }
+  }
+});
+test('Check-only: a row Python read as a rating ignores a stray invalid_mark (Python counted it)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const py = python();
+    py.omr_debug[0].invalid_mark = 'dot';
+    const r = await rec(py, geminiWith({ m1: 'F' }));
+    assert.strictEqual(r.ratings.m1, 5, which);
+    assert.strictEqual(r.comparisons[0].source, 'python', which);
+    assert.strictEqual(r.comparisons[0].invalid_mark, null, which);
+  }
+});
+test('Check-only: mix of valid, blank and invalid rows -> invalid never counts as a blank for too_many_blanks', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    // rows 0..5 truly blank (both engines), rows 6..11 x/shade/circle/dot with Gemini letters, rows 12..19 valid
+    const marks = ['x', 'shade', 'circle', 'dot', 'x', 'x'];
+    const invalid = Object.fromEntries(marks.map((m, k) => [6 + k, m]));
+    const gBlank = Object.fromEntries(QS.slice(0, 6).map((q) => [q, 'blank']));
+    const gInvalid = Object.fromEntries(QS.slice(6, 12).map((q) => [q, 'VS']));
+    const r = await rec(python({ override: blankRows(6), invalid }), geminiWith({ ...gBlank, ...gInvalid }));
+    const by = Object.fromEntries(r.comparisons.map((c) => [c.question, c]));
+    for (const q of QS.slice(0, 6)) assert.deepStrictEqual([r.ratings[q], by[q].source], [null, 'blank'], `${which} ${q}`);
+    for (const q of QS.slice(6, 12)) assert.deepStrictEqual([r.ratings[q], by[q].source], [null, 'invalid_mark'], `${which} ${q}`);
+    for (const q of QS.slice(12)) assert.strictEqual(by[q].source, 'python', `${which} ${q}`);
+    // 12 empty rows in all, but only 6 real blanks: no too_many_blanks; 6 invalid rows: no review flag
+    assert.deepStrictEqual(r.review_reasons, [], which);
+    assert.strictEqual(r.needs_review, false, which);
+    assert.strictEqual(r.agreement_percent, 100, which);
+    assert.strictEqual(r.omr_agreement.filled_from_gemini, 0, which);
+    assert.strictEqual(r.omr_agreement.invalid_mark_rows, 6, which);
+    assert.match(r.review_note, new RegExp('^m7: scanner saw an x \\(not counted\\); m8: scanner saw a shaded bubble \\(not counted\\); '
+      + 'm9: scanner saw a circle \\(not counted\\); m10: scanner saw a dot \\(not counted\\); p1: scanner saw an x \\(not counted\\); '
+      + 'p2: scanner saw an x \\(not counted\\)\\. Only a check or slash mark counts'), which);
+    // 11 invalid rows (Gemini blank): still no too_many_blanks, no flag
+    const all11 = Object.fromEntries(Array.from({ length: 11 }, (_, i) => [i, 'dot']));
+    const r11 = await rec(python({ invalid: all11 }), geminiWith(Object.fromEntries(QS.slice(0, 11).map((q) => [q, 'blank']))));
+    assert.deepStrictEqual(r11.review_reasons, [], which);
+    assert.strictEqual(r11.needs_review, false, which);
+  }
+});
+test('Check-only: invalid marks never flag a review (2 rows and 3 rows -> note only)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const two = await rec(python({ invalid: { 0: 'x', 10: 'shade' } }), geminiWith({ m1: 'S', p1: 'O' }));
+    assert.deepStrictEqual(two.review_reasons, [], which);
+    assert.strictEqual(two.needs_review, false, which);
+    assert.match(two.review_note, /^m1: scanner saw an x \(not counted\); p1: scanner saw a shaded bubble \(not counted\)\./, which);
+    const three = await rec(python({ invalid: { 0: 'x', 10: 'shade', 19: 'circle' } }), geminiWith({ m1: 'S', p1: 'O', p10: 'F' }));
+    assert.deepStrictEqual(three.review_reasons, [], which);
+    assert.strictEqual(three.needs_review, false, which);
+    if (which === 'phone') assert.notStrictEqual(three.validation_status, 'flagged');
+    assert.match(three.review_note, /p10: scanner saw a circle \(not counted\)\. Only a check or slash mark counts, so those answers stay blank\.$/, which);   // unflagged page: no agreement sentence appended
+    // an unknown mark name from a newer OMR is still not counted
+    const odd = await rec(python({ invalid: { 4: 'Scribble' } }), geminiWith({ m5: 'O' }));
+    assert.strictEqual(odd.ratings.m5, null, which);
+    assert.match(odd.review_note, /^m5: scanner saw a "scribble" mark \(not counted\)/, which);
+  }
+});
+test('Check-only: a fully dotted sheet (20 dots) -> all blank, no invalid-mark flag; 0 answered -> discarded (min-answered rule)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const dots = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [i, 'dot']));
+    const r = await rec(python({ invalid: dots }), geminiResp());   // Gemini reads every dot as a letter
+    assert.ok(Object.values(r.ratings).every((v) => v === null), which);
+    // the dots themselves raise nothing; the form has no answer left, so the min-answered rule discards it
+    assert.deepStrictEqual(r.review_reasons, ['too_few_answers_0_of_20'], which);
+    assert.strictEqual(r.auto_discard, true, which);
+    assert.strictEqual(r.agreement_percent, 100, which);
+    assert.match(r.summary, /^0\/20 answered, 20 non-check mark\(s\) not counted/, which);
+  }
+});
+test('Check-only: both main Gemini prompts carry the one check-only line (no names, schema unchanged)', () => {
+  const LINE = "- Only a check mark or a slash (/) counts as an answer; read an x, a fully shaded bubble, a circle or a dot as 'blank'.";
+  for (const name of ['ai validation ocr and omr', 'Website AI Validation']) {
+    const body = wf.nodes.find((x) => x.name === name).parameters.jsonBody;
+    assert.strictEqual(body.split(LINE).length - 1, 1, name);
+    assert.ok(body.includes(`${LINE}\\n- Two bubbles shaded in one row -> 'blank'.`), name);
+  }
+});
 test('Handle Gemini failure (phone): student id no longer taken from Python OCR', async () => {
   const code = codeOf('Handle Gemini failure');
   assert.ok(!code.includes('ocr_fields'), 'must not read py.ocr_fields');
@@ -555,8 +703,153 @@ test('Handle Gemini failure (phone): student id no longer taken from Python OCR'
   });
   const r = out[0].json;
   assert.strictEqual(r.student_id, '');
-  assert.deepStrictEqual(r.review_reasons, ['ai_validation_failed']);
+  // stamp rule: nothing was read, so the stamp is unreadable too
+  assert.deepStrictEqual(r.review_reasons, ['ai_validation_failed', 'stamp_unreadable']);
+  assert.strictEqual(r.stamp_status, 'unreadable');
+  assert.strictEqual(r.stamp_no, null);
   assert.strictEqual(r.task_id, 'phone-1');
+});
+
+// ---------------------------------------------------------------- OCR cross-check (ocr_crosscheck.js, panel #2/#10/#11)
+// OMR ocr_meta with the ink score (api.py 306667b9+): ink[f] <= 0.001 = empty, >= 0.008 = written, else unsure
+function withInk(py, ink, { located = {}, version = 2, noInk = false } = {}) {
+  const fields = ['student_id', 'instructor', 'subject', 'date', 'remarks'];
+  const meta = { version, located: Object.fromEntries(fields.map((f) => [f, located[f] ?? true])),
+    present: Object.fromEntries(fields.map((f) => [f, (ink[f] ?? 0.05) >= 0.004])), boxes: {}, paper_wh: [1700, 2200] };
+  if (!noInk) meta.ink = Object.fromEntries(fields.map((f) => [f, ink[f] ?? 0.05]));
+  py.ocr_fields = { ...py.ocr_fields, ocr_meta: meta };
+  return py;
+}
+const OC_REASONS = ['student_id_unverified', 'student_id_missed', 'remarks_missed', 'remarks_unverified', 'white_ink_correction'];
+const ocOnly = (r) => r.review_reasons.filter((x) => OC_REASONS.includes(x));
+test('OCR cross-check: blank ID box + blank remarks box read blank by the AI -> no reason, no note (both reconcilers)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await rec(withInk(python(), { student_id: 0, remarks: 0 }), geminiResp({ student_id: '', remarks: '' }));
+    assert.deepStrictEqual(ocOnly(r), [], which);
+    assert.ok(!/student ID box|remarks box|ID box looks empty|Correction fluid/.test(r.review_note || ''), which);
+    assert.deepStrictEqual(r.ocr_check, { student_id_ink: 'empty', remarks_ink: 'empty', corrected_rows: [] }, which);
+    if (which === 'phone') {
+      assert.deepStrictEqual(r.review_reasons, [], 'phone: a blank form header is normal');
+      assert.strictEqual(r.needs_review, false);
+      assert.strictEqual(r.review_note, null);
+    } else {
+      assert.deepStrictEqual(r.review_reasons, [], 'website: student_id_missing is added later by Website Decide, unchanged');
+    }
+    // written boxes read by the AI: also nothing
+    const ok = await rec(withInk(python(), { student_id: 0.04, remarks: 0.02 }), geminiResp());
+    assert.deepStrictEqual(ok.review_reasons, [], which);
+    assert.strictEqual(ok.student_id.replace(/\s+/g, ''), '20210001', which);
+  }
+});
+test('OCR cross-check: empty ID box but the AI read an ID -> ID dropped (blank), student_id_unverified + note; never discarded', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await rec(withInk(python(), { student_id: 0.0004 }), geminiResp({ student_id: '2021 0001' }));
+    assert.deepStrictEqual(r.review_reasons, ['student_id_unverified'], which);
+    assert.strictEqual(r.needs_review, true, which);
+    assert.strictEqual(r.auto_discard, false, which);
+    assert.strictEqual(r.student_id, '', `${which}: the AI's ID is not stored`);
+    assert.strictEqual(r.ocr_check.student_id_ai, '2021 0001', `${which}: kept for the reviewer`);
+    assert.ok(r.review_note.includes('The AI read a student ID but the ID box looks empty. Check the sheet.'), which);
+    if (which === 'phone') assert.strictEqual(r.validation_status, 'flagged');
+  }
+});
+test('OCR cross-check: written ID box read empty -> student_id_missed on the phone only (website keeps student_id_missing in Decide)', async () => {
+  const py = () => withInk(python(), { student_id: 0.03 });
+  const phone = await phoneReconcile(py(), geminiResp({ student_id: '' }));
+  assert.deepStrictEqual(phone.review_reasons, ['student_id_missed']);
+  assert.ok(phone.review_note.includes('The student ID box has writing but the AI read no student ID.'));
+  const web = await reconcile(py(), geminiResp({ student_id: '' }));
+  assert.deepStrictEqual(web.review_reasons, [], 'no duplicate of student_id_missing');
+  const d = await decide(identity(), { ...REC, student_id: web.student_id });
+  assert.ok(d.review_reasons.includes('student_id_missing'), 'Decide still flags the blank ID');
+});
+test('OCR cross-check: remarks -> ink + AI blank = remarks_missed; no ink + AI text = remarks_unverified (text kept)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const missed = await rec(withInk(python(), { remarks: 0.02 }), geminiResp({ remarks: '' }));
+    assert.deepStrictEqual(missed.review_reasons, ['remarks_missed'], which);
+    assert.ok(missed.review_note.includes('The remarks box has writing but the AI read no remark.'), which);
+    // a student's "N/A" is writing the AI read (raw text): not missed
+    const na = await rec(withInk(python(), { remarks: 0.02 }), geminiResp({ remarks: 'N/A' }));
+    assert.deepStrictEqual(ocOnly(na), [], which);
+    const unv = await rec(withInk(python(), { remarks: 0 }), geminiResp({ remarks: 'Very good teacher' }));
+    assert.deepStrictEqual(unv.review_reasons, ['remarks_unverified'], which);
+    assert.strictEqual(unv.remarks, 'Very good teacher', `${which}: review only, text not changed`);
+    assert.ok(unv.review_note.includes('The AI read a remark but the remarks box looks empty. Check the sheet.'), which);
+    // a placeholder the AI wrote for an empty box is not a remark (stored as NULL anyway)
+    for (const ph of ['N/A', 'none', '-', '  ']) {
+      const p = await rec(withInk(python(), { remarks: 0 }), geminiResp({ remarks: ph }));
+      assert.deepStrictEqual(ocOnly(p), [], `${which} ${JSON.stringify(ph)}`);
+    }
+  }
+});
+test('OCR cross-check: unsure or missing ink data -> nothing (old OMR, no ocr_meta, mid score, not located, no table, AI failed)', async () => {
+  const g = geminiResp({ student_id: '2021 0001', remarks: '' });
+  for (const [which, rec] of RECONCILERS) {
+    const cases = {
+      'no ocr_meta (older OMR)': python(),
+      'ocr_meta without ink (deployed OMR)': withInk(python(), { student_id: 0, remarks: 0.05 }, { noInk: true }),
+      'ink between the thresholds': withInk(python(), { student_id: 0.003, remarks: 0.005 }),
+      'box not located': withInk(python(), { student_id: 0, remarks: 0.05 }, { located: { student_id: false, remarks: false } }),
+      'ocr_meta version 1': withInk(python(), { student_id: 0, remarks: 0.05 }, { version: 1 }),
+      'ink not a number': (() => { const p = withInk(python(), {}); p.ocr_fields.ocr_meta.ink = { student_id: '0', remarks: null }; return p; })(),
+      'ocr_meta null': (() => { const p = python(); p.ocr_fields.ocr_meta = null; return p; })(),
+    };
+    for (const [label, py] of Object.entries(cases)) {
+      const r = await rec(py, g);
+      assert.deepStrictEqual(ocOnly(r), [], `${which}: ${label}`);
+      assert.strictEqual(r.student_id.replace(/\s+/g, ''), '20210001', `${which}: ${label}`);
+    }
+    // no table: ratings untrusted anyway; the ink boxes are not trusted either
+    const nt = await rec(withInk(python({ table: false }), { student_id: 0, remarks: 0.05 }), g);
+    assert.ok(!nt.review_reasons.some((x) => OC_REASONS.includes(x)), `${which}: table not found`);
+    // Gemini failed: its blank text is not an AI read
+    const bad = { candidates: [{ content: { parts: [{ text: 'not json' }] } }] };
+    const gf = await rec(withInk(python(), { student_id: 0.05, remarks: 0.05 }), bad);
+    assert.deepStrictEqual(ocOnly(gf), [], `${which}: Gemini unparseable`);
+    // not a SAST form: no cross-check noise
+    const nf = await rec(withInk(python(), { student_id: 0, remarks: 0 }),
+      geminiResp({ student_id: '123', remarks: 'hello', document_check: { is_sast_form: false, reason: 'a receipt' } }));
+    assert.deepStrictEqual(ocOnly(nf), [], `${which}: not a SAST form`);
+  }
+});
+test('White ink: corrected_rows -> white_ink_correction + note naming the rows; ratings unchanged; junk ignored', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await rec(python(), geminiResp({ corrected_rows: ['p7', 'M3', 'x9', 'm3', 'p10', 7, null] }));
+    assert.deepStrictEqual(r.review_reasons, ['white_ink_correction'], which);
+    assert.deepStrictEqual(r.ocr_check.corrected_rows, ['m3', 'p7', 'p10'], which);
+    assert.ok(r.review_note.includes('Correction fluid/tape or a crossed-out mark was seen on m3, p7, p10. '
+      + 'Check those rows on the sheet: only the remaining uncovered check counts.'), which);
+    const plain = await rec(python(), geminiResp());
+    assert.deepStrictEqual(r.ratings, plain.ratings, `${which}: no automatic score change`);
+    assert.strictEqual(r.auto_discard, false, which);
+    for (const cr of [[], undefined, 'm3', ['', 'q1', 'm11']]) {
+      const n = await rec(python(), geminiResp({ corrected_rows: cr }));
+      assert.deepStrictEqual(ocOnly(n), [], `${which} ${JSON.stringify(cr)}`);
+    }
+  }
+});
+test('Double mark (OMR invalid_mark "double"): row blank, never filled from Gemini, "two marks" note, no flag', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await rec(python({ invalid: { 4: 'double' } }), geminiWith({ m5: 'O' }));
+    const c = r.comparisons.find((x) => x.question === 'm5');
+    assert.strictEqual(r.ratings.m5, null, which);
+    assert.strictEqual(c.source, 'invalid_mark', which);
+    assert.strictEqual(c.invalid_mark, 'double', which);
+    assert.deepStrictEqual(r.review_reasons, [], which);
+    assert.strictEqual(r.review_note, 'm5: scanner saw two marks (not counted). Only a check or slash mark counts, '
+      + 'so those answers stay blank. A row with two marks has no single answer.', which);
+  }
+});
+test('OCR cross-check: both Gemini prompts carry the white-ink line once (after the two-bubbles rule) and a required corrected_rows; no names', () => {
+  const LINE = '- A mark covered by correction fluid or tape (white-out), or heavily crossed out, is erased and is not an answer: '
+    + 'read only the remaining uncovered check, and list that row (m1-m10, p1-p10) in corrected_rows ([] if none).';
+  for (const name of ['ai validation ocr and omr', 'Website AI Validation']) {
+    const body = wf.nodes.find((x) => x.name === name).parameters.jsonBody;
+    assert.strictEqual(body.split(LINE).length - 1, 1, name);
+    assert.ok(body.includes(`- Two bubbles shaded in one row -> 'blank'.\\n${LINE}\\n- A faint mark`), name);
+    assert.ok(body.includes('"corrected_rows": { "type": "ARRAY", "items": { "type": "STRING" } },'), name);
+    assert.ok(!/Known instructors|known_instructor/.test(body), `${name}: no instructor names`);
+  }
 });
 
 // ---------------------------------------------------------------- layout safety net (layout_check.js)
@@ -1188,29 +1481,70 @@ test('Known-list pick from Gemini (website: subjects only): counts for the batch
   assert.strictEqual(d.partial_data.instructor_match, 'unreadable');
   assert.strictEqual(d.partial_data.subject_match, 'unreadable');
 });
-test('Phone reconcile: Gemini\'s known pick replaces the raw instructor/subject only when it is on the list and fits', async () => {
-  const known = { instructor_names: ['Joseph King', RODZ], subjects: [{ code: 'PC121', name: 'Discreet Math' }, { code: 'ASP 101', name: 'asp.net mvc' }] };
+test('Phone reconcile: Gemini\'s known SUBJECT pick replaces the raw subject only when it is on the list and fits', async () => {
+  const known = { subjects: [{ code: 'PC121', name: 'Discreet Math' }, { code: 'ASP 101', name: 'asp.net mvc' }] };
   const phone = async (fields, kn = known) => (await run('reconcile ocr and omr1', {}, {
     'image to ocr and omr python': python(), 'ai validation ocr and omr': geminiResp(fields), 'SAST image from phone': PHONE_HOOK,
     'Phone Known Names': kn,
   }))[0].json;
-  let r = await phone({ instructor: 'Kodi Harvey D. Licayan', known_instructor: RODZ, subject: 'PO121', known_subject: 'PC121' });
-  assert.strictEqual(r.instructor, RODZ);
+  let r = await phone({ subject: 'PO121', known_subject: 'PC121' });
   assert.strictEqual(r.subject, 'PC121');
-  assert.deepStrictEqual(r.review_reasons, []);
-  r = await phone({ instructor: 'Kodi Harvey D. Licayan', known_instructor: 'Joseph King', subject: 'IT1021', known_subject: 'ASP 101' });
-  assert.strictEqual(r.instructor, 'Kodi Harvey D. Licayan', 'no support from the raw reading');
-  assert.strictEqual(r.subject, 'IT1021');
-  r = await phone({ instructor: 'Kodi Harvey D. Licayan', known_instructor: 'Somebody Else', subject: 'Astrc Math', known_subject: 'XX 999' });
-  assert.strictEqual(r.instructor, 'Kodi Harvey D. Licayan', 'not on the list');
-  assert.strictEqual(r.subject, 'Astrc Math');
-  r = await phone({ instructor: 'Kodi Harvey D. Licayan', known_instructor: RODZ }, { error: 'connection refused' });
-  assert.strictEqual(r.instructor, 'Kodi Harvey D. Licayan', 'lookup failed -> raw reading');
-  r = await phone({ instructor: '', known_instructor: RODZ, subject: '', known_subject: 'PC121' });
+  r = await phone({ subject: 'IT1021', known_subject: 'ASP 101' });
+  assert.strictEqual(r.subject, 'IT1021', 'no support from the raw reading');
+  r = await phone({ subject: 'Astrc Math', known_subject: 'XX 999' });
+  assert.strictEqual(r.subject, 'Astrc Math', 'not on the list');
+  r = await phone({ subject: 'PO121', known_subject: 'PC121' }, { error: 'connection refused' });
+  assert.strictEqual(r.subject, 'PO121', 'lookup failed -> raw reading');
+  r = await phone({ instructor: '', subject: '', known_subject: 'PC121' });
   assert.deepStrictEqual([r.instructor, r.subject], ['', ''], 'nothing written -> nothing picked');
   assert.deepStrictEqual(r.review_reasons, ['missing_instructor', 'missing_subject']);
 });
-test('Main Gemini prompts: known instructors/subjects from Known Names, optional known_* fields, old fields unchanged', async () => {
+test('Phone reconcile: the instructor is matched locally against Phone Instructor Candidates (no Gemini pick)', async () => {
+  const cands = { candidates_version: 1, instructor_names: ['Joseph King', RODZ, 'Evangeline Caruana'] };
+  const phone = async (fields, cn = cands) => {
+    const nodes = { 'image to ocr and omr python': python(), 'ai validation ocr and omr': geminiResp(fields),
+      'SAST image from phone': PHONE_HOOK, 'Phone Known Names': { subjects: [] } };
+    if (cn !== null) nodes['Phone Instructor Candidates'] = cn;
+    return (await run('reconcile ocr and omr1', {}, nodes))[0].json;
+  };
+  // messy reading, one clear database match -> the exact database name (found by 'get instructor id6')
+  let r = await phone({ instructor: 'Kodi Harvey D. Licayan' });
+  assert.strictEqual(r.instructor, RODZ);
+  assert.strictEqual(r.instructor_match.match, 'found');
+  assert.strictEqual(r.instructor_match.raw, 'Kodi Harvey D. Licayan');
+  assert.deepStrictEqual(r.review_reasons, []);
+  r = await phone({ instructor: 'Prof. Joseph King, MIT' });
+  assert.strictEqual(r.instructor, 'Joseph King', 'titles and degrees ignored');
+  // a known_instructor Gemini might still return is ignored
+  r = await phone({ instructor: 'Kodi Harvey D. Licayan', known_instructor: 'Joseph King' });
+  assert.strictEqual(r.instructor, RODZ);
+  // no database entry close enough -> the raw reading goes on to 'get instructor id6' as before
+  r = await phone({ instructor: 'Licayan' });
+  assert.strictEqual(r.instructor, 'Licayan');
+  assert.strictEqual(r.instructor_match.match, 'none');
+  assert.deepStrictEqual(r.review_reasons, [], 'not found here is decided downstream (import error), not flagged');
+  r = await phone({ instructor: 'Somebody Else' });
+  assert.strictEqual(r.instructor, 'Somebody Else');
+  // two people fit equally (same name) -> flagged for review, never a guess
+  r = await phone({ instructor: 'Joseph King' }, { candidates_version: 1, instructor_names: ['Joseph King', 'Joseph King', RODZ] });
+  assert.strictEqual(r.instructor_match.match, 'ambiguous');
+  assert.strictEqual(r.instructor, 'Joseph King', 'raw reading kept');
+  assert.ok(r.review_reasons.includes('instructor_ambiguous'));
+  assert.strictEqual(r.needs_review, true);
+  assert.ok(/fits more than one instructor/.test(r.review_note));
+  // lookup failed / not executed -> the raw reading, as before
+  for (const cn of [{ error: 'connection refused' }, null]) {
+    r = await phone({ instructor: 'Kodi Harvey D. Licayan' }, cn);
+    assert.strictEqual(r.instructor, 'Kodi Harvey D. Licayan');
+    assert.strictEqual(r.instructor_match.match, 'unavailable');
+    assert.deepStrictEqual(r.review_reasons, []);
+  }
+  // nothing written -> missing_instructor, as before
+  r = await phone({ instructor: '' });
+  assert.ok(r.review_reasons.includes('missing_instructor'));
+  assert.strictEqual(r.instructor_match.match, 'unreadable');
+});
+test('Main Gemini prompts: known subjects only from Known Names, optional known_subject, old fields unchanged', async () => {
   const known = { instructor_list: 'Joseph King; Rodz Harvey d Licayan', subject_list: 'PC121 = Discreet Math; SE101 = Software "Eng"' };
   const body = (name, kn, extra = {}) => {
     const nodes = { 'Website Prepare Scan': { image_base64: 'QUJD', mime_type: 'image/jpeg', ...extra }, 'SAST image from phone': { body: { image: 'QUJD' } },
@@ -1220,25 +1554,27 @@ test('Main Gemini prompts: known instructors/subjects from Known Names, optional
     // eslint-disable-next-line no-new-func
     return JSON.parse(src.replace(/\{\{([\s\S]*?)\}\}/g, (m, js) => String(new Function('$', `return (${js});`)($))));
   };
-  // phone: unchanged -- known_instructor + known_subject, instructor list sent, two image parts
+  // phone: subject list only (privacy -- no instructor names sent to Gemini), two image parts
   {
     const b = body('ai validation ocr and omr', known);
     const text = b.contents[0].parts[0].text;
-    assert.match(text, /6\. student_id: digits only\.\n7\. known_instructor: .*\n8\. known_subject: /);
-    assert.ok(text.includes('Known instructors: Joseph King; Rodz Harvey d Licayan'));
+    assert.match(text, /6\. student_id: digits only\.\n7\. known_subject: /);
+    assert.ok(!text.includes('known_instructor'));
+    assert.ok(!text.includes('Known instructors') && !text.includes('Joseph King'), 'no instructor name list sent (privacy)');
     assert.ok(text.includes('Known subjects (code = title): PC121 = Discreet Math; SE101 = Software "Eng"'));
     assert.ok(text.includes('2. subject: the course code and/or subject title, as written.'));
     assert.ok(!text.includes('DDMGT, IT, CSO'), 'no fixed code list in the hint any more');
     assert.strictEqual(b.contents[0].parts.length, 2);
     assert.strictEqual(b.contents[0].parts[1].inlineData.data, 'QUJD');
     const sch = b.generationConfig.responseSchema;
-    assert.deepStrictEqual(sch.properties.known_instructor, { type: 'STRING' });
+    assert.strictEqual(sch.properties.known_instructor, undefined);
     assert.deepStrictEqual(sch.properties.known_subject, { type: 'STRING' });
-    assert.deepStrictEqual(sch.required, ['instructor', 'subject', 'ay_semester', 'remarks', 'date', 'student_id', 'document_check',
-      'scan_quality', 'ratings'], 'known_* are optional');
+    assert.deepStrictEqual(sch.required, ['instructor', 'subject', 'ay_semester', 'remarks', 'date', 'student_id', 'stamp_numbers',
+      'stamp_numbers_page', 'stamp_reads_tiles', 'document_check', 'scan_quality', 'corrected_rows', 'ratings'], 'known_subject is optional; stamp_numbers and corrected_rows are required');
+    assert.deepStrictEqual(sch.properties.stamp_numbers, { type: 'ARRAY', items: { type: 'STRING' } });
     for (const kn of [{ error: 'timeout' }, {}, undefined]) {
       const t = body('ai validation ocr and omr', kn).contents[0].parts[0].text;
-      assert.ok(t.includes('6. student_id: digits only.\n\n--- BUBBLE GRID ---') && !t.includes('known_instructor'));
+      assert.ok(t.includes('6. student_id: digits only.\n\n--- STAMP ---\nstamp_numbers: ') && !t.includes('known_subject'));
     }
   }
   // website: subject list only (privacy -- no instructor names sent to Gemini), optional
@@ -1259,11 +1595,12 @@ test('Main Gemini prompts: known instructors/subjects from Known Names, optional
     assert.strictEqual(sch.properties.known_instructor, undefined);
     assert.deepStrictEqual(sch.properties.known_subject, { type: 'STRING' });
     assert.deepStrictEqual(sch.properties.instructor_confidence, { type: 'STRING', enum: ['high', 'medium', 'low'] });
-    assert.deepStrictEqual(sch.required, ['instructor', 'subject', 'ay_semester', 'remarks', 'date', 'student_id', 'document_check',
-      'scan_quality', 'ratings'], 'known_subject / confidence fields are optional');
+    assert.deepStrictEqual(sch.required, ['instructor', 'subject', 'ay_semester', 'remarks', 'date', 'student_id', 'stamp_numbers',
+      'stamp_numbers_page', 'stamp_reads_tiles', 'document_check', 'scan_quality', 'corrected_rows', 'ratings'], 'known_subject / confidence fields are optional; stamp_numbers and corrected_rows are required');
+    assert.deepStrictEqual(sch.properties.stamp_numbers, { type: 'ARRAY', items: { type: 'STRING' } });
     for (const kn of [{ error: 'timeout' }, {}, undefined]) {
       const t = body('Website AI Validation', kn).contents[0].parts[0].text;
-      assert.ok(t.includes('6. student_id: digits only.\n\n--- BUBBLE GRID ---') && !t.includes('known_subject'));
+      assert.ok(t.includes('6. student_id: digits only.\n\n--- STAMP ---\nstamp_numbers: ') && !t.includes('known_subject'));
     }
     // header image present -> third part + hint text
     const b2 = body('Website AI Validation', known, { header_image_base64: 'SEVBREVS' });
@@ -1434,7 +1771,8 @@ test('Not Saved Response: contract', async () => {
 
 // ---------------------------------------------------------------- shared phone flagged path
 const FLAGGED_COLUMNS = ['task_id', 'user_id', 'term_id', 'table_found', 'grid_source', 'partial_data', 'status',
-  'review_reasons', 'omr_comparison', 'validation_status', 'scan_image_id', 'batch_id'];
+  'review_reasons', 'omr_comparison', 'validation_status', 'scan_image_id', 'batch_id',
+  'stamp_no', 'stamp_source'];   // migration 015
 test('build flagged record1: website record -> only real failed_scan_queue columns, batch name/code', async () => {
   const d = await decide(identity(), REC_DISAGREE());
   const wrec = (await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX }))[0].json;
@@ -1525,6 +1863,169 @@ test('Respond to Webhook: website -> contract (flagged / internal_error_not_save
   assert.deepStrictEqual(mfail.identity_check, mr.identity_check);
 });
 
+// ---------------------------------------------------------------- min-answered rule (teacher, 2026-10-08)
+// fewer than 5 of the 20 items answered -> the form is discarded (stored in the queue as 'discarded')
+const geminiBlank = (qs) => Object.fromEntries(qs.map((q) => [q, 'blank']));
+// Python reads rows 0..n-1 blank and Gemini agrees: 20 - n answered rows
+const answeredOnly = (n, rec) => rec(python({ override: blankRows(20 - n) }), geminiWith(geminiBlank(QS.slice(0, 20 - n))));
+const DISCARD_COLUMNS = [...FLAGGED_COLUMNS, 'review_action', 'review_correction'];
+function fcmParams() {
+  const qr = wf.nodes.find((x) => x.name === 'Get staff FCM for flagged scan').parameters.options.queryReplacement;
+  const m = /^=\{\{([\s\S]*)\}\}$/.exec(qr.trim());
+  if (!m) throw new Error('FCM queryReplacement is not an expression');
+  return (record) => new Function('$', `return (${m[1]});`)(() => ({ first: () => ({ json: record }) }));
+}
+test('Min answered: 4 answered + 16 blank on a reliable scan -> auto_discard, too_few_answers_4_of_20 (no too_many_blanks)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await answeredOnly(4, rec);
+    assert.strictEqual(Object.values(r.ratings).filter((v) => v !== null).length, 4, which);
+    assert.deepStrictEqual(r.review_reasons, ['too_few_answers_4_of_20'], which);
+    assert.strictEqual(r.needs_review, true, which);
+    assert.strictEqual(r.auto_discard, true, which);
+    assert.strictEqual(r.answered_count, 4, which);
+    assert.strictEqual(r.omr_agreement.answered_count, 4, which);
+    assert.match(r.review_note, /^Only 4 of the 20 items were answered \(at least 5 are needed\), so this form was discarded automatically and is not counted\./, which);
+    assert.match(r.summary, /^4\/20 answered, agreement 100% — discarded: too_few_answers_4_of_20$/, which);
+  }
+});
+test('Min answered: exactly 5 answered -> counted as before (too_many_blanks_15_of_20 review, not discarded)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await answeredOnly(5, rec);
+    assert.deepStrictEqual(r.review_reasons, ['too_many_blanks_15_of_20'], which);
+    assert.strictEqual(r.auto_discard, false, which);
+    assert.strictEqual(r.answered_count, 5, which);
+    assert.ok(!/discarded/.test(r.review_note || ''), which);
+    // 10 answered: a clean page, nothing changes
+    const ten = await answeredOnly(10, rec);
+    assert.deepStrictEqual(ten.review_reasons, [], which);
+    assert.strictEqual(ten.auto_discard, false, which);
+  }
+});
+test('Min answered: Gemini-filled rows count (union of both readers); without them the form is discarded', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    // Python reads only p9, p10; Gemini also reads p6..p8 (gemini_fill) -> 5 answered
+    const filled = await rec(python({ override: blankRows(18) }), geminiWith(geminiBlank(QS.slice(0, 15))));
+    assert.strictEqual(filled.omr_agreement.filled_from_gemini, 3, which);
+    assert.strictEqual(filled.answered_count, 5, which);
+    assert.strictEqual(filled.auto_discard, false, which);
+    assert.ok(!filled.review_reasons.some((x) => x.startsWith('too_few_answers_')), which);
+    // Gemini reads those rows blank too -> 2 answered -> discarded
+    const two = await rec(python({ override: blankRows(18) }), geminiWith(geminiBlank(QS.slice(0, 18))));
+    assert.strictEqual(two.answered_count, 2, which);
+    assert.strictEqual(two.auto_discard, true, which);
+    assert.deepStrictEqual(two.review_reasons, ['too_few_answers_2_of_20'], which);
+    // a disagreement on an answered row changes the rating, never the count
+    const differ = await rec(python({ override: blankRows(16) }), geminiWith({ ...geminiBlank(QS.slice(0, 16)), p7: 'O', p8: 'US' }));
+    assert.strictEqual(differ.answered_count, 4, which);
+    assert.strictEqual(differ.auto_discard, true, which);
+  }
+});
+test('Min answered: valid checks + x/dot/shade/circle marks below 5 -> discarded (invalid marks are not answers, no extra flag)', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const marks = ['x', 'dot', 'shade', 'circle'];
+    const invalid = Object.fromEntries(Array.from({ length: 17 }, (_, i) => [i, marks[i % 4]]));
+    const r = await rec(python({ invalid }), geminiResp());   // Gemini reads every mark as a letter
+    assert.strictEqual(r.answered_count, 3, which);
+    assert.strictEqual(r.omr_agreement.invalid_mark_rows, 17, which);
+    assert.strictEqual(r.auto_discard, true, which);
+    assert.deepStrictEqual(r.review_reasons, ['too_few_answers_3_of_20'], which);
+  }
+});
+test('Min answered: an unreliable scan with < 5 answers goes to review (too_few_answers, auto_discard false), never discarded', async () => {
+  const empty = () => python({ override: blankRows(20) });
+  const gEmpty = (fields = {}) => geminiWith(geminiBlank(QS), fields);
+  const notJson = { candidates: [{ content: { parts: [{ text: 'no json here' }] } }] };
+  const cases = [
+    ['OMR failed', { error: 'OMR down' }, gEmpty(), 'omr_unavailable'],
+    ['Gemini unusable', empty(), notJson, 'gemini_unavailable'],
+    ['grid not found', python({ table: false, override: blankRows(20) }), gEmpty(), 'grid_not_detected'],
+    ['fallback grid', python({ grid: 'fallback', override: blankRows(20) }), gEmpty(), null],
+    ['layout mismatch', pyLayout(OTHER_LAYOUT, { override: blankRows(20) }), gEmpty(), 'layout_mismatch'],
+    ['poor scan quality', empty(), gEmpty({ scan_quality: { poor_quality: true, issues: ['low_light'], reason: 'Dark' } }), 'poor_scan_quality'],
+    ['not a SAST form', empty(), gEmpty({ document_check: { is_sast_form: false, reason: 'A receipt' } }), 'not_a_sast_form'],
+  ];
+  for (const [which, rec] of RECONCILERS) {
+    for (const [label, py, g, reason] of cases) {
+      const r = await rec(py, g);
+      const tag = `${which}: ${label}`;
+      assert.strictEqual(r.auto_discard, false, tag);
+      assert.strictEqual(r.needs_review, true, tag);
+      assert.ok(r.review_reasons.includes('too_few_answers_0_of_20'), `${tag}: ${r.review_reasons}`);
+      if (reason) assert.ok(r.review_reasons.some((x) => x.startsWith(reason)), `${tag}: ${r.review_reasons}`);
+      assert.match(r.review_note, /^Only 0 of the 20 items have an answer \(at least 5 are needed to count a form\), but the scan could not be fully checked\./, tag);
+      assert.match(r.summary, / — flagged: /, tag);
+    }
+  }
+});
+test('Min answered (website): Decide flags it, Flagged Record passes auto_discard, queue row stored discarded, answer says so, no push', async () => {
+  const rec = await answeredOnly(4, (py, g) => reconcile(py, g));
+  const d = await decide(identity(), rec);
+  assert.strictEqual(d.decision, 'flagged');
+  assert.deepStrictEqual(d.review_reasons, ['too_few_answers_4_of_20'], 'never a spot_check on top');
+  const wrec = (await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': rec }))[0].json;
+  assert.strictEqual(wrec.auto_discard, true);
+  assert.strictEqual(wrec.answered_count, 4);
+  const q = (await run('build flagged record1', {}, { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: 'img1' }] }))[0].json;
+  assert.deepStrictEqual(Object.keys(q).filter((k) => !DISCARD_COLUMNS.includes(k)), []);
+  assert.strictEqual(q.status, 'discarded');
+  assert.strictEqual(q.review_action, 'rejected');
+  assert.strictEqual(q.validation_status, 'flagged');
+  assert.deepStrictEqual(q.review_reasons, ['too_few_answers_4_of_20']);
+  assert.strictEqual(q.scan_image_id, 'img1', 'the image is kept');
+  assert.strictEqual(q.batch_id, BATCH);
+  const c = q.review_correction;
+  assert.strictEqual(c.action, 'rejected');
+  assert.strictEqual(c.auto, true);
+  assert.strictEqual(c.reviewed_by, null);
+  assert.strictEqual(c.reviewed_by_name, 'Automatic rule');
+  assert.strictEqual(c.note, 'Fewer than 5 of the 20 items were answered (only 4), so this form was discarded automatically and is not counted.');
+  assert.ok(!Number.isNaN(Date.parse(c.at)));
+  // the website answer: still the 'flagged' contract (the backend counts it), with a plain message
+  const evalBody = respondExpr();
+  const ok = assertContract([{ json: JSON.parse(evalBody({}, { 'Website Flagged Record': wrec })) }], 'flagged');
+  assert.deepStrictEqual(ok.review_reasons, ['too_few_answers_4_of_20']);
+  assert.strictEqual(ok.message, 'Discarded automatically: fewer than 5 of the 20 items were answered (only 4), so this form is not counted.');
+  const failed = JSON.parse(evalBody({ error: 'HTTP 500' }, { 'Website Flagged Record': wrec }));
+  assert.ok(failed.review_reasons.includes('internal_error_not_saved'));
+  assert.match(failed.message, /^NOT SAVED/);
+  // no staff push for a discarded form; a pending one still notifies its staff member
+  const fcm = fcmParams();
+  assert.deepStrictEqual(fcm(q), [null]);
+  const pending = (await run('build flagged record1', {}, { 'Website Flagged Record': (await run('Website Flagged Record',
+    await decide(identity(), REC_DISAGREE()), { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': REC }))[0].json,
+  'Save scan error image': [{ id: 'img1' }] }))[0].json;
+  assert.strictEqual(pending.status, 'pending');
+  assert.ok(!('review_correction' in pending) && !('review_action' in pending));
+  assert.deepStrictEqual(fcm(pending), [STAFF]);
+});
+test('Min answered (website): an internal error is never discarded (review), even when the reconciler said auto_discard', async () => {
+  const rec = await answeredOnly(2, (py, g) => reconcile(py, g));
+  assert.strictEqual(rec.auto_discard, true);
+  const wrec = (await run('Website Flagged Record', { error: 'Decide crashed' },
+    { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': rec }))[0].json;
+  assert.strictEqual(wrec.auto_discard, false);
+  assert.ok(wrec.review_reasons.includes('internal_error_decide'));
+  const q = (await run('build flagged record1', {}, { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(q.status, 'pending');
+});
+test('Min answered (phone): reconcile -> build flagged record1 stores it discarded; Gemini-failure records stay pending', async () => {
+  const r = await answeredOnly(3, (py, g) => phoneReconcile(py, g));
+  assert.strictEqual(r.validation_status, 'flagged');
+  assert.strictEqual(r.auto_discard, true);
+  const q = (await run('build flagged record1', {}, { 'reconcile ocr and omr1': r, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.deepStrictEqual(Object.keys(q).filter((k) => !DISCARD_COLUMNS.includes(k)), []);
+  assert.strictEqual(q.status, 'discarded');
+  assert.strictEqual(q.review_action, 'rejected');
+  assert.strictEqual(q.review_correction.note, 'Fewer than 5 of the 20 items were answered (only 3), so this form was discarded automatically and is not counted.');
+  assert.strictEqual(q.user_id, STAFF);
+  assert.deepStrictEqual(fcmParams()(q), [null]);
+  // phone answer text unchanged (Flutter only checks the HTTP status)
+  assert.strictEqual(respondExpr()({ anything: 1 }, {}), '{{ JSON.stringify($json) }}');
+  const gf = (await run('build flagged record1', {}, { 'Handle Gemini failure': { task_id: 'p9', review_reasons: ['ai_validation_failed'] },
+    'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(gf.status, 'pending');
+});
+
 // ---------------------------------------------------------------- clean path -> shared main flow
 test('Website Map to Target Format: same shape as Map to Target Format3', async () => {
   const d = await decide(identity());
@@ -1537,7 +2038,8 @@ test('Website Map to Target Format: same shape as Map to Target Format3', async 
   for (const k of need) assert.ok(Object.prototype.hasOwnProperty.call(r, k), `missing ${k}`);
   // Map to Target Format3 produces exactly these keys too (scan_image, review_reasons, omr_comparisons, review_note extra)
   const phoneKeys = ['instructor_ID', 'true_subject_id', 'current_term_id', 'scan_image', 'review_reasons', 'omr_comparisons',
-    'review_note', 'task_id', 'Student ID', 'Instructor/Professor', 'Subject Taught', 'AY/Semester', 'Remarks & Suggestions', 'Date'];
+    'review_note', 'task_id', 'Student ID', 'Instructor/Professor', 'Subject Taught', 'AY/Semester', 'Remarks & Suggestions', 'Date',
+    'stamp_no', 'stamp_source'];   // stamp rule: a clean page always has its one stamp
   for (let i = 1; i <= 10; i++) phoneKeys.push(`M${i}`, `P${i}`);
   assert.deepStrictEqual(Object.keys(r).sort(), phoneKeys.sort());
   assert.strictEqual(r.instructor_ID, INSTR);
@@ -1546,6 +2048,8 @@ test('Website Map to Target Format: same shape as Map to Target Format3', async 
   assert.strictEqual(r.task_id, TASK);
   assert.strictEqual(r['Instructor/Professor'], 'Juan Dela Cruz');
   assert.strictEqual(r.M1, 5);
+  assert.strictEqual(r.stamp_no, '0100005');
+  assert.strictEqual(r.stamp_source, 'gemini+python');
 });
 test('Code in JavaScript: website staff id + task_id; blank student -> NULL and never deduplicated', async () => {
   const d = await decide(identity());
@@ -1601,7 +2105,8 @@ test('Website Raw Upsert replacement: blank student/remark -> NULL, ratings JSON
   const $ = (ref) => ({ first: () => ({ json: { 'Website Decide': d }[ref] }) });
   // eslint-disable-next-line no-new-func
   const v = new Function('$', '$json', `return (${m[1]});`)($, { saved: null });
-  assert.strictEqual(v.length, 10);
+  assert.strictEqual(v.length, 12);
+  assert.deepStrictEqual(v.slice(10), ['0100005', 'gemini+python'], 'stamp_no + stamp_source (save_website_raw_row)');
   assert.deepStrictEqual(v.slice(0, 3), [INSTR, SUBJ, TERM]);
   assert.strictEqual(v[3], null);
   assert.strictEqual(v[4], 'Juan Dela Cruz');
@@ -1619,6 +2124,12 @@ test('Website Raw Upsert replacement: blank student/remark -> NULL, ratings JSON
   assert.strictEqual(row.sao_staff_id, v[7]);
   assert.strictEqual(row.task_id, v[8]);
   for (const k of Object.keys(d.ratings)) assert.strictEqual(row[k], JSON.parse(v[9])[k], k);
+  assert.strictEqual(row.stamp_no, v[10]);
+  assert.strictEqual(row.stamp_source, v[11]);
+  // no stamp on the page -> NULL stamp, NULL source
+  const dn = await decide(identity(), { ...REC, stamp_no: null, stamp_status: 'missing', review_reasons: ['stamp_missing'] });
+  const vn = new Function('$', '$json', `return (${m[1]});`)((ref) => ({ first: () => ({ json: { 'Website Decide': dn }[ref] }) }), {});
+  assert.deepStrictEqual(vn.slice(10), [null, null]);
 });
 
 // ---------------------------------------------------------------- main-flow aggregate fix
@@ -1659,7 +2170,9 @@ test('Aggregates: Raw Upsert Done -> Code in JavaScript8 -> recompute_sast -> If
   const n = wf.nodes.find((x) => x.name === 'update to overall total2');
   assert.strictEqual(n.parameters.query.trim(), 'SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);');
   assert.strictEqual(n.parameters.options.queryReplacement, '={{ [$json.instructor_id, $json.term_id] }}');
-  assert.strictEqual(n.onError, 'continueRegularOutput');
+  // error output (2026-10-18): a failed recompute is recorded on the Google Sheet import job (migration 018)
+  assert.strictEqual(n.onError, 'continueErrorOutput');
+  assert.deepStrictEqual(outs('update to overall total2', 1), ['Describe Import Failure']);
   // unique instructor+term pairs (one recompute and at most one alert each)
   const rows = [
     { instructor_ID: INSTR, current_term_id: TERM }, { instructor_ID: INSTR, current_term_id: TERM },
@@ -1749,15 +2262,16 @@ test('Corrections: 0 / blank / invalid ratings from Flutter or the website -> nu
 
 // ---------------------------------------------------------------- corrections -> import_errors keep the scan image
 // Evaluates an If node (v2, combinator and) the way n8n does for the operators used here.
-function ifTrue(name, $json) {
+function ifTrue(name, $json, $ = () => { throw new Error('$() is not mocked in this test'); }) {
   const c = wf.nodes.find((x) => x.name === name).parameters.conditions;
   assert.strictEqual(c.combinator, 'and');
   return c.conditions.every((cond) => {
     const m = /^=\{\{([\s\S]*)\}\}$/.exec(cond.leftValue.trim());
     // eslint-disable-next-line no-new-func
-    const v = new Function('$json', `return (${m[1]});`)($json);
+    const v = new Function('$json', '$', `return (${m[1]});`)($json, $);
     const op = `${cond.operator.type}:${cond.operator.operation}`;
     if (op === 'string:exists') return v !== undefined && v !== null;
+    if (op === 'string:notEmpty') return v !== undefined && v !== null && String(v) !== '';
     if (op === 'boolean:true') return v === true;
     if (op === 'boolean:false') return v === false;
     throw new Error(`${name}: operator ${op} not mocked`);
@@ -1798,7 +2312,9 @@ test('Correction without any stored image -> no EMPTY scan_error_images row, sca
 test('Correction chain: image lookup runs before Map target (webhook -> lookup -> get instructor id7)', async () => {
   const out = (n) => ((wf.connections[n] || {}).main || [[]])[0].map((c) => c.node);
   assert.deepStrictEqual(out('sast-manual-correction1'), ['get existing scan image id']);
-  assert.deepStrictEqual(out('get existing scan image id'), ['get instructor id7']);
+  assert.deepStrictEqual(out('get existing scan image id'), ['Correction Candidates']);
+  assert.deepStrictEqual(out('Correction Candidates'), ['Correction Name Match']);
+  assert.deepStrictEqual(out('Correction Name Match'), ['get instructor id7']);
   assert.deepStrictEqual(out('import-error-correction1'), ['get existing scan image id1']);
   assert.deepStrictEqual(out('get existing scan image id1'), ['get instructor id9']);
   for (const n of ['get instructor id7', 'get instructor id9']) {
@@ -1813,20 +2329,34 @@ function exprValue(nodeName, $json, nodes) {
   // eslint-disable-next-line no-new-func
   return new Function('$', '$json', `return (${m[1]});`)($, $json);
 }
-test('Correction lookups: get instructor id7 / get subject id6 get array parameters with the body ids (Flutter payload unchanged)', async () => {
+// 'Correction Name Match' run on a webhook body (cands: the 'Correction Candidates' row; null = node not run)
+async function nameMatch(body, cands = CORR_CANDS) {
+  const nodes = { 'sast-manual-correction1': { body } };
+  if (cands !== null) nodes['Correction Candidates'] = cands;
+  return (await run('Correction Name Match', { scan_image_id: null }, nodes))[0].json;
+}
+test('Correction lookups: get instructor id7 / get subject id6 get array parameters from Correction Name Match (body when it failed)', async () => {
   const flutter = { body: { instructor: 'Juan Dela Cruz', instructor_id: null, subject: 'IT 101', subject_id: null } };
-  assert.deepStrictEqual(exprValue('get instructor id7', { scan_image_id: null }, { 'sast-manual-correction1': flutter }),
-    ['Juan Dela Cruz', '']);
-  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: INSTR }, { 'sast-manual-correction1': flutter }),
-    [INSTR, 'IT 101', '']);
+  const nodes = (body, cm) => ({ 'sast-manual-correction1': body, 'Correction Name Match': cm });
+  // the match node failed (onError continue: an error item): the webhook body exactly as before
+  assert.deepStrictEqual(exprValue('get instructor id7', { error: 'x' }, nodes(flutter, { error: 'x' })), ['Juan Dela Cruz', '']);
+  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: INSTR }, nodes(flutter, { error: 'x' })), [INSTR, 'IT 101', '']);
   // Flutter [null] arrays and a missing instructor row never shift the parameters
   const odd = { body: { instructor: [null], subject: 'Math, Science', subject_id: [null] } };
-  assert.deepStrictEqual(exprValue('get instructor id7', {}, { 'sast-manual-correction1': odd }), ['', '']);
-  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: null }, { 'sast-manual-correction1': odd }), [null, 'Math, Science', '']);
-  assert.deepStrictEqual(exprValue('get subject id6', { error: 'x' }, { 'sast-manual-correction1': odd }), [null, 'Math, Science', '']);
+  const oddMatch = await nameMatch(odd.body);
+  assert.deepStrictEqual(exprValue('get instructor id7', {}, nodes(odd, oddMatch)), ['', '']);
+  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: null }, nodes(odd, oddMatch)), [null, 'Math, Science', '']);
+  assert.deepStrictEqual(exprValue('get subject id6', { error: 'x' }, nodes(odd, oddMatch)), [null, 'Math, Science', '']);
   const web = { body: { instructor: 'Pedro Reyes', instructor_id: PEDRO, subject: 'IT 102', subject_id: IT102 } };
-  assert.deepStrictEqual(exprValue('get instructor id7', {}, { 'sast-manual-correction1': web }), ['Pedro Reyes', PEDRO]);
-  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: PEDRO }, { 'sast-manual-correction1': web }), [PEDRO, 'IT 102', IT102]);
+  const webMatch = await nameMatch(web.body);
+  assert.deepStrictEqual(exprValue('get instructor id7', {}, nodes(web, webMatch)), ['Pedro Reyes', PEDRO]);
+  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: PEDRO }, nodes(web, webMatch)), [PEDRO, 'IT 102', IT102]);
+  // older app: names only -> the local match supplies the ids
+  const old = { body: { instructor: 'Prof. Pedro Reyes', subject: 'IT 102 - Computer Programming 1' } };
+  const oldMatch = await nameMatch(old.body);
+  assert.deepStrictEqual(exprValue('get instructor id7', {}, nodes(old, oldMatch)), ['Prof. Pedro Reyes', PEDRO]);
+  assert.deepStrictEqual(exprValue('get subject id6', { instructor_id: PEDRO }, nodes(old, oldMatch)),
+    [PEDRO, 'IT 102 - Computer Programming 1', IT102]);
 });
 async function correctionMap(bodyExtra) {
   const hook = { body: { failed_scan_id: 'f1', task_id: 't1', instructor: 'Pedro Reyes', subject: 'IT 102', student_id: 'S',
@@ -1857,9 +2387,13 @@ test('Correction term: website_review approvals credited to body.term_id; Flutte
   ({ mapped } = await correctionMap({ correction_source: 'website_review', term_id: ` ${TERM.toUpperCase()} ` }));
   assert.strictEqual(mapped.current_term_id, TERM);
 });
-test('Correction response: Map target -> Mark Queue Validated1 -> Respond to Webhook5 -> After Correction Response -> If19', async () => {
+test('Correction response: Map target -> (ids found, stamp check) -> Mark Queue Validated1 -> Respond to Webhook5 -> After Correction Response -> If19', async () => {
   const out = (n, i = 0) => (((wf.connections[n] || {}).main || [])[i] || []).map((c) => c.node);
-  assert.deepStrictEqual(out('Map target'), ['Mark Queue Validated1'], 'Map target no longer feeds If19 directly');
+  assert.deepStrictEqual(out('Map target'), ['Correction Ids Found?'], 'Map target no longer feeds If19 directly');
+  assert.deepStrictEqual(out('Correction Ids Found?', 0), ['Correction Stamp Check']);
+  assert.deepStrictEqual(out('Correction Ids Found?', 1), ['Correction Not Found']);
+  assert.deepStrictEqual(out('Correction Stamp Check'), ['Correction Stamp Duplicate?']);
+  assert.deepStrictEqual(out('Correction Stamp Duplicate?', 1), ['Mark Queue Validated1']);
   assert.deepStrictEqual(out('Mark Queue Validated1'), ['Respond to Webhook5']);
   assert.deepStrictEqual(out('Respond to Webhook5'), ['After Correction Response']);
   assert.deepStrictEqual(out('After Correction Response'), ['If19']);
@@ -1869,6 +2403,151 @@ test('Correction response: Map target -> Mark Queue Validated1 -> Respond to Web
   const r5 = wf.nodes.find((x) => x.name === 'Respond to Webhook5');
   assert.strictEqual(r5.parameters.respondWith, 'json');
   assert.ok(Number(r5.typeVersion) >= 1.1, 'a Respond node that passes its item on');
+});
+
+// ---- corrections never validate an unresolved scan (2026-10-24): local name match + 422
+const JUAN2 = 'bbbbbbbb-2222-4222-8222-00000000000b';
+const CORR_CANDS = {
+  candidates_version: 1,
+  instructors: [
+    { id: INSTR, name: 'Juan Dela Cruz' }, { id: PEDRO, name: 'Pedro Reyes' }, { id: MARIA, name: 'Maria Santos' },
+    { id: ANA, name: 'Mario Santos' }, { id: NORA, name: 'Nora Villanueva' },
+  ],
+  subjects: [
+    { id: SUBJ, code: 'IT 101', name: 'Introduction to Computing' },
+    { id: IT102, code: 'IT 102', name: 'Computer Programming 1' },
+    { id: IT103, code: 'IT 103', name: 'Computer Programming 2' },
+    { id: GE104, code: 'GE 104', name: 'Mathematics in the Modern World' },
+  ],
+};
+test('Correction Name Match: body ids pass through; a clear text match gives the id; ambiguous gives no id and no name for the SQL guess', async () => {
+  // website review / current app: ids win (the SQL still checks them), text untouched
+  let m = await nameMatch({ instructor: 'Pedro Reyes', instructor_id: PEDRO.toUpperCase(), subject: 'IT 102', subject_id: IT102 });
+  assert.deepStrictEqual([m.instructor_id, m.instructor_name, m.subject_id, m.subject_text], [PEDRO, 'Pedro Reyes', IT102, 'IT 102']);
+  assert.strictEqual(m.instructor_match.match, 'id');
+  assert.strictEqual(m.subject_match.match, 'id');
+  // older app: OCR-ish text only
+  m = await nameMatch({ instructor: 'Mr. Pedro Reyess', subject: 'it-102' });
+  assert.strictEqual(m.instructor_id, PEDRO);
+  assert.strictEqual(m.instructor_match.match, 'found');
+  assert.strictEqual(m.subject_id, IT102);
+  // the old Flutter picker text "CODE — Name"
+  m = await nameMatch({ instructor: 'Juan Dela Cruz', subject: 'IT 101 — Introduction to Computing' });
+  assert.deepStrictEqual([m.instructor_id, m.subject_id], [INSTR, SUBJ]);
+  // title only, clearly one subject
+  m = await nameMatch({ instructor: 'Nora Villanueva', subject: 'Mathematics in the Modern World' });
+  assert.strictEqual(m.subject_id, GE104);
+  // "Mari Santos" fits Maria and Mario Santos equally: ambiguous -> no id, no name (the SQL must not pick one)
+  m = await nameMatch({ instructor: 'Mari Santos', subject: 'IT 102' });
+  assert.strictEqual(m.instructor_match.match, 'ambiguous');
+  assert.strictEqual(m.instructor_id, '');
+  assert.strictEqual(m.instructor_name, '');
+  assert.deepStrictEqual(m.instructor_match.candidates.map((c) => c.id).sort(), [ANA, MARIA].sort());
+  // two people with the same name: never guessed
+  m = await nameMatch({ instructor: 'Juan Dela Cruz', subject: 'IT 101' },
+    { ...CORR_CANDS, instructors: [...CORR_CANDS.instructors, { id: JUAN2, name: 'Juan Dela Cruz' }] });
+  assert.strictEqual(m.instructor_match.match, 'ambiguous');
+  assert.deepStrictEqual(m.instructor_match.candidates.map((c) => c.id).sort(), [INSTR, JUAN2].sort());
+  // "Computer Programming" fits IT 102 and IT 103 equally: ambiguous subject
+  m = await nameMatch({ instructor: 'Pedro Reyes', subject: 'Computer Programming' });
+  assert.strictEqual(m.subject_match.match, 'ambiguous');
+  assert.deepStrictEqual([m.subject_id, m.subject_text], ['', '']);
+  assert.deepStrictEqual(m.subject_match.candidates.map((c) => c.id).sort(), [IT102, IT103].sort());
+  // a code that is no subject never picks a subject by title; one letter off is only a candidate
+  m = await nameMatch({ instructor: 'Pedro Reyes', subject: 'IT 109 Computer Programming 1' });
+  assert.strictEqual(m.subject_match.match, 'none');
+  assert.strictEqual(m.subject_text, 'IT 109 Computer Programming 1', 'no match keeps the text for the old SQL lookup');
+  // nobody fits: none, text kept for the old strict SQL lookup, up to 5 candidates
+  m = await nameMatch({ instructor: 'Xyz Qwerty', subject: '' });
+  assert.deepStrictEqual([m.instructor_match.match, m.instructor_id, m.instructor_name], ['none', '', 'Xyz Qwerty']);
+  assert.ok(m.instructor_match.candidates.length <= 5);
+  assert.strictEqual(m.subject_match.match, 'missing');
+  // candidate lookup failed / not run: body values as before (old SQL behaviour)
+  for (const c of [null, { error: 'db down' }]) {
+    m = await nameMatch({ instructor: 'Pedro Reyes', subject: 'IT 102' }, c);
+    assert.deepStrictEqual([m.instructor_id, m.instructor_name, m.subject_id, m.subject_text], ['', 'Pedro Reyes', '', 'IT 102']);
+    assert.strictEqual(m.instructor_match.match, 'unavailable');
+  }
+  // Flutter [null] arrays / junk ids
+  m = await nameMatch({ instructor: [null], instructor_id: [null], subject: null, subject_id: 'not-a-uuid' });
+  assert.deepStrictEqual([m.instructor_id, m.instructor_name, m.subject_id, m.subject_text], ['', '', '', '']);
+});
+test('Correction Ids Found?: both ids set -> stamp check / Mark Queue Validated1; else 422 instructor_not_found | subject_not_found | instructor_and_subject_not_found, nothing saved', async () => {
+  assert.strictEqual(ifTrue('Correction Ids Found?', { instructor_ID: PEDRO, true_subject_id: IT102 }), true);
+  for (const j of [{ instructor_ID: null, true_subject_id: IT102 }, { instructor_ID: PEDRO, true_subject_id: null },
+    { instructor_ID: '', true_subject_id: '' }, {}]) {
+    assert.strictEqual(ifTrue('Correction Ids Found?', j), false, JSON.stringify(j));
+  }
+  const outs2 = (n, i = 0) => (((wf.connections[n] || {}).main || [])[i] || []).map((c) => c.node);
+  assert.deepStrictEqual(outs2('Correction Not Found'), ['Correction Not Found Response']);
+  assert.deepStrictEqual(outs2('Correction Not Found Response'), [], 'nothing after the 422 answer: not validated, no import error');
+  const resp = wf.nodes.find((x) => x.name === 'Correction Not Found Response');
+  assert.strictEqual(resp.parameters.options.responseCode, 422);
+  const bodyOf = (j) => JSON.parse(evalExpr(resp.parameters.responseBody, { $json: j }));
+  const hook = (b) => ({ body: { failed_scan_id: 'f1', task_id: 't1', ...b } });
+  async function notFound(b, mapped, cands = CORR_CANDS) {
+    const match = await nameMatch(hook(b).body, cands);
+    const out = await run('Correction Not Found', mapped, { 'sast-manual-correction1': hook(b), 'Correction Name Match': match });
+    return bodyOf(out[0].json);
+  }
+  let r = await notFound({ instructor: 'Mari Santos', subject: 'IT 102' }, { instructor_ID: null, true_subject_id: IT102 });
+  assert.strictEqual(r.success, false);
+  assert.strictEqual(r.code, 'instructor_not_found');
+  assert.strictEqual(r.instructor_match, 'ambiguous');
+  assert.ok(/Several instructors fit "Mari Santos"/.test(r.message), r.message);
+  assert.deepStrictEqual(r.candidates.instructors.map((c) => c.id).sort(), [ANA, MARIA].sort());
+  assert.ok(!('subjects' in r.candidates));
+  assert.ok(r.candidates.instructors.every((c) => Object.keys(c).sort().join() === 'id,name'));
+  r = await notFound({ instructor: 'Pedro Reyes', subject: 'Computer Programming' }, { instructor_ID: PEDRO, true_subject_id: null });
+  assert.strictEqual(r.code, 'subject_not_found');
+  assert.deepStrictEqual(r.candidates.subjects.map((c) => c.code).sort(), ['IT 102', 'IT 103']);
+  r = await notFound({ instructor: 'Xyz Qwerty', subject: 'ZZ 999' }, { instructor_ID: null, true_subject_id: null });
+  assert.strictEqual(r.code, 'instructor_and_subject_not_found');
+  assert.ok(/was not found/.test(r.message) && /Pick the instructor and the subject/.test(r.message), r.message);
+  assert.ok(r.candidates.instructors.length <= 5 && r.candidates.subjects.length <= 5);
+  // the match node failed: still a clear 422 with no candidates
+  const out = await run('Correction Not Found', { instructor_ID: null, true_subject_id: SUBJ },
+    { 'sast-manual-correction1': hook({ instructor: 'Someone' }), 'Correction Name Match': { error: 'x' } });
+  r = bodyOf(out[0].json);
+  assert.strictEqual(r.code, 'instructor_not_found');
+  assert.deepStrictEqual(r.candidates, { instructors: [] });
+});
+test('Correction chain (simulated): a text-only correction from an older app resolves locally and reaches Mark Queue Validated1', async () => {
+  const b = { failed_scan_id: 'f1', task_id: 't1', instructor: 'Prof Pedro Reyes', subject: 'IT102', student_id: 'S', m1: 4 };
+  const match = await nameMatch(b);
+  // the SQL lookups return the row for the id they were given
+  const nodes = { 'sast-manual-correction1': { body: b }, 'get existing scan image id': { scan_image_id: null },
+    'Correction Name Match': match,
+    'get instructor id7': { instructor_id: match.instructor_id, first_name: 'Pedro', last_name: 'Reyes', match_score: 1 },
+    'get subject id6': { subject_id: match.subject_id, subject_name: 'Computer Programming 1', department_id: 1 } };
+  const built = (await run('build the record1', {}, nodes))[0].json;
+  const mapped = (await run('Map target', { ...built, current_term_id: TERM }, nodes))[0].json;
+  assert.strictEqual(mapped.instructor_ID, PEDRO);
+  assert.strictEqual(mapped.true_subject_id, IT102);
+  assert.strictEqual(ifTrue('Correction Ids Found?', mapped), true);
+  assert.strictEqual(ifTrue('If19', mapped), true, 'credited, never an import error');
+});
+test('Correction candidates: never reach a Gemini node (privacy)', () => {
+  const reach = (start) => {
+    const seen = new Set();
+    const stack = [start];
+    while (stack.length) {
+      const c = stack.pop();
+      if (seen.has(c) || c === 'If19') continue;
+      seen.add(c);
+      for (const o of Object.values(wf.connections[c] || {})) for (const l of o) for (const e of l || []) stack.push(e.node);
+    }
+    return seen;
+  };
+  const r = reach('Correction Candidates');
+  const ai = wf.nodes.filter((n) => r.has(n.name) && (/langchain|gemini/i.test(n.type)
+    || /generativelanguage/.test(JSON.stringify(n.parameters))));
+  assert.deepStrictEqual(ai.map((n) => n.name), []);
+  const q = wf.nodes.find((n) => n.name === 'Correction Candidates');
+  assert.deepStrictEqual(q.parameters.options, {}, 'no query parameters');
+  assert.strictEqual(q.onError, 'continueRegularOutput');
+  assert.strictEqual(q.alwaysOutputData, true);
+  assert.strictEqual(wf.nodes.find((n) => n.name === 'Correction Name Match').onError, 'continueRegularOutput');
 });
 test('Phone scan with image, instructor missing -> image saved once, import error points at it', async () => {
   const row = { task_id: 'phone-task-2', existing_scan_image_id: undefined, scan_image: 'iVBORw0KGgo=',
@@ -2132,7 +2811,7 @@ test('Typed text (sheet import, corrections, import errors): deterministic mask,
   assert.strictEqual(raw.Remarks_and_Suggestions, 'Gago ka pero ****');
   const sheet = await run('Map to Target Format', {}, {
     'Google LINK from phone1': { body: { term_id: TERM, semester: '1st', academic_year: '2026' } },
-    'Get row(s) in sheet1': { __items: [{ 'Student ID': 'S1', 'Remarks & Suggestions': 'Buang ka, bilat', M1: 5 }, { Remarks: 12345 }] },
+    'Normalize Sheet Rows': { __items: [{ 'Student ID': 'S1', 'Remarks & Suggestions': 'Buang ka, bilat', M1: 5 }, { Remarks: 12345 }] },
     'get instructor id5': { __items: [{ instructor_id: INSTR }, {}] }, 'get subject id7': { __items: [{ subject_id: SUBJ }, {}] },
     'GET TERM BY ID1': { __items: [{ current_term_id: TERM }, {}] } });
   assert.strictEqual(sheet[0].json['Remarks & Suggestions'], 'Buang ka, *****');
@@ -2160,7 +2839,7 @@ test('Remark AI: profane or masked wordcloud keywords dropped, remark and AI tex
     { 'Prepare Unified AI Input1': { instructor_ID: INSTR, term_id: TERM, feedback } })).map((i) => i.json);
   assert.deepStrictEqual(out.filter((r) => r.record_type === 'wordcloud').map((r) => r.word), ['Teaching clarity', 'Kupal attitude']);
   assert.deepStrictEqual(out.filter((r) => r.record_type === 'student_remark').map((r) => r.remark), ['Maayo si sir', '******']);
-  assert.strictEqual(out.find((r) => r.record_type === 'evaluation').improvement_insights, 'less ***** talk');
+  assert.strictEqual(out.find((r) => r.record_type === 'evaluation').improvement_insights, 'Less ***** talk.');
   const ind = { overall_tone: 'Critical', keywords: [{ word: 'fuck' }, { word: '*****' }], ai_suggestion: 'no iyot jokes',
     student_interpretation: 's', positive_themes: ['ok'], improvement_insights: ['tite'] };
   const out2 = (await run('Add Parse Code node1', { text: JSON.stringify(ind) },
@@ -2170,7 +2849,7 @@ test('Remark AI: profane or masked wordcloud keywords dropped, remark and AI tex
   assert.strictEqual(out2.find((r) => r.record_type === 'student_remark').remark, '***** si sir');
   const ev = out2.find((r) => r.record_type === 'evaluation');
   assert.strictEqual(ev.ai_suggestion, 'no **** jokes');
-  assert.deepStrictEqual(ev.improvement_insights, ['****']);
+  assert.strictEqual(ev.improvement_insights, '****.');
   for (const [name, rule] of [['Unified AI Analysis1', 'Prefer concise English theme names.\n\nNever use a vulgar or sexual word'],
     ['Individual AI Analysis1', 'Remove filler words.\n\nNever use a vulgar or sexual word']]) {
     assert.ok(wf.nodes.find((x) => x.name === name).parameters.text.includes(rule), name);
@@ -2193,7 +2872,7 @@ test('Website Gemini prompt only: optional confidence fields + header crop image
   assert.ok(web.includes('"known_subject": { "type": "STRING" }'));
   assert.ok(!web.includes('known_instructor'), 'no instructor list/pick sent to Gemini (privacy)');
   assert.ok(!web.includes('Known instructors'), 'no instructor name list in the prompt text');
-  assert.ok(phone.includes('known_instructor') && phone.includes('Known instructors'), 'phone branch unchanged');
+  assert.ok(!phone.includes('known_instructor') && !phone.includes('Known instructors'), 'phone: no instructor list either');
   assert.ok(web.includes('header_image_base64'), 'optional third image part for the header crop');
   assert.ok(web.includes('HEADER CLOSE-UP'), 'prompt mentions the header close-up when sent');
   assert.ok(!phone.includes('header_image_base64') && !phone.includes('HEADER CLOSE-UP'), 'phone unaffected');
@@ -2203,7 +2882,7 @@ test('Website Gemini prompt only: optional confidence fields + header crop image
     assert.ok(!req.includes(f), f);
   }
 });
-test('Website: no instructor name or list is sent to Gemini (Known Names SQL, AI Validation body, reconciler, Verify Remark Words)', async () => {
+test('No instructor name or list is sent to Gemini (Known Names SQL, both OCR bodies, reconciler, Verify Remark Words, remark AI)', async () => {
   const NAMES = ['Joseph King', RODZ, 'Evangeline Caruana'];
   // the lookup itself: subjects only, no parameters (it used to pass the batch instructor id)
   const kn = wf.nodes.find((x) => x.name === 'Website Known Names');
@@ -2211,8 +2890,38 @@ test('Website: no instructor name or list is sent to Gemini (Known Names SQL, AI
   assert.ok(!/user_info|instructor/i.test(sql), 'Website Known Names does not read or return instructors');
   assert.ok(/\bAS\s+subject_list\b/.test(sql) && /\bAS\s+subjects\b/.test(sql), 'subject list kept');
   assert.strictEqual(kn.parameters.options.queryReplacement, undefined, 'no query parameters');
-  const phoneKn = wf.nodes.find((x) => x.name === 'Phone Known Names').parameters.query;
-  assert.ok(/AS instructor_list/.test(phoneKn), 'phone lookup unchanged');
+  // phone: the same subjects-only lookup, no parameters
+  const phoneKnNode = wf.nodes.find((x) => x.name === 'Phone Known Names');
+  const phoneKn = phoneKnNode.parameters.query.replace(/--[^\n]*/g, '');
+  assert.ok(!/user_info|instructor/i.test(phoneKn), 'Phone Known Names does not read or return instructors');
+  assert.ok(/\bAS\s+subject_list\b/.test(phoneKn), 'phone subject list kept');
+  assert.strictEqual((phoneKnNode.parameters.options || {}).queryReplacement, undefined, 'no query parameters');
+  // phone Gemini body: even if a lookup returned instructor names, none reaches Gemini
+  const phoneSrc = wf.nodes.find((x) => x.name === 'ai validation ocr and omr').parameters.jsonBody.replace(/^=/, '');
+  for (const known of [
+    { subject_list: 'PC121 = Discreet Math' },
+    { instructor_list: NAMES.join('; '), instructor_names: NAMES, subject_list: 'PC121 = Discreet Math' },
+    { error: 'timeout' }]) {
+    const nodes = { 'SAST image from phone': { body: { image: 'QUJD' } }, 'Phone Known Names': known,
+      'Phone Instructor Candidates': { candidates_version: 1, instructor_names: NAMES } };
+    const $ = (ref) => ({ first: () => ({ json: nodes[ref] }) });
+    // eslint-disable-next-line no-new-func
+    const text = phoneSrc.replace(/\{\{([\s\S]*?)\}\}/g, (m, js) => String(new Function('$', `return (${js});`)($)));
+    const body = JSON.parse(text);
+    for (const name of NAMES) assert.ok(!text.includes(name), `${name} not in the phone Gemini body`);
+    assert.ok(!/known_instructor|Known instructors|instructor_list|instructor_names/.test(text));
+    assert.strictEqual(body.generationConfig.responseSchema.properties.known_instructor, undefined);
+  }
+  // the phone candidates lookup runs AFTER the Gemini call and no Gemini node reads it
+  assert.deepStrictEqual(wf.connections['Is not a SAST form?'].main[1].map((c) => c.node), ['Phone Instructor Candidates']);
+  assert.deepStrictEqual(wf.connections['Phone Instructor Candidates'].main[0].map((c) => c.node), ['Phone Remark Check']);
+  for (const n of wf.nodes) {
+    const p = JSON.stringify(n.parameters);
+    if (/generativelanguage\.googleapis\.com/.test(p) || n.type.startsWith('@n8n/n8n-nodes-langchain.')) {
+      assert.ok(!/Phone Instructor Candidates|Website Form Match|instructor_names|instructor_list|first_name|last_name/.test(p),
+        `${n.name}: no instructor names in a Gemini request`);
+    }
+  }
   // the built request body: even if the lookup returned instructor names, none reaches Gemini
   const src = wf.nodes.find((x) => x.name === 'Website AI Validation').parameters.jsonBody.replace(/^=/, '');
   for (const known of [
@@ -2259,6 +2968,1223 @@ test('If28: alerts only for a real combined_score_mean below 3 (NULL/empty/undef
     assert.strictEqual(f({ combined_score_mean: v }), want, `combined_score_mean=${JSON.stringify(v)}`);
   }
   assert.strictEqual(f({}), false, 'missing field');
+});
+
+// ---------------------------------------------------------------- stamp rule (2026-10-16, migration 015)
+// Gemini's stamp_numbers -> one readable stamp (ok) or a review reason; a stamp already stored for
+// the term auto-rejects the page (duplicate_stamp), above reused_image and the min-answered discard.
+const DUP = { raw_id: 77, task_id: 'web:aaaaaaaa-0000-4000-8000-000000000001:0123456789abcdef',
+  batch_id: 'aaaaaaaa-0000-4000-8000-000000000001', submitted_date: '2026-10-01', instructor_id: INSTR,
+  subject_id: SUBJ, term_id: TERM, stamp_no: '0100005' };
+const STAMP_DUP_MESSAGE = 'Discarded automatically: this form was already scanned (stamp 0100005), so it is not counted.';
+// Gemini's final answer = stamps; its page/tile reads and the Python reader agree with the readable
+// numbers (cands) - this checks the parsing of Gemini's answer; the two-reader rule is tested below
+const stampRec = async (rec, stamps, cands = []) => rec(python({ stamp: pyStamp(cands) }), geminiResp({
+  stamp_numbers: stamps, stamp_numbers_page: cands, stamp_reads_tiles: cands.map((n, i) => ({ tile: `T${i + 1}`, number: n })) }));
+test('Stamp: Gemini prompt (both) carries the verbatim stamp paragraph; stamp_numbers required; no instructor names', () => {
+  const PARA = 'stamp_numbers: every number printed on the page by a numbering-machine stamp. A numbering stamp is a machine-printed '
+    + 'number in ink (usually black) made of evenly spaced, same-size digits, often 5 to 9 digits long and sometimes starting with '
+    + 'zeros. It can be anywhere on the page (top, bottom, a margin, inside or over the table) and in any orientation (upright, '
+    + 'sideways, upside down or tilted); read it in its own orientation. Check marks, signatures or handwriting may cover part of '
+    + 'it. Return each stamped number as a string of digits only, exactly as printed, keeping leading zeros; write ? for a digit '
+    + 'you cannot read. If there are several stamped numbers, return all of them. Return [] when the page has no stamp. Do NOT '
+    + 'include the student ID, dates, phone numbers, handwritten numbers, rating numbers, or the printed form codes and texts '
+    + '(for example "SS Form2", "Revision 3", "February 4, 2009").';
+  for (const name of ['ai validation ocr and omr', 'Website AI Validation']) {
+    const body = wf.nodes.find((x) => x.name === name).parameters.jsonBody;
+    assert.strictEqual(body.split(JSON.stringify(PARA).slice(1, -1)).length - 1, 1, `${name}: paragraph exactly once, verbatim`);
+    assert.strictEqual(body.split('"stamp_numbers": { "type": "ARRAY", "items": { "type": "STRING" } }').length - 1, 1, name);
+    assert.ok(body.includes('"student_id",\n        "stamp_numbers",\n        "stamp_numbers_page",\n        "stamp_reads_tiles",\n'
+      + '        "document_check",'), `${name}: required`);
+    for (const m of ['known_instructor', 'Known instructors', "$('Phone Instructor Candidates')", 'first_name']) {
+      assert.ok(!body.includes(m), `${name}: ${m}`);
+    }
+  }
+});
+test('Stamp: both reconcilers -- ok (leading zeros kept, de-duplicated, separators stripped), missing, unreadable, multiple', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const ok = await stampRec(rec, ['0100005'], ['0100005']);
+    assert.strictEqual(ok.stamp_status, 'ok', which);
+    assert.strictEqual(ok.stamp_no, '0100005', `${which}: leading zero kept`);
+    assert.deepStrictEqual(ok.stamp_candidates, ['0100005'], which);
+    assert.deepStrictEqual(ok.stamp_raw, ['0100005'], which);
+    assert.deepStrictEqual(ok.review_reasons, [], which);
+    assert.strictEqual(ok.stamp_source, 'gemini+python', which);
+    const cases = [
+      [['0100005', ' 0100005 '], 'ok', '0100005', ['0100005']],
+      [['No. 0100-005'], 'ok', '0100005', ['0100005']],
+      [['123'], 'ok', '123', ['123']],
+      [['000000000012'], 'ok', '000000000012', ['000000000012']],
+      [[], 'missing', null, []],
+      [['', '   '], 'missing', null, []],
+      [undefined, 'missing', null, []],
+      ['0100005', 'missing', null, []],                 // not an array = []
+      [['01?0005'], 'unreadable', null, []],
+      [['12'], 'unreadable', null, []],                 // too short
+      [['1234567890123'], 'unreadable', null, []],      // 13 digits: too long
+      [['abc'], 'unreadable', null, []],
+      [['0100005', '0200006'], 'multiple', null, ['0100005', '0200006']],
+      [['0100005', '01?0006'], 'multiple', null, ['0100005']],
+      [['0100005', '12'], 'multiple', null, ['0100005']],
+    ];
+    const REASON = { ok: null, missing: 'stamp_missing', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps' };
+    for (const [stamps, status, no, cands] of cases) {
+      const r = await stampRec(rec, stamps, cands);
+      const tag = `${which}: ${JSON.stringify(stamps)}`;
+      assert.strictEqual(r.stamp_status, status, tag);
+      assert.strictEqual(r.stamp_no, no, tag);
+      assert.deepStrictEqual(r.stamp_candidates, cands, tag);
+      if (REASON[status]) {
+        assert.deepStrictEqual(r.review_reasons, [REASON[status]], `${tag}: a stamp reason sends the page to review`);
+        assert.strictEqual(r.needs_review, true, tag);
+        assert.match(r.review_note, /stamp/i, tag);
+      } else {
+        assert.deepStrictEqual(r.review_reasons, [], tag);
+      }
+    }
+    // Gemini answered without JSON -> unreadable (the stamp could not be read)
+    const nj = await rec(python(), { candidates: [{ content: { parts: [{ text: 'no json' }] } }] });
+    assert.strictEqual(nj.stamp_status, 'unreadable', which);
+    assert.ok(nj.review_reasons.includes('stamp_unreadable') && nj.review_reasons.includes('gemini_unavailable'), which);
+  }
+  // website: the Gemini call itself failed -> unreadable
+  const failed = (await run('Website Reconcile OCR OMR', { error: 'timeout' },
+    { 'Website Python OMR': python(), 'Website AI Validation': undefined }))[0].json;
+  assert.strictEqual(failed.stamp_status, 'unreadable');
+  assert.deepStrictEqual(failed.review_reasons, ['ai_validation_failed', 'stamp_unreadable']);
+  // one copy of website_src/stamp.js in each reconciler
+  const copies = ['Website Reconcile OCR OMR', 'reconcile ocr and omr1'].map((n) => {
+    const c = codeOf(n);
+    const i = c.indexOf('// stamp reader, from website_src/stamp.js');
+    return c.slice(i, c.indexOf('// end of stamp reader', i));
+  });
+  assert.ok(copies[0].length > 100 && copies[0] === copies[1]);
+});
+test('Stamp: Website Identity Check gets the stamp as $6 ("" unless exactly one stamp was read)', () => {
+  const ctx = { instructor_id: INSTR, subject_id: SUBJ, term_id: TERM, task_id: TASK };
+  const v = exprValue('Website Identity Check', { student_id: ' 1 ', stamp_status: 'ok', stamp_no: '0100005' }, { 'Website Prepare Scan': ctx });
+  assert.deepStrictEqual(v, [INSTR, SUBJ, TERM, '1', TASK, '0100005']);
+  for (const st of ['missing', 'unreadable', 'multiple']) {
+    assert.strictEqual(exprValue('Website Identity Check', { stamp_status: st, stamp_no: null }, { 'Website Prepare Scan': ctx })[5], '');
+  }
+});
+test('Stamp: Decide -- duplicate in the term -> auto_reject duplicate_stamp first, reused_image dropped; stamp kept on clean pages', async () => {
+  // clean page: the stamp travels to the raw row (gemini)
+  const clean = await decide(identity({ duplicate_stamp_exists: false, duplicate_stamp_of: null }));
+  assert.strictEqual(clean.flagged, false);
+  assert.strictEqual(clean.stamp_no, '0100005');
+  assert.strictEqual(clean.stamp_source, 'gemini+python');
+  assert.strictEqual(clean.auto_reject, null);
+  assert.strictEqual(clean.partial_data.stamp_status, 'ok');
+  // duplicate (and a reused image, which never goes with it)
+  const run2 = async (ctxExtra, recExtra = {}) => (await run('Website Decide', formMatch(), {
+    'Website Prepare Scan': { ...CTX, ...ctxExtra }, 'Website Reconcile OCR OMR': { ...REC, ...recExtra },
+    'Website Identity Check': identity({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }),
+  }))[0].json;
+  const d = await run2({ reused_image: { batch_id: BATCH, status: 'success' } });
+  assert.strictEqual(d.flagged, true);
+  assert.deepStrictEqual(d.review_reasons, ['duplicate_stamp']);
+  assert.strictEqual(d.auto_reject, 'duplicate_stamp');
+  assert.deepStrictEqual(d.duplicate_of, DUP);
+  assert.deepStrictEqual(d.partial_data.duplicate_of, DUP);
+  assert.match(d.review_note, /^This form was already scanned: stamp 0100005 is already stored for this term \(saved 2026-10-01\)\./);
+  assert.match(d.partial_data.summary, / — discarded: duplicate_stamp$/);
+  // other reasons stay after it; a JSON-string DUP (driver) is parsed
+  const d2 = await run2({}, { student_id: '', review_reasons: ['omr_agreement_below_30'] });
+  assert.deepStrictEqual(d2.review_reasons, ['duplicate_stamp', 'omr_agreement_below_30', 'student_id_missing']);
+  const d3 = (await run('Website Decide', formMatch(), { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': REC,
+    'Website Identity Check': identity({ duplicate_stamp_exists: true, duplicate_stamp_of: JSON.stringify(DUP) }) }))[0].json;
+  assert.deepStrictEqual(d3.duplicate_of, DUP);
+  // the identity check is only trusted for a page with one readable stamp
+  const d4 = await run2({}, { stamp_status: 'missing', stamp_no: null, review_reasons: ['stamp_missing'] });
+  assert.deepStrictEqual(d4.review_reasons, ['stamp_missing']);
+  assert.strictEqual(d4.auto_reject, null);
+  assert.strictEqual(d4.stamp_no, null);
+});
+// Website page with a duplicate stamp, end to end through the shared flagged path and the answer.
+async function websiteDuplicate(rec = REC) {
+  const d = (await run('Website Decide', formMatch(), { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': rec,
+    'Website Identity Check': identity({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }) }))[0].json;
+  const wrec = (await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': rec }))[0].json;
+  const q = (await run('build flagged record1', {}, { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: 'img1' }] }))[0].json;
+  return { d, wrec, q };
+}
+function assertAutoRejected(q, extraReasons = []) {
+  assert.deepStrictEqual(Object.keys(q).filter((k) => !DISCARD_COLUMNS.includes(k)), []);
+  assert.strictEqual(q.status, 'discarded');
+  assert.strictEqual(q.review_action, 'rejected');
+  assert.strictEqual(q.validation_status, 'flagged');
+  assert.deepStrictEqual(q.review_reasons, ['duplicate_stamp', ...extraReasons]);
+  assert.strictEqual(q.stamp_no, '0100005');
+  assert.strictEqual(q.stamp_source, 'gemini+python');
+  assert.deepStrictEqual(q.partial_data.duplicate_of, DUP);
+  assert.strictEqual(q.partial_data.stamp_status, 'ok');
+  const c = q.review_correction;
+  assert.deepStrictEqual([c.action, c.auto, c.rule, c.reviewed_by, c.reviewed_by_name],
+    ['rejected', true, 'duplicate_stamp', null, 'Automatic rule']);
+  assert.strictEqual(c.note, 'This form was already scanned (stamp 0100005), saved 2026-10-01, so this copy was discarded automatically and is not counted.');
+  assert.ok(!Number.isNaN(Date.parse(c.at)));
+  assert.deepStrictEqual(fcmParams()(q), [null], 'no staff push for an auto-rejected form');
+}
+test('Stamp (website, identity check): duplicate -> queue row discarded/rejected (rule duplicate_stamp), answer flagged + auto_rejected, no push', async () => {
+  const { wrec, q } = await websiteDuplicate();
+  assert.strictEqual(wrec.auto_reject, 'duplicate_stamp');
+  assert.strictEqual(wrec.auto_discard, false);
+  assertAutoRejected(q);
+  const evalBody = respondExpr();
+  const ok = assertContract([{ json: JSON.parse(evalBody({}, { 'Website Flagged Record': wrec })) }], 'flagged');
+  assert.deepStrictEqual(ok.review_reasons, ['duplicate_stamp']);
+  assert.strictEqual(ok.auto_rejected, 'duplicate_stamp');
+  assert.strictEqual(ok.stamp_no, '0100005');
+  assert.strictEqual(ok.message, STAMP_DUP_MESSAGE);
+  // queue insert failed: retryable, never 'auto_rejected'
+  const failed = JSON.parse(evalBody({ error: 'HTTP 500' }, { 'Website Flagged Record': wrec }));
+  assert.ok(failed.review_reasons.includes('internal_error_not_saved'));
+  assert.strictEqual(failed.auto_rejected, null);
+  assert.match(failed.message, /^NOT SAVED/);
+  // every other flagged page: auto_rejected null, stamp_no = the stamp read on the page
+  const plain = (await run('Website Flagged Record', await decide(identity(), REC_DISAGREE()), { 'Website Prepare Scan': CTX }))[0].json;
+  const pr = assertContract([{ json: JSON.parse(evalBody({}, { 'Website Flagged Record': plain })) }], 'flagged');
+  assert.strictEqual(pr.auto_rejected, null);
+  assert.strictEqual(pr.stamp_no, '0100005');
+  const pq = (await run('build flagged record1', {}, { 'Website Flagged Record': plain, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(pq.status, 'pending');
+  assert.strictEqual(pq.stamp_no, '0100005');
+  assert.strictEqual(pq.stamp_source, 'gemini+python');
+  assert.deepStrictEqual(pq.partial_data.stamp_candidates, ['0100005']);
+  assert.deepStrictEqual(pq.partial_data.stamp_raw, ['0100005']);
+  assert.ok(!('duplicate_of' in pq.partial_data));
+});
+test('Stamp (website): duplicate beats the min-answered auto-discard', async () => {
+  const rec = await answeredOnly(3, (py, g) => reconcile(py, g));
+  assert.strictEqual(rec.auto_discard, true);
+  const { wrec, q } = await websiteDuplicate(rec);
+  assert.strictEqual(wrec.auto_discard, false);
+  assertAutoRejected(q, ['too_few_answers_3_of_20']);
+  assert.strictEqual(JSON.parse(respondExpr()({}, { 'Website Flagged Record': wrec })).message, STAMP_DUP_MESSAGE);
+});
+test('Stamp (website, race): Website Raw Upsert says duplicate_stamp -> Raw Stored? false -> same auto-reject', async () => {
+  assert.deepStrictEqual(outs('Website Raw Stored?', 1), ['Website Flagged Record']);
+  assert.strictEqual(ifTrue('Website Raw Stored?', { saved: false, reason: 'duplicate_stamp', duplicate_of: DUP }), false);
+  const clean = await decide(identity({ duplicate_stamp_exists: false, duplicate_stamp_of: null }));
+  const wrec = (await run('Website Flagged Record', { saved: false, reason: 'duplicate_stamp', duplicate_of: DUP }, {
+    'Website Prepare Scan': CTX, 'Website Decide': clean, 'Website Reconcile OCR OMR': REC, 'Website Identity Check': identity(),
+  }))[0].json;
+  assert.strictEqual(wrec.auto_reject, 'duplicate_stamp');
+  assert.deepStrictEqual(wrec.review_reasons, ['duplicate_stamp']);
+  assert.match(wrec.review_note, /^This form was already scanned: stamp 0100005/);
+  const q = (await run('build flagged record1', {}, { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: 'img1' }] }))[0].json;
+  assertAutoRejected(q);
+  assert.strictEqual(JSON.parse(respondExpr()({}, { 'Website Flagged Record': wrec })).auto_rejected, 'duplicate_stamp');
+  // the existing duplicate_student race is unchanged
+  const ds = (await run('Website Flagged Record', { saved: false, reason: 'duplicate_student' }, {
+    'Website Prepare Scan': CTX, 'Website Decide': clean, 'Website Reconcile OCR OMR': REC, 'Website Identity Check': identity(),
+  }))[0].json;
+  assert.deepStrictEqual(ds.review_reasons, ['duplicate_student_id']);
+  assert.strictEqual(ds.auto_reject, null);
+});
+test('Stamp (phone): reconcile -> Phone Stamp Check -> Phone Stamp Verdict -> If31; parameters; verdict outcomes', async () => {
+  assert.deepStrictEqual(outs('reconcile ocr and omr1'), ['Phone Stamp Check']);
+  assert.deepStrictEqual(outs('Phone Stamp Check'), ['Phone Stamp Verdict']);
+  assert.deepStrictEqual(outs('Phone Stamp Verdict'), ['If31']);
+  const chk = wf.nodes.find((x) => x.name === 'Phone Stamp Check');
+  assert.strictEqual(chk.onError, 'continueRegularOutput');
+  assert.strictEqual(chk.alwaysOutputData, true);
+  assert.strictEqual(chk.credentials.postgres.name, 'Postgres account');
+  const r = await phoneReconcile(python());
+  assert.deepStrictEqual(exprValue('Phone Stamp Check', {}, { 'reconcile ocr and omr1': r }), ['', '0100005', 'phone-1']);
+  const none = await phoneReconcile(python({ stamp: pyStamp([]) }),
+    geminiResp({ stamp_numbers: [], stamp_numbers_page: [], stamp_reads_tiles: [] }));
+  assert.deepStrictEqual(exprValue('Phone Stamp Check', {}, { 'reconcile ocr and omr1': none }), ['', '', 'phone-1']);
+  const verdict = async (rec, check) => (await run('Phone Stamp Verdict', check, { 'reconcile ocr and omr1': rec }))[0].json;
+  // not a duplicate -> unchanged, still clean (If31 true)
+  const v0 = await verdict(r, { duplicate_stamp_exists: false, duplicate_stamp_of: null });
+  assert.strictEqual(v0.needs_review, false);
+  assert.deepStrictEqual(v0.review_reasons, []);
+  assert.strictEqual(v0._stage, 'phone_stamp_checked');
+  // check failed (error item / empty item) -> review, never credited unchecked
+  for (const bad of [{ error: { message: 'connection refused' } }, {}]) {
+    const v1 = await verdict(r, bad);
+    assert.strictEqual(v1.needs_review, true);
+    assert.deepStrictEqual(v1.review_reasons, ['stamp_check_failed']);
+    assert.strictEqual(v1.validation_status, 'flagged');
+  }
+  // no stamp: the check result does not matter
+  const v2 = await verdict(none, {});
+  assert.deepStrictEqual(v2.review_reasons, ['stamp_missing']);
+  // duplicate -> auto-reject
+  const v3 = await verdict(r, { duplicate_stamp_exists: true, duplicate_stamp_of: DUP });
+  assert.strictEqual(v3.needs_review, true);
+  assert.strictEqual(v3.auto_reject, 'duplicate_stamp');
+  assert.deepStrictEqual(v3.review_reasons, ['duplicate_stamp']);
+  assert.deepStrictEqual(v3.duplicate_of, DUP);
+});
+test('Stamp (phone): duplicate -> queue row discarded/rejected, phone answer JSON with the message, no push; beats min-answered', async () => {
+  const r = await phoneReconcile(python());
+  const v = (await run('Phone Stamp Verdict', { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }, { 'reconcile ocr and omr1': r }))[0].json;
+  const q = (await run('build flagged record1', {}, { 'Phone Stamp Verdict': v, 'reconcile ocr and omr1': r,
+    'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assertAutoRejected(q);
+  assert.strictEqual(q.user_id, STAFF);
+  assert.strictEqual(q.term_id, TERM);
+  const ans = respondExpr()({}, { 'build flagged record1': q });
+  assert.deepStrictEqual(JSON.parse(ans), { status: 'discarded', flagged: true, auto_rejected: 'duplicate_stamp', task_id: 'phone-1',
+    stamp_no: '0100005', duplicate_of: DUP, review_reasons: ['duplicate_stamp'], message: STAMP_DUP_MESSAGE });
+  // the phone's other answers keep the original fixed text
+  const pend = (await run('build flagged record1', {}, { 'reconcile ocr and omr1': { ...r, review_reasons: ['x'] },
+    'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(respondExpr()({}, { 'build flagged record1': pend }), '{{ JSON.stringify($json) }}');
+  assert.strictEqual(respondExpr()({ error: 'HTTP 409' }, { 'build flagged record1': q }), '{{ JSON.stringify($json) }}');
+  // min-answered + duplicate: the duplicate wins
+  const few = await answeredOnly(3, (py, g) => phoneReconcile(py, g));
+  const vf = (await run('Phone Stamp Verdict', { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }, { 'reconcile ocr and omr1': few }))[0].json;
+  assert.strictEqual(vf.auto_discard, false);
+  const qf = (await run('build flagged record1', {}, { 'Phone Stamp Verdict': vf, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assertAutoRejected(qf, ['too_few_answers_3_of_20']);
+  // a phone queue row without a duplicate carries the read stamp; a Gemini failure has none
+  const pq = (await run('build flagged record1', {}, { 'Phone Stamp Verdict': { ...v, auto_reject: undefined, review_reasons: ['x'] },
+    'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(pq.status, 'pending');
+  assert.strictEqual(pq.stamp_no, '0100005');
+  assert.strictEqual(pq.partial_data.stamp_status, 'ok');
+  const gfail = (await run('Handle Gemini failure', { error: { message: 'timeout' } }, {
+    'SAST image from phone': PHONE_HOOK, 'image to ocr and omr python': python() }))[0].json;
+  const gq = (await run('build flagged record1', {}, { 'Handle Gemini failure': gfail, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(gq.stamp_no, null);
+  assert.strictEqual(gq.stamp_source, null);
+  assert.strictEqual(gq.partial_data.stamp_status, 'unreadable');
+  assert.deepStrictEqual(gq.review_reasons, ['ai_validation_failed', 'stamp_unreadable']);
+});
+test('Stamp: raw rows -- phone/website rows carry the stamp (gemini); sheet rows never get the key; corrections map body.stamp_no', async () => {
+  // phone clean scan: Map to Target Format3 -> Code in JavaScript
+  const r = await phoneReconcile(python());
+  const fr = { m1: 5, p1: 4 };
+  const mapped = (await run('Map to Target Format3', { current_term_id: TERM }, { '2. Format Final Results1': fr,
+    'reconcile ocr and omr1': r, 'get instructor id6': { instructor_id: INSTR }, 'get subject id4': { subject_id: SUBJ } }))[0].json;
+  assert.strictEqual(mapped.stamp_no, '0100005');
+  assert.strictEqual(mapped.stamp_source, 'gemini+python');
+  const row = (await run('Code in JavaScript', null, { 'SAST image from phone': { body: { user_id: STAFF } } }, [mapped]))[0].json;
+  assert.strictEqual(row.stamp_no, '0100005');
+  assert.strictEqual(row.stamp_source, 'gemini+python');
+  // Google Sheet row: no stamp key at all (an upsert never clears a stamp)
+  const sheet = (await run('Code in JavaScript', null, { 'SAST image from phone': { body: { user_id: STAFF } } },
+    [{ instructor_ID: INSTR, true_subject_id: SUBJ, current_term_id: TERM, 'Student ID': 'A1', M1: 4 }]))[0].json;
+  assert.ok(!('stamp_no' in sheet) && !('stamp_source' in sheet));
+  // corrections: body.stamp_no / body.stamp_source
+  const cases = [
+    [{ stamp_no: '0100005', stamp_source: 'staff' }, '0100005', 'staff'],
+    [{ stamp_no: '0100005', stamp_source: 'override' }, '0100005', 'override'],
+    [{ stamp_no: ' 0100005 ', stamp_source: 'gemini' }, '0100005', 'staff'],   // anything else -> staff
+    [{ stamp_no: '0100005' }, '0100005', 'staff'],
+    [{ stamp_no: '' }, null, null],
+    [{ stamp_no: null, stamp_source: 'staff' }, null, null],
+    [{ stamp_no: '01-00005' }, null, null],                                   // not digits only -> no stamp
+    [{ stamp_no: '12' }, null, null],
+    [{}, null, null],                                                        // older client
+  ];
+  for (const [extra, no, src] of cases) {
+    const { mapped: m } = await correctionMap(extra);
+    const tag = JSON.stringify(extra);
+    assert.strictEqual(m.stamp_no, no, tag);
+    assert.strictEqual(m.stamp_source, src, tag);
+    assert.strictEqual(m.raw.stamp_no, no, tag);
+    const cr = (await run('Code in JavaScript', null, { 'sast-manual-correction1': { body: {} } }, [m]))[0].json;
+    assert.strictEqual(cr.stamp_no, no, `${tag}: raw row`);
+    assert.strictEqual(cr.stamp_source, src, `${tag}: raw row`);
+  }
+});
+test('Stamp (corrections): check against raw for the term before Mark Queue Validated1; duplicate -> HTTP 409, nothing saved', async () => {
+  assert.deepStrictEqual(outs('Map target'), ['Correction Ids Found?']);
+  assert.deepStrictEqual(outs('Correction Ids Found?', 0), ['Correction Stamp Check']);
+  assert.deepStrictEqual(outs('Correction Stamp Check'), ['Correction Stamp Duplicate?']);
+  assert.deepStrictEqual(outs('Correction Stamp Duplicate?', 0), ['Correction Duplicate Stamp Response']);
+  assert.deepStrictEqual(outs('Correction Stamp Duplicate?', 1), ['Mark Queue Validated1']);
+  assert.deepStrictEqual(outs('Correction Duplicate Stamp Response'), [], 'nothing after the 409 answer');
+  const chk = wf.nodes.find((x) => x.name === 'Correction Stamp Check');
+  assert.strictEqual(chk.onError, 'continueRegularOutput');
+  assert.strictEqual(chk.alwaysOutputData, true);
+  const { mapped } = await correctionMap({ correction_source: 'website_review', stamp_no: '0100005', stamp_source: 'staff' });
+  assert.deepStrictEqual(exprValue('Correction Stamp Check', mapped, {}), [TERM, '0100005', 't1']);
+  const { mapped: noStamp, CURRENT } = await correctionMap({});
+  assert.deepStrictEqual(exprValue('Correction Stamp Check', noStamp, {}), [CURRENT, '', 't1']);
+  assert.strictEqual(ifTrue('Correction Stamp Duplicate?', { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }), true);
+  assert.strictEqual(ifTrue('Correction Stamp Duplicate?', { duplicate_stamp_exists: false }), false);
+  // fail safe: a check that could not run stops a correction that carries a stamp (nothing saved),
+  // but never one without a stamp (there is nothing to check)
+  const $ = (ref) => ({ first: () => ({ json: { 'Map target': mapped }[ref] }) });
+  const $noStamp = (ref) => ({ first: () => ({ json: { 'Map target': noStamp }[ref] }) });
+  assert.strictEqual(ifTrue('Correction Stamp Duplicate?', { error: 'db down' }, $), true, 'a failed check blocks a correction with a stamp');
+  assert.strictEqual(ifTrue('Correction Stamp Duplicate?', { error: 'db down' }, $noStamp), false, 'a failed check never blocks a correction without a stamp');
+  const resp = wf.nodes.find((x) => x.name === 'Correction Duplicate Stamp Response');
+  assert.strictEqual(resp.type, 'n8n-nodes-base.respondToWebhook');
+  assert.strictEqual(resp.parameters.respondWith, 'json');
+  const code = /^=\{\{([\s\S]*)\}\}$/.exec(String(resp.parameters.options.responseCode).trim());
+  // eslint-disable-next-line no-new-func
+  const codeOf = (j) => new Function('$json', `return (${code[1]});`)(j);
+  assert.strictEqual(codeOf({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }), 409);
+  assert.strictEqual(codeOf({ error: 'db down' }), 503);
+  const m = /^=\{\{([\s\S]*)\}\}$/.exec(resp.parameters.responseBody.trim());
+  // eslint-disable-next-line no-new-func
+  assert.deepStrictEqual(JSON.parse(new Function('$', '$json', `return (${m[1]});`)($, { error: 'db down' })),
+    { success: false, code: 'stamp_check_failed',
+      message: 'The stamp check could not run, so nothing was saved. Try again in a moment.', duplicate_of: null });
+  // eslint-disable-next-line no-new-func
+  const ans = JSON.parse(new Function('$', '$json', `return (${m[1]});`)($, { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }));
+  assert.deepStrictEqual(ans, { success: false, code: 'duplicate_stamp',
+    message: 'This form was already scanned: stamp 0100005 is already stored for this term (saved 2026-10-01). Nothing was saved.',
+    duplicate_of: DUP });
+  // success path: the queue row also gets the stamp (only when the caller sent the stamp_no key)
+  const mk = wf.nodes.find((x) => x.name === 'Mark Queue Validated1');
+  assert.match(mk.parameters.query, /stamp_no = CASE WHEN \$4 = 'true' THEN NULLIF\(\$2, ''\) ELSE stamp_no END/);
+  const hook = (body) => ({ 'sast-manual-correction1': { body }, 'Map target': mapped });
+  assert.deepStrictEqual(exprValue('Mark Queue Validated1', {}, hook({ failed_scan_id: 'f1', stamp_no: '0100005' })),
+    ['f1', '0100005', 'staff', 'true']);
+  assert.deepStrictEqual(exprValue('Mark Queue Validated1', {}, { 'sast-manual-correction1': { body: { failed_scan_id: 'f1' } },
+    'Map target': noStamp }), ['f1', '', '', 'false']);
+});
+
+// ---------------------------------------------------------------- two readers (2026-10-17)
+// A stamp is accepted only when Gemini (final answer, full page, tiles) and the OMR's Python reader
+// agree on one number; everything else goes to review; a duplicate auto-reject only for an accepted one.
+const gem2 = ({ final = ['0100005'], page = ['0100005'], tiles = ['0100005'] } = {}) => geminiResp({
+  stamp_numbers: final, stamp_numbers_page: page, stamp_reads_tiles: tiles.map((n, i) => ({ tile: `T${i + 1}`, number: n })) });
+test('Stamp (two readers): every decision path in both reconcilers', async () => {
+  const cases = [
+    // [tag, python block, gemini, status, stamp_no, hint, why, source]
+    ['agree', pyStamp(['0100005']), gem2(), 'ok', '0100005', null, 'agree', 'gemini+python'],
+    ['disagree', pyStamp(['0100006']), gem2(), 'unconfirmed', null, '0100005', 'python_differs', null],
+    ['python ?', pyStamp(['01?0005']), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
+    ['python read nothing', pyStamp([]), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
+    ['python block missing (old OMR / failed)', null, gem2(), 'unconfirmed', null, '0100005', 'python_not_run', null],
+    ['python reader off', pyStamp(['0100005'], { reader: false }), gem2(), 'unconfirmed', null, '0100005', 'python_not_run', null],
+    ['python 2 stamp-like, 1 complete', pyStamp(['0100005', '01?0005']), gem2(), 'unconfirmed', null, '0100005', 'python_stamp_like', null],
+    ['gemini ?', pyStamp(['0100005']), gem2({ final: ['01?0005'], page: ['01?0005'], tiles: ['01?0005'] }), 'unreadable', null, '0100005', 'gemini_unreadable', null],
+    ['gemini nothing, python read', pyStamp(['0100005']), gem2({ final: [], page: [], tiles: [] }), 'unconfirmed', null, '0100005', 'gemini_none_python_read', null],
+    ['nothing at all', pyStamp([]), gem2({ final: [], page: [], tiles: [] }), 'missing', null, null, 'none', null],
+    ['page differs', pyStamp(['0100005']), gem2({ page: ['0100006'] }), 'unconfirmed', null, '0100005', 'page_differs', null],
+    ['page ?', pyStamp(['0100005']), gem2({ page: ['01?0005'] }), 'unconfirmed', null, '0100005', 'page_differs', null],
+    ['tiles differ', pyStamp(['0100005']), gem2({ tiles: ['0100006'] }), 'unconfirmed', null, '0100005', 'tiles_differ', null],
+    ['tile ?', pyStamp(['0100005']), gem2({ tiles: ['0100?05'] }), 'unconfirmed', null, '0100005', 'tiles_differ', null],
+    ['no tile sheet', pyStamp(['0100005'], { sheet: false }), gem2({ tiles: [] }), 'unconfirmed', null, '0100005', 'no_tile_sheet', null],
+    ['gemini multiple', pyStamp(['0100005']), gem2({ final: ['0100005', '0200006'] }), 'multiple', null, null, 'gemini_multiple', null],
+    ['page multiple', pyStamp(['0100005']), gem2({ page: ['0100005', '0200006'] }), 'multiple', null, null, 'readers_see_several', null],
+    ['python multiple', pyStamp(['0100005', '0200006']), gem2(), 'multiple', null, null, 'readers_see_several', null],
+    ['format check off by default: 5 digits', pyStamp(['12345']), gem2({ final: ['12345'], page: ['12345'], tiles: ['12345'] }), 'ok', '12345', null, 'agree', 'gemini+python'],
+    ['9 digits', pyStamp(['012345678']), gem2({ final: ['012345678'], page: ['012345678'], tiles: ['012345678'] }), 'ok', '012345678', null, 'agree', 'gemini+python'],
+    ['length differs', pyStamp(['0100005']), gem2({ final: ['01000050'], page: ['01000050'], tiles: ['01000050'] }), 'unconfirmed', null, '01000050', 'python_differs', null],
+  ];
+  const REASON = { ok: null, unconfirmed: 'stamp_unconfirmed', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps', missing: 'stamp_missing' };
+  for (const [which, rec] of RECONCILERS) {
+    for (const [tag, sc, g, status, no, hint, why, source] of cases) {
+      const r = await rec(python({ stamp: sc }), g);
+      const t = `${which}: ${tag}`;
+      assert.strictEqual(r.stamp_status, status, t);
+      assert.strictEqual(r.stamp_no, no, t);
+      assert.strictEqual(r.stamp_hint, hint, t);
+      assert.strictEqual(r.stamp_source, source, t);
+      assert.strictEqual(r.stamp_check.why, why, t);
+      assert.strictEqual(r.stamp_check.agreed, status === 'ok', t);
+      if (REASON[status]) {
+        assert.deepStrictEqual(r.review_reasons, [REASON[status]], `${t}: review`);
+        assert.strictEqual(r.needs_review, true, t);
+      } else {
+        assert.deepStrictEqual(r.review_reasons, [], t);
+      }
+    }
+    // the reviewer sees both reads, with the reader's '?' positions
+    const q = await rec(python({ stamp: pyStamp(['01?0005']) }), gem2());
+    assert.match(q.review_note, /not confirmed by both readers/);
+    assert.match(q.review_note, /AI read: 0100005\. Scanner read: 01\?0005 \(\? = a digit it was not sure of\)\./, which);
+    assert.deepStrictEqual(q.stamp_check.python, ['01?0005']);
+    assert.deepStrictEqual(q.stamp_check.gemini_tiles, ['0100005']);
+    const old = await rec(python({ stamp: null }), gem2());
+    assert.match(old.review_note, /Scanner read: did not run/);
+    const pg = await rec(python({ stamp: pyStamp(['0100005']) }), gem2({ page: ['0100006'] }));
+    assert.match(pg.review_note, /AI read: 0100005 \(full page 0100006\)\./);
+  }
+});
+test('Stamp (two readers): format check and the Gemini-only fallback are config switches, both OFF', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'website_src', 'stamp.js'), 'utf8');
+  assert.match(src, /^const ST_FORMAT_CHECK = false;$/m);
+  assert.match(src, /^const ST_ALLOW_GEMINI_ONLY = false;$/m);
+  const load = (s) => new Function(`${s}\nreturn stCheckStamp;`)();   // eslint-disable-line no-new-func
+  const G = (n) => ({ stamp_numbers: [n], stamp_numbers_page: [n], stamp_reads_tiles: [{ tile: 'T1', number: n }] });
+  const fmt = load(src.replace('const ST_FORMAT_CHECK = false;', 'const ST_FORMAT_CHECK = true;')
+    .replace('const ST_FORMAT_RULES = [];', "const ST_FORMAT_RULES = [{ length: [7], prefix: ['01', '45'] }];"));
+  assert.strictEqual(fmt(G('0100005'), true, pyStamp(['0100005'])).stamp_status, 'ok');
+  const bad = fmt(G('9900005'), true, pyStamp(['9900005']));
+  assert.deepStrictEqual([bad.stamp_status, bad.stamp_check.why, bad.stamp_hint], ['unconfirmed', 'format', '9900005']);
+  assert.strictEqual(fmt(G('01000051'), true, pyStamp(['01000051'])).stamp_check.why, 'format');
+  const fb = load(src.replace('const ST_ALLOW_GEMINI_ONLY = false;', 'const ST_ALLOW_GEMINI_ONLY = true;'));
+  const f1 = fb({ stamp_numbers: ['0100005'] }, true, undefined);
+  assert.deepStrictEqual([f1.stamp_status, f1.stamp_no, f1.stamp_source, f1.stamp_check.why], ['ok', '0100005', 'gemini', 'gemini_only_fallback']);
+  // with the reader present the fallback changes nothing: a disagreement still goes to review
+  assert.strictEqual(fb(G('0100005'), true, pyStamp(['0100006'])).stamp_status, 'unconfirmed');
+  const off = load(src)({ stamp_numbers: ['0100005'] }, true, undefined);
+  assert.deepStrictEqual([off.stamp_status, off.stamp_source], ['unconfirmed', null]);
+});
+test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an unconfirmed match is a hint (website + phone)', async () => {
+  const ctx = { instructor_id: INSTR, subject_id: SUBJ, term_id: TERM, task_id: TASK };
+  const unc = await reconcile(python({ stamp: pyStamp(['01?0005']) }), gem2());
+  assert.strictEqual(unc.stamp_status, 'unconfirmed');
+  // Identity Check $6: the accepted stamp, else the hint
+  assert.strictEqual(exprValue('Website Identity Check', unc, { 'Website Prepare Scan': ctx })[5], '0100005');
+  assert.strictEqual(exprValue('Website Identity Check', { ...unc, stamp_hint: null }, { 'Website Prepare Scan': ctx })[5], '');
+  const d = await decide(identity({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }), unc);
+  assert.strictEqual(d.flagged, true);
+  assert.strictEqual(d.auto_reject, null, 'never auto-rejected on an unconfirmed stamp');
+  assert.strictEqual(d.stamp_no, null);
+  assert.strictEqual(d.stamp_source, null);
+  assert.ok(d.review_reasons.includes('stamp_unconfirmed') && !d.review_reasons.includes('duplicate_stamp'));
+  assert.match(d.review_note, /Possible duplicate: a form with stamp 0100005 is already stored for this term \(saved 2026-10-01\)/);
+  assert.deepStrictEqual(d.partial_data.stamp_duplicate_hint, DUP);
+  assert.strictEqual(d.partial_data.stamp_hint, '0100005');
+  assert.strictEqual(d.partial_data.stamp_check.why, 'python_incomplete');
+  // no duplicate -> no hint note
+  const d0 = await decide(identity({ duplicate_stamp_exists: false, duplicate_stamp_of: null }), unc);
+  assert.ok(!/Possible duplicate/.test(d0.review_note) && !('stamp_duplicate_hint' in d0.partial_data));
+  // the queue row: pending (review), no stamp column, the readers' reads + the hint in partial_data
+  const wrec = (await run('Website Flagged Record', d, { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': unc }))[0].json;
+  const q = (await run('build flagged record1', {}, { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(q.status, 'pending');
+  assert.strictEqual(q.stamp_no, null);
+  assert.strictEqual(q.stamp_source, null);
+  assert.strictEqual(q.partial_data.stamp_status, 'unconfirmed');
+  assert.deepStrictEqual(q.partial_data.stamp_check.python, ['01?0005']);
+  assert.deepStrictEqual(q.partial_data.stamp_duplicate_hint, DUP);
+  // accepted stamp + duplicate -> auto-reject (unchanged), source gemini+python
+  const acc = await reconcile(python(), gem2());
+  const da = await decide(identity({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }), acc);
+  assert.strictEqual(da.auto_reject, 'duplicate_stamp');
+  // phone: the hint goes to Phone Stamp Check; a match adds a note, never an auto-reject
+  const pu = await phoneReconcile(python({ stamp: pyStamp(['0100006']) }), gem2());
+  assert.deepStrictEqual(exprValue('Phone Stamp Check', {}, { 'reconcile ocr and omr1': pu }), ['', '0100005', 'phone-1']);
+  const v = (await run('Phone Stamp Verdict', { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }, { 'reconcile ocr and omr1': pu }))[0].json;
+  assert.strictEqual(v.auto_reject, undefined);
+  assert.strictEqual(v.needs_review, true);
+  assert.deepStrictEqual(v.review_reasons, ['stamp_unconfirmed']);
+  assert.match(v.review_note, /Possible duplicate: a form with stamp 0100005/);
+  assert.deepStrictEqual(v.stamp_duplicate_hint, DUP);
+  const pq = (await run('build flagged record1', {}, { 'Phone Stamp Verdict': v, 'Save scan error image': [{ id: 'i' }] }))[0].json;
+  assert.strictEqual(pq.status, 'pending');
+  assert.strictEqual(pq.stamp_no, null);
+  assert.deepStrictEqual(pq.partial_data.stamp_duplicate_hint, DUP);
+  assert.strictEqual(pq.partial_data.stamp_check.why, 'python_differs');
+  // a failed check on a hint does not add stamp_check_failed (the scan is in review anyway)
+  const vf = (await run('Phone Stamp Verdict', {}, { 'reconcile ocr and omr1': pu }))[0].json;
+  assert.deepStrictEqual(vf.review_reasons, ['stamp_unconfirmed']);
+});
+test('Stamp (two readers): Gemini requests attach the tile sheet as the LAST image only when /process sent one', () => {
+  const render = (name, nodes) => {
+    const $ = (ref) => ({ first: () => ({ json: nodes[ref] }) });
+    const src = wf.nodes.find((x) => x.name === name).parameters.jsonBody.replace(/^=/, '');
+    // eslint-disable-next-line no-new-func
+    return JSON.parse(src.replace(/\{\{([\s\S]*?)\}\}/g, (m, js) => String(new Function('$', `return (${js});`)($))));
+  };
+  const SHEET = 'QUJD'.repeat(60);
+  const kn = { subject_list: 'IT 101 = Intro' };
+  const STRICT = 'STAMP READING RULES (strict):\n- Read each digit of the numbering-machine stamp independently.\n';
+  for (const [name, omr, base] of [
+    ['ai validation ocr and omr', 'image to ocr and omr python', { 'SAST image from phone': { body: { image: 'UEFHRQ==' } }, 'Phone Known Names': kn }],
+    ['Website AI Validation', 'Website Python OMR', { 'Website Prepare Scan': { image_base64: 'UEFHRQ==', mime_type: 'image/jpeg', header_image_base64: 'SEVBRA==' },
+      'Website Known Names': kn }],
+  ]) {
+    const nHeader = name === 'Website AI Validation' ? 1 : 0;
+    const withSheet = render(name, { ...base, [omr]: { stamp_candidates: { ...pyStamp(), tile_sheet_b64: SHEET } } });
+    const parts = withSheet.contents[0].parts;
+    assert.strictEqual(parts.length, 3 + nHeader, name);
+    assert.deepStrictEqual(parts[parts.length - 1], { inlineData: { mimeType: 'image/jpeg', data: SHEET } }, `${name}: tile sheet last`);
+    assert.strictEqual(parts[1].inlineData.data, 'UEFHRQ==');
+    const text = parts[0].text;
+    assert.ok(text.includes('Return ONLY valid JSON matching the schema.\n\n--- STAMP TILES (the LAST image) ---\nThe last image is a tile sheet made by our scanner software.')
+      && text.endsWith('printed form codes and texts ("SS Form2", "Revision 3", "February 4, 2009").'), `${name}: tile paragraph at the end`);
+    assert.ok(text.includes(`${STRICT}`) && text.indexOf(STRICT) < text.indexOf('--- BUBBLE GRID ---')
+      && text.indexOf(STRICT) > text.indexOf('--- STAMP ---\nstamp_numbers: '), `${name}: strict rules end the stamp section`);
+    const sch = withSheet.generationConfig.responseSchema;
+    assert.deepStrictEqual(sch.properties.stamp_numbers_page, { type: 'ARRAY', items: { type: 'STRING' } });
+    assert.deepStrictEqual(sch.properties.stamp_reads_tiles, { type: 'ARRAY', items: { type: 'OBJECT', properties: {
+      tile: { type: 'STRING' }, number: { type: 'STRING' } }, required: ['tile', 'number'] } });
+    assert.ok(/flash-lite/.test(wf.nodes.find((x) => x.name === name).parameters.url), `${name}: model unchanged`);
+    // no sheet (old OMR, /process failed, finder found nothing, not base64) -> no part, no tile paragraph
+    for (const omrJson of [{ ratings: {} }, { error: 'ECONNREFUSED' }, undefined, { stamp_candidates: pyStamp([], { sheet: false }) },
+      { stamp_candidates: { ...pyStamp(), tile_sheet_b64: 'abc"def'.repeat(30) } }, { stamp_candidates: { ...pyStamp(), tile_sheet_b64: 'QUJD' } }]) {
+      const b = render(name, { ...base, [omr]: omrJson });
+      assert.strictEqual(b.contents[0].parts.length, 2 + nHeader, `${name}: ${String(JSON.stringify(omrJson)).slice(0, 60)}`);
+      assert.ok(!b.contents[0].parts[0].text.includes('STAMP TILES'), name);
+      assert.ok(b.contents[0].parts[0].text.includes(STRICT), `${name}: strict rules always`);
+    }
+  }
+});
+
+// ---------------------------------------------------------------- AI sentences (ai_sentences.js)
+test('AI sentences: both parsers store one sentence per line (array or string input, old paragraph, dedupe, cap 5)', async () => {
+  const feedback = [{ index: 1, remark: 'Maayo si sir', subject_id: SUBJ }];
+  const base = { evaluation: { interpretation: 'ok', suggestion: 's' }, overall_tone: 'Positive',
+    remark_tones: [{ index: 1, tone: 'Positive' }], keywords: [{ word: 'Teaching clarity', new_count: 1 }] };
+  const uni = async (positives, improvements) => (await run('Parse Unified AI Result1',
+    { text: JSON.stringify({ ...base, evaluation: { ...base.evaluation, positives, improvements } }) },
+    { 'Prepare Unified AI Input1': { instructor_ID: INSTR, term_id: TERM, feedback } })).map((i) => i.json)
+    .find((r) => r.record_type === 'evaluation');
+  let ev = await uni(['clear explanations.', '  Fair grading  ', 'Clear explanations', '- patient with students;', 'a', 'b', 'c'], 'x');
+  assert.strictEqual(ev.positive_themes, 'Clear explanations.\nFair grading.\nPatient with students.\nA.\nB.');
+  ev = await uni('Clear explanations, strong preparedness, fair grading', '1. Slow down.\n* More examples• Shorter quizzes;');
+  assert.strictEqual(ev.positive_themes, 'Clear explanations, strong preparedness, fair grading.', 'old paragraph: one item, commas kept');
+  assert.strictEqual(ev.improvement_insights, 'Slow down.\nMore examples.\nShorter quizzes.');
+  const ind = async (p, i) => (await run('Add Parse Code node1', { text: JSON.stringify({ overall_tone: 'Positive',
+    keywords: [{ word: 'Teaching clarity' }], ai_suggestion: 's', student_interpretation: 'i', positive_themes: p, improvement_insights: i }) },
+    { 'Prepare Individual AI Input1': { instructor_ID: INSTR, term_id: TERM, subject_id: SUBJ, new_student_remark: 'ok' } }))
+    .map((x) => x.json).find((r) => r.record_type === 'evaluation');
+  ev = await ind(['Teaching clarity', 'Explains well.'], 'Needs more examples; Pace is fast');
+  assert.strictEqual(ev.positive_themes, 'Teaching clarity.\nExplains well.');
+  assert.strictEqual(ev.improvement_insights, 'Needs more examples.\nPace is fast.');
+  ev = await ind(undefined, null);
+  assert.strictEqual(ev.positive_themes, '');
+  assert.strictEqual(ev.improvement_insights, '');
+  await assert.rejects(uni([], 'x'), /Empty positives/);
+  await assert.rejects(uni('x', ['  ']), /Empty improvements/);
+});
+test('AI sentences: both prompts ask for 2-5 complete sentences as an array; one identical helper copy per parser', () => {
+  for (const n of ['Unified AI Analysis1', 'Individual AI Analysis1']) {
+    const t = wf.nodes.find((x) => x.name === n).parameters.text;
+    assert.strictEqual(t.split('3 to 5 short, complete sentences').length - 1, 2, n);
+    assert.ok(/may hold this as one paragraph or as separate lines/.test(t), n);
+  }
+  const u = wf.nodes.find((x) => x.name === 'Unified AI Analysis1').parameters.text;
+  assert.ok(/"positives": \[/.test(u) && /"improvements": \[/.test(u) && !/evaluation fields are strings/.test(u));
+  const re = /\/\/ AI sentences, from website_src\/ai_sentences\.js\n[\s\S]*?\/\/ end of AI sentences\n/;
+  const a = re.exec(codeOf('Parse Unified AI Result1'))[0];
+  assert.strictEqual(re.exec(codeOf('Add Parse Code node1'))[0], a);
+});
+
+// ---------------------------------------------------------------- interpretation summary (ai_interpretation.js)
+// Synthetic remarks only; no names.
+const NODE = Object.fromEntries(wf.nodes.map((n) => [n.name, n]));
+const AIINT_RE = /\/\/ AI interpretation, from website_src\/ai_interpretation\.js\n([\s\S]*?)\/\/ end of AI interpretation\n/;
+function aiIntFrom(nodeName) {
+  // eslint-disable-next-line no-new-func
+  return new Function(`${AIINT_RE.exec(codeOf(nodeName))[1]}\nreturn { aiInterpretation, AI_INTERPRETATION_MAX };`)();
+}
+const longPara = (n) => Array.from({ length: n }, (_, i) => `Most students say lesson ${i + 1} was clear and well paced.`).join(' ');
+test('AI interpretation: one paragraph, whitespace normalised, capped at a sentence end (~1500 chars); identical copy per parser', () => {
+  const { aiInterpretation, AI_INTERPRETATION_MAX } = aiIntFrom('Parse Unified AI Result1');
+  assert.strictEqual(AI_INTERPRETATION_MAX, 1500);
+  assert.strictEqual(aiInterpretation('  Most students\n\n praise the   lessons.\r\n- A few ask for more examples.  '),
+    'Most students praise the lessons. A few ask for more examples.');
+  assert.strictEqual(aiInterpretation(['Most students are happy.', '  Several want slower pacing. ']),
+    'Most students are happy. Several want slower pacing.');
+  for (const v of [null, undefined, '', '   ', 'null', 'N/A', {}, ['', null], '...']) assert.strictEqual(aiInterpretation(v), '', String(v));
+  const long = longPara(60);
+  assert.ok(long.length > 1500);
+  const cut = aiInterpretation(long);
+  assert.ok(cut.length <= 1500 && cut.length > 1400, `length ${cut.length}`);
+  assert.ok(cut.endsWith('was clear and well paced.') && long.startsWith(cut), 'cut at a sentence end');
+  const noStop = 'word '.repeat(400).trim();
+  const c2 = aiInterpretation(noStop);
+  assert.ok(c2.length <= 1501 && c2.endsWith('word.') && !/\s{2}/.test(c2), 'no sentence end: cut at a space, period added');
+  assert.strictEqual(aiInterpretation(longPara(3)), longPara(3), 'short text unchanged');
+  assert.strictEqual(AIINT_RE.exec(codeOf('Add Parse Code node1'))[0], AIINT_RE.exec(codeOf('Parse Unified AI Result1'))[0]);
+});
+test('AI interpretation: unified parser cleans/caps it and still throws on empty; single-scan parser keeps the stored one when Gemini returns none', async () => {
+  const feedback = [{ index: 1, remark: 'Maayo si sir', subject_id: SUBJ }];
+  const uni = async (interpretation) => (await run('Parse Unified AI Result1',
+    { text: JSON.stringify({ evaluation: { interpretation, positives: 'a', improvements: 'b', suggestion: 's' },
+      overall_tone: 'Positive', remark_tones: [{ index: 1, tone: 'Positive' }], keywords: [] }) },
+    { 'Prepare Unified AI Input1': { instructor_ID: INSTR, term_id: TERM, feedback } })).map((i) => i.json)
+    .find((r) => r.record_type === 'evaluation');
+  assert.strictEqual((await uni('Most students\n praise the lessons.')).student_interpretation, 'Most students praise the lessons.');
+  assert.ok((await uni(longPara(60))).student_interpretation.length <= 1500);
+  await assert.rejects(uni('  \n '), /Empty interpretation/);
+  const ind = async (studentInterpretation, existing) => (await run('Add Parse Code node1', { text: JSON.stringify({
+    overall_tone: 'Positive', keywords: [{ word: 'Teaching clarity' }], ai_suggestion: 's',
+    student_interpretation: studentInterpretation, positive_themes: ['A.'], improvement_insights: ['B.'] }) },
+  { 'Prepare Individual AI Input1': { instructor_ID: INSTR, term_id: TERM, subject_id: SUBJ, new_student_remark: 'ok',
+    existing_ai: existing === undefined ? undefined : { student_interpretation: existing } } }))
+    .map((x) => x.json).find((r) => r.record_type === 'evaluation');
+  assert.strictEqual((await ind('Most students\n\nlike the class.', 'Old summary.')).student_interpretation, 'Most students like the class.');
+  assert.strictEqual((await ind('', 'Most students like the class.')).student_interpretation, 'Most students like the class.', 'kept');
+  assert.strictEqual((await ind(undefined, 'Kept  summary.')).student_interpretation, 'Kept summary.');
+  assert.strictEqual((await ind('   ', undefined)).student_interpretation, '', 'nothing stored either');
+  assert.ok((await ind(longPara(60), '')).student_interpretation.length <= 1500);
+});
+test('Interpretation summary: single-scan path gets previous_remarks (text + tone only) through Merge2 into the prompt', async () => {
+  const q = NODE['Get Existing AI Suggestion1'];
+  const sql = q.parameters.query;
+  assert.ok(sql.includes('FROM (SELECT $1::uuid AS instructor_id, $2::uuid AS term_id) p') && /LEFT JOIN LATERAL/.test(sql),
+    'always one row, even without an ai_suggestions row');
+  assert.ok(/jsonb_build_object\('remark', x\.remark, 'tone', x\.tone\)/.test(sql) && /LIMIT 100/.test(sql)
+    && /ORDER BY x\.created_at DESC/.test(sql) && !/student_id|user_info|first_name/.test(sql), 'remark + tone only, newest first, last 100');
+  assert.strictEqual(q.alwaysOutputData, true);
+  const m = NODE.Merge2.parameters;
+  assert.deepStrictEqual([m.mode, m.combineBy, m.numberInputs], ['combine', 'combineByPosition', 3]);
+  assert.deepStrictEqual(outs('Prepare Existing AI1'), ['Merge2']);
+  assert.ok(wf.connections['Prepare Existing AI1'].main[0].every((e) => e.index === 2), 'Merge2 input 2 (position kept)');
+  const rows = [{ remark: 'Maayo  kaayo\nmo explain.', tone: 'Positive', student_id: '2023-0001', subject_id: SUBJ },
+    { remark: '  ', tone: 'Neutral' }, { remark: 'Dugangi ang examples.', tone: 'Critical', created_at: 'x' }];
+  const pe = async (row) => (await run('Prepare Existing AI1', row))[0].json;
+  let ex = await pe({ instructor_id: INSTR, term_id: TERM, student_interpretation: 'Old.', previous_remarks: rows });
+  assert.strictEqual(ex.existing_ai.student_interpretation, 'Old.');
+  assert.strictEqual(ex.previous_remarks.length, 3);
+  assert.strictEqual((await pe({ previous_remarks: JSON.stringify(rows) })).previous_remarks.length, 3, 'json text parsed');
+  ex = await pe({ instructor_id: INSTR, term_id: TERM, ai_suggestion: null, previous_remarks: [] });
+  assert.deepStrictEqual(ex.previous_remarks, []);
+  assert.strictEqual(ex.existing_ai.overall_tone, 'Neutral');
+  assert.deepStrictEqual((await pe({ previous_remarks: 'not json' })).previous_remarks, []);
+  // Merge2 combine by position = the three items' fields in one item
+  const merged = { wordcloud: [], instructor_name_tokens: ['zorro'], instructor_ID: INSTR, current_term_id: TERM,
+    true_subject_id: SUBJ, 'Remarks & Suggestions': 'Paspas kaayo.', ...(await pe({ student_interpretation: 'Old.', previous_remarks: rows })) };
+  const inp = (await run('Prepare Individual AI Input1', merged))[0].json;
+  assert.deepStrictEqual(inp.previous_remarks, [{ remark: 'Maayo kaayo mo explain.', tone: 'Positive' },
+    { remark: 'Dugangi ang examples.', tone: 'Critical' }], 'text + tone only, blanks dropped');
+  assert.strictEqual(inp.existing_ai.student_interpretation, 'Old.');
+  // render the prompt: previous remarks in their block, no student id, no name tokens
+  const t = NODE['Individual AI Analysis1'].parameters.text.replace(/^=/, '');
+  // eslint-disable-next-line no-new-func
+  const rendered = t.replace(/\{\{([\s\S]*?)\}\}/g, (s, js) => String(new Function('$json', `return (${js});`)(inp)));
+  const block = rendered.split('PREVIOUS STUDENT REMARKS\n')[2];
+  assert.ok(block && block.includes('"remark":"Dugangi ang examples."'), 'block filled');
+  assert.ok(!rendered.includes('2023-0001') && !rendered.includes('zorro') && !rendered.includes(SUBJ), 'no ids or names');
+  assert.ok(rendered.indexOf('PREVIOUS STUDENT REMARKS\n=') < rendered.indexOf('NEW STUDENT FEEDBACK\n='));
+});
+test('Interpretation summary: both prompts ask for one paragraph about ALL students (5-8 sentences, no names, no bullets)', () => {
+  const u = NODE['Unified AI Analysis1'].parameters.text;
+  const i = NODE['Individual AI Analysis1'].parameters.text;
+  for (const [n, t] of [['unified', u], ['individual', i]]) {
+    for (const s of ['Write ONE paragraph of 5 to 8 complete sentences (about 120 to 200 words)', '"most students", "several students", "a few students"',
+      'Summarise Bisaya/Cebuano and Tagalog comments in English.', 'Never use an instructor name or a student name.',
+      'Never quote a vulgar or sexual word', 'No bullet points', 'Do not mention AI, surveys, batches', 'What Your Students Are Saying']) {
+      assert.ok(t.includes(s), `${n}: ${s}`);
+    }
+  }
+  assert.ok(u.includes('INTERPRETATION (evaluation.interpretation)') && !u.includes('INSTRUCTOR INTERPRETATION'));
+  assert.ok(u.includes('the historical analysis, the historical remarks and the new feedback'));
+  assert.ok(u.includes('"interpretation": "One paragraph of 5 to 8 complete sentences summarising what students say.",'));
+  assert.ok(u.includes('- interpretation is ONE paragraph of 5 to 8 complete sentences'));
+  assert.ok(i.includes('UPDATED OVERALL interpretation of what ALL students are saying') && !i.includes('Write a short interpretation'));
+  assert.ok(i.includes('{{ JSON.stringify($json.previous_remarks || []) }}') && i.includes('You have four sources of information'));
+  assert.ok(i.includes('"student_interpretation": "One paragraph of 5 to 8 complete sentences summarising what all students say.",'));
+  assert.ok(i.includes('Determine the tone of the NEW student feedback.'), 'overall_tone stays about the new student');
+});
+
+// ---------------------------------------------------------------- remark tone (ai_tone.js)
+const TONE_RE = /\/\/ AI tone, from website_src\/ai_tone\.js\n([\s\S]*?)\/\/ end of AI tone\n/;
+test('AI tone: case-insensitive, trimmed; negative / mixed -> Critical; anything else null; identical copy per parser', () => {
+  // eslint-disable-next-line no-new-func
+  const { aiTone } = new Function(`${TONE_RE.exec(codeOf('Parse Unified AI Result1'))[1]}\nreturn { aiTone };`)();
+  for (const [v, want] of [['Positive', 'Positive'], [' positive ', 'Positive'], ['CRITICAL', 'Critical'], ['neutral\n', 'Neutral'],
+    ['Negative', 'Critical'], ['mixed', 'Critical'], [' MIXED ', 'Critical'], ['angry', null], ['', null], [null, null],
+    [undefined, null], [1, null], ['constructor', null], ['toString', null]]) assert.strictEqual(aiTone(v), want, String(v));
+  assert.strictEqual(TONE_RE.exec(codeOf('Add Parse Code node1'))[0], TONE_RE.exec(codeOf('Parse Unified AI Result1'))[0]);
+});
+test('AI tone: unified parser maps remark_tones / overall_tone (invalid still throws); single-scan parser maps or falls back to Neutral', async () => {
+  const feedback = [1, 2, 3].map((index) => ({ index, remark: `remark ${index}`, subject_id: SUBJ }));
+  const uni = async (tones, overall = 'Positive') => (await run('Parse Unified AI Result1',
+    { text: JSON.stringify({ evaluation: { interpretation: 'Most students are happy.', positives: 'a', improvements: 'b', suggestion: 's' },
+      overall_tone: overall, remark_tones: tones.map((tone, i) => ({ index: i + 1, tone })), keywords: [] }) },
+    { 'Prepare Unified AI Input1': { instructor_ID: INSTR, term_id: TERM, feedback } })).map((i) => i.json);
+  const out = await uni([' POSITIVE ', 'negative', 'Mixed'], ' neutral');
+  assert.deepStrictEqual(out.filter((r) => r.record_type === 'student_remark').map((r) => r.tone), ['Positive', 'Critical', 'Critical']);
+  assert.strictEqual(out.find((r) => r.record_type === 'evaluation').overall_tone, 'Neutral');
+  assert.strictEqual((await uni(['Positive', 'Critical', 'Neutral'], 'NEGATIVE')).find((r) => r.record_type === 'evaluation').overall_tone, 'Critical');
+  await assert.rejects(uni(['Positive', 'Angry', 'Neutral']), /Invalid tone for remark 2/);
+  await assert.rejects(uni(['Positive', 'Critical', 'Neutral'], 'happy'), /Invalid overall_tone/);
+  const ind = async (tone) => (await run('Add Parse Code node1', { text: JSON.stringify({ overall_tone: tone, keywords: [],
+    ai_suggestion: 's', student_interpretation: 'i', positive_themes: ['A.'], improvement_insights: ['B.'] }) },
+  { 'Prepare Individual AI Input1': { instructor_ID: INSTR, term_id: TERM, subject_id: SUBJ, new_student_remark: 'Sana po bagalan.' } }))
+    .map((x) => x.json);
+  for (const [tone, want] of [['NEGATIVE', 'Critical'], [' mixed', 'Critical'], ['positive', 'Positive'], ['happy', 'Neutral'], [undefined, 'Neutral']]) {
+    const o = await ind(tone);
+    assert.strictEqual(o.find((r) => r.record_type === 'evaluation').overall_tone, want, String(tone));
+    assert.strictEqual(o.find((r) => r.record_type === 'student_remark').tone, want, String(tone));
+  }
+  assert.strictEqual((await ind('critical')).find((r) => r.record_type === 'wordcloud').word, 'Needs improvement', 'fallback keyword uses the mapped tone');
+});
+test('AI tone: both prompts carry the any-language rule, the decision rules and all 15 examples (old examples gone)', () => {
+  const ex = [["Maayo kaayo mo explain si ma'am.", 'Positive'], ['Ang galing magturo ni sir, sobrang linaw.', 'Positive'],
+    ['Salamat sa pasensya, sir!', 'Positive'], ['Keep it up po!', 'Positive'], ['Very approachable and fair.', 'Positive'],
+    ['Muy buen profesor.', 'Positive'], ['Paspas kaayo mo discuss, dili mi ka sabay.', 'Critical'],
+    ['Sana po bagalan ang pagtuturo.', 'Critical'], ['Dugangi pa unta ang examples.', 'Critical'],
+    ['Maayo ra man siya pero kanunay late.', 'Critical'], ['Galing mo sir, wala kaming natutunan.', 'Critical'],
+    ['Hindi po malinaw ang grading.', 'Critical'], ['Mas maayo unta kung naay review before exam.', 'Critical'],
+    ['Okay ra.', 'Neutral'], ['Every MWF ang klase.', 'Neutral']];
+  for (const n of ['Unified AI Analysis1', 'Individual AI Analysis1']) {
+    const t = NODE[n].parameters.text;
+    for (const s of ['Hiligaynon', 'Ilocano', 'Taglish and Bislish', 'Translate it to English in your head before deciding.',
+      'Never decide from one keyword.', 'unta, sana, dapat, palihug, please, pls', 'Praise plus a specific problem or request:\nCritical.',
+      'only a greeting, or too short to judge', 'Emoji only:', 'Positive\nCritical\nNeutral']) assert.ok(t.includes(s), `${n}: ${s}`);
+    for (const [r, tone] of ex) assert.ok(t.includes(`"${r}"\n→ ${tone}\n`), `${n}: ${r}`);
+    for (const old of ['"His class is every Monday."', '"Okay ra man."', '"Mas maayo unta kung hinay-hinayan ang discussion."', '"Please give more examples."']) {
+      assert.ok(!t.includes(old), `${n}: old example ${old} removed`);
+    }
+  }
+  const u = NODE['Unified AI Analysis1'].parameters.text;
+  assert.ok(u.includes('Classify EVERY NEW feedback item.') && u.includes('If there is a tie, return Neutral.'), 'unified count rule kept');
+  assert.strictEqual(u.split('Never decide from one keyword.').length, 2);
+});
+
+// ---------------------------------------------------------------- word cloud words (remark_words.js)
+// Synthetic remarks and a synthetic name only.
+const RW_RE = /\/\/ remark words, from [^\n]*\n([\s\S]*?)\/\/ end of remark words\n/;
+function rwFrom(nodeName) {
+  // eslint-disable-next-line no-new-func
+  return new Function(`${RW_RE.exec(codeOf(nodeName))[1]}\nreturn { remarkWords, mergeWordCounts, RW_STOPWORDS };`)();
+}
+test('remark_words: stopwords (EN/Bisaya/Tagalog), short words, digits, name tokens, profanity, placeholders; once per remark', () => {
+  const RW = rwFrom('Parse Unified AI Result1');
+  const remarks = ['Si Maam Zorro maayo kaayo mutudlo, very PATIENT patient patient 123!',
+    "Ang patient nga teacher, naman talaga po. Don't rush.", 'N/A', 'none', 'wala', 'Wala', 'hahaha ok', 'iyot lecture',
+    '****** explains clearly', 'Sir Mañana is fine'];
+  const out = RW.remarkWords(remarks, ['zorro', 'Mañana'], PF.profaneKeyword);
+  const m = Object.fromEntries(out.map((w) => [w.word, w.new_count]));
+  assert.strictEqual(m.patient, 2, 'once per remark, two remarks');
+  for (const w of ['maayo', 'mutudlo', 'rush', 'lecture', 'explains', 'clearly', 'fine']) assert.strictEqual(m[w], 1, w);
+  for (const w of ['zorro', 'manana', 'iyot', 'kaayo', 'very', 'ang', 'nga', 'naman', 'talaga', 'teacher', 'dont', 'none', 'wala',
+    'hahaha', 'ok', 'sir', 'maam', 'si', '123', 'n']) assert.strictEqual(m[w], undefined, `${w} dropped`);
+  assert.ok(out.every((w) => w.word.length >= 3 && Number.isInteger(w.new_count) && w.new_count >= 1));
+  assert.deepStrictEqual(RW.remarkWords(['a b c none wala n/a'], [], null), []);
+  assert.deepStrictEqual(RW.remarkWords(null, null), []);
+  assert.strictEqual(RW.remarkWords(['alpha beta gamma delta'], [], null, 2).length, 2, 'limit');
+  assert.deepStrictEqual(RW.mergeWordCounts([{ word: 'Patient', new_count: 2 }, { word: 'Teaching clarity', new_count: 1 }],
+    [{ word: 'patient', new_count: 3 }, { word: 'clear', new_count: 1 }], 'new_count'),
+  [{ word: 'Patient', new_count: 5 }, { word: 'Teaching clarity', new_count: 1 }, { word: 'clear', new_count: 1 }],
+  'same text (any case) merges into one entry, the theme spelling wins');
+});
+test('remark_words: one identical copy in both remark parse nodes, after the sexual-word filter', () => {
+  const a = RW_RE.exec(codeOf('Parse Unified AI Result1'))[0];
+  const b = RW_RE.exec(codeOf('Add Parse Code node1'))[0];
+  assert.strictEqual(a, b);
+  for (const n of ['Parse Unified AI Result1', 'Add Parse Code node1']) {
+    const c = codeOf(n);
+    assert.ok(c.indexOf('// end of sexual-word filter') < c.indexOf('// remark words, from'), n);
+    assert.strictEqual(c.split('// remark words, from').length, 2, `${n}: once`);
+  }
+});
+test('Word cloud words: unified path merges words into the theme items (one row per word)', async () => {
+  const feedback = [{ index: 1, remark: 'Patient teacher, patient explains', subject_id: SUBJ },
+    { index: 2, remark: 'Zorro is patient. Maayo kaayo!', subject_id: SUBJ }];
+  const ai = { evaluation: { interpretation: 'ok', positives: 'clear', improvements: 'more', suggestion: 'more examples' },
+    overall_tone: 'Positive', remark_tones: [{ index: 1, tone: 'Positive' }, { index: 2, tone: 'Positive' }],
+    keywords: [{ word: 'Patient', new_count: 2 }, { word: 'Teaching clarity', new_count: 1 }] };
+  const base = { instructor_ID: INSTR, term_id: TERM, feedback };
+  const wc = async (extra) => (await run('Parse Unified AI Result1', { text: JSON.stringify(ai) },
+    { 'Prepare Unified AI Input1': { ...base, ...extra } })).map((i) => i.json).filter((r) => r.record_type === 'wordcloud');
+  const withWords = await wc({ instructor_name_tokens: ['zorro'] });
+  const m = Object.fromEntries(withWords.map((r) => [r.word, r.new_count]));
+  assert.strictEqual(m.Patient, 4, 'theme 2 + word 2, merged into one row');
+  assert.strictEqual(m['Teaching clarity'], 1, 'the AI theme is kept as is');
+  assert.strictEqual(m.explains, 1);
+  assert.strictEqual(m.maayo, 1);
+  assert.strictEqual(m.zorro, undefined, 'instructor name token dropped');
+  assert.strictEqual(new Set(withWords.map((r) => r.word.toLowerCase())).size, withWords.length, 'one row per word');
+  assert.ok(withWords.every((r) => r.instructor_id === INSTR && r.term_id === TERM && Number.isInteger(r.new_count)));
+  // no name tokens (lookup missing) -> themes only, never words that could be a name
+  assert.deepStrictEqual((await wc({})).map((r) => r.word), ['Patient', 'Teaching clarity']);
+  assert.deepStrictEqual((await wc({ instructor_name_tokens: null })).map((r) => r.word), ['Patient', 'Teaching clarity']);
+});
+test('Word cloud words: unified path keeps at most 60 words next to the themes', async () => {
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const text = Array.from({ length: 100 }, (_, i) => `zebra${letters[i % 26]}${letters[Math.floor(i / 26)]}x`).join(' ');
+  const feedback = [{ index: 1, remark: text, subject_id: SUBJ }];
+  const ai = { evaluation: { interpretation: 'ok', positives: 'p', improvements: 'i', suggestion: 's' }, overall_tone: 'Neutral',
+    remark_tones: [{ index: 1, tone: 'Neutral' }], keywords: [{ word: 'Teaching clarity', new_count: 1 }] };
+  const out = (await run('Parse Unified AI Result1', { text: JSON.stringify(ai) },
+    { 'Prepare Unified AI Input1': { instructor_ID: INSTR, term_id: TERM, feedback, instructor_name_tokens: [] } }))
+    .map((i) => i.json).filter((r) => r.record_type === 'wordcloud');
+  assert.strictEqual(out.length, 61);
+});
+test('Word cloud words: individual path merges words into the theme items (count field), fallback theme still works', async () => {
+  const wc = async (ind, remark, extra) => (await run('Add Parse Code node1', { text: JSON.stringify(ind) },
+    { 'Prepare Individual AI Input1': { instructor_ID: INSTR, term_id: TERM, subject_id: SUBJ, new_student_remark: remark, ...extra } }))
+    .map((i) => i.json).filter((r) => r.record_type === 'wordcloud');
+  const ai = { overall_tone: 'Positive', keywords: [{ word: 'Patient', new_count: 1 }, { word: 'Teaching clarity', new_count: 1 }],
+    ai_suggestion: 's', student_interpretation: 'i', positive_themes: ['p'], improvement_insights: ['i'] };
+  const out = await wc(ai, 'Zorro is patient and explains well', { instructor_name_tokens: ['zorro'] });
+  assert.deepStrictEqual(Object.fromEntries(out.map((r) => [r.word, r.count])),
+    { Patient: 2, 'Teaching clarity': 1, explains: 1, well: 1 });
+  assert.ok(out.every((r) => r.instructor_id === INSTR && r.term_id === TERM));
+  const none = await wc({ ...ai, keywords: [] }, 'Zorro is patient', { instructor_name_tokens: ['zorro'] });
+  assert.deepStrictEqual(Object.fromEntries(none.map((r) => [r.word, r.count])), { 'Positive feedback': 1, patient: 1 },
+    'fallback theme plus the real word');
+  assert.deepStrictEqual((await wc(ai, 'Zorro is patient', {})).map((r) => [r.word, r.count]),
+    [['Patient', 1], ['Teaching clarity', 1]], 'no tokens -> themes only, exactly as before');
+});
+test('Word cloud words: name tokens come from the database to the parsers, never to an AI node', () => {
+  const by = (n) => wf.nodes.find((x) => x.name === n);
+  for (const n of ['Get Previous Instructor Analysis1', 'Get the old wordcloud1']) {
+    const q = by(n).parameters.query;
+    assert.ok(/instructor_name_tokens/.test(q) && /public\.user_info/.test(q) && /\$1::uuid/.test(q), n);
+  }
+  for (const n of ['Prepare Unified AI Input1', 'Prepare Existing Wordcloud1', 'Prepare Individual AI Input1']) {
+    assert.ok(/instructor_name_tokens/.test(codeOf(n)), n);
+  }
+  for (const n of ['Unified AI Analysis1', 'Individual AI Analysis1']) {
+    assert.ok(!/name_tokens|first_name|last_name|user_info/.test(JSON.stringify(by(n).parameters)), `${n}: no name tokens in the AI prompt`);
+  }
+});
+test('Gemini free tier: Wait1 paces the remark loop (>= 6 s), AI nodes retry, failures skip the instructor via Wait1', () => {
+  const by = (n) => wf.nodes.find((x) => x.name === n);
+  const w = by('Wait1').parameters;
+  assert.strictEqual(w.unit, 'seconds');
+  assert.ok(w.amount >= 6);
+  for (const n of ['Unified AI Analysis1', 'Individual AI Analysis1']) {
+    const nd = by(n);
+    assert.ok(nd.retryOnFail === true && nd.maxTries === 3 && nd.waitBetweenTries === 5000, n);
+  }
+  for (const n of ['Unified AI Analysis1', 'Parse Unified AI Result1']) {
+    assert.strictEqual(by(n).onError, 'continueErrorOutput', n);
+    // + the sheet import job's failure recorder (migration 018); Wait1 still advances the loop
+    assert.deepStrictEqual(wf.connections[n].main[1].map((c) => c.node), ['Wait1', 'Describe Import Failure'], n);
+  }
+  assert.strictEqual(by('Get Previous Instructor Analysis1').onError, 'continueRegularOutput');
+});
+test('Word cloud words: Prepare Existing Wordcloud1 passes the tokens, also when the instructor has no wordcloud rows yet', async () => {
+  const out = (await run('Prepare Existing Wordcloud1', undefined, {}, [{ word: null, count: null, instructor_name_tokens: ['zorro', 'santos'] }]))[0].json;
+  assert.deepStrictEqual(out.wordcloud, []);
+  assert.deepStrictEqual(out.instructor_name_tokens, ['zorro', 'santos']);
+  const out2 = (await run('Prepare Existing Wordcloud1', undefined, {}, [{ word: 'Patient', count: '3', instructor_name_tokens: ['zorro'] }]))[0].json;
+  assert.deepStrictEqual(out2.wordcloud, [{ word: 'Patient', count: 3 }]);
+});
+
+// ---- Google Sheet import: header matching (old and new layout), no database change
+const NEW_ITEM_HEADERS = ['1. gives reasonable course/subject assignments', '2. earns appreciation and kind attention from the students',
+  '3. gives orientation about the subject and how the students are evaluated', '4. gives tests and/or projects which are within the objectives of the course',
+  '5. shows deep interest and concern in assisting the students', '6. manifests sympathetic insight into students’ feelings',
+  '7. checks and records test papers/term papers', '8. is on time and regular in meeting the class', '9. apportions fair subject/course assignments',
+  '10. sustains the attention of the class for the whole period', '11. presents lesson clearly, methodically, and substantially',
+  '12. motivates the students to learn', '13. facilitates learning with the application of appropriate educational methods and techniques',
+  '14. shows mastery of the lesson', '15. is ready for the class', '16. inspires students’ self-reliance in their quest for knowledge',
+  '17. knows when the students have difficulty understanding the lesson and find ways to make it easy', '18. integrates values into the lesson',
+  '19. speaks the language of instruction (english or filipino) clearly and fluently', '20. delivers thought provoking questions'];
+const SH_INSTR = 'Name of the Instructor/Professor\n(Family Name, First Name,  Middle I.)';
+const SH_COURSE = 'Course Handled by the above-mentioned Instructor/Professor (Ex. CC214 DATA STRUCTURES AND ALGORITHM)';
+function newSheetRow(over = {}, ratings = {}) {
+  const r = { 'ID Number': 7000001, 'Section': 'BIT-3A', [SH_INSTR]: 'Ana Reyes-Test',
+    '': 'Ana Reyes-Test - MOBAPP 330 MOBILE APPLICATION DEVELOPMENT',
+    [SH_COURSE]: 'MOBAPP 330 MOBILE APPLICATION DEVELOPMENT', 'Comments': 'MAAYO MAGTURO' };
+  NEW_ITEM_HEADERS.forEach((h, i) => { r[(i % 2 ? h.toUpperCase() : h)] = ratings[i + 1] === undefined ? 3 : ratings[i + 1]; });
+  return { ...r, ...over };
+}
+async function normRows(rows) {
+  return (await run('Normalize Sheet Rows', undefined, {}, rows)).map((x) => x.json);
+}
+test('Sheet import (new layout): columns found by normalised header, not position', async () => {
+  const [r] = await normRows([newSheetRow({}, { 2: 2, 11: 2 })]);
+  assert.strictEqual(r['Student ID'], '7000001');
+  assert.strictEqual(r['Instructor/Professor'], 'Ana Reyes-Test');
+  assert.strictEqual(r['Subject Taught'], 'MOBILE APPLICATION DEVELOPMENT (MOBAPP 330)');
+  assert.strictEqual(r['Remarks & Suggestions'], 'MAAYO MAGTURO');
+  assert.strictEqual(r.M1, 3); assert.strictEqual(r.M2, 2); assert.strictEqual(r.M10, 3);
+  assert.strictEqual(r.P1, 2, 'item 11 is P1'); assert.strictEqual(r.P10, 3, 'item 20 is P10');
+  assert.ok(!('Section' in r), 'section has no place in the database: ignored');
+});
+test('Sheet import (new layout): shuffled column order, extra whitespace, curly quotes and a blank rating', async () => {
+  const base = newSheetRow({}, { 5: '', 6: ' ' });
+  const shuffled = {};
+  for (const k of Object.keys(base).reverse()) shuffled[k.replace(/ /g, '  ')] = base[k];
+  const [r] = await normRows([shuffled]);
+  assert.strictEqual(r['Student ID'], '7000001');
+  assert.strictEqual(r.M5, null, 'blank stays null, never 0'); assert.strictEqual(r.M6, null);
+  assert.strictEqual(r.M4, 3); assert.strictEqual(r.P5, 3);
+  assert.strictEqual(r['Instructor/Professor'], 'Ana Reyes-Test');
+});
+test('Sheet import (new layout): course codes with and without a space, family-name-first instructor', async () => {
+  const rows = await normRows([
+    newSheetRow({ [SH_COURSE]: 'PC121 DISCREET MATH' }),
+    newSheetRow({ [SH_COURSE]: 'SE101 SOFTWARE ENGINEERING', [SH_INSTR]: 'Dela Testa, Maria L.' }),
+    newSheetRow({ [SH_COURSE]: 'DATA STRUCTURES (CC214)' }),
+  ]);
+  assert.strictEqual(rows[0]['Subject Taught'], 'DISCREET MATH (PC121)');
+  assert.strictEqual(rows[1]['Subject Taught'], 'SOFTWARE ENGINEERING (SE101)');
+  assert.strictEqual(rows[1]['Instructor/Professor'], 'Maria Dela Testa');
+  assert.strictEqual(rows[2]['Subject Taught'], 'DATA STRUCTURES (CC214)', 'already has a code in parentheses: kept');
+});
+test('Sheet import (new layout): the combined column is only a fallback for an empty instructor or course', async () => {
+  const [a, b, c] = await normRows([
+    newSheetRow({ [SH_INSTR]: '', [SH_COURSE]: '' }),
+    newSheetRow({ [SH_INSTR]: 'Ben Cruz-Test', '': 'Someone Else - SE101 SOFTWARE ENGINEERING', [SH_COURSE]: '' }),
+    newSheetRow({ [SH_INSTR]: 'Ben Cruz-Test', '': 'Someone Else - SE101 SOFTWARE ENGINEERING' }),
+  ]);
+  assert.strictEqual(a['Instructor/Professor'], 'Ana Reyes-Test');
+  assert.strictEqual(a['Subject Taught'], 'MOBILE APPLICATION DEVELOPMENT (MOBAPP 330)');
+  assert.strictEqual(b['Instructor/Professor'], 'Ben Cruz-Test', 'column 3 wins');
+  assert.strictEqual(b['Subject Taught'], 'SOFTWARE ENGINEERING (SE101)');
+  assert.strictEqual(c['Subject Taught'], 'MOBILE APPLICATION DEVELOPMENT (MOBAPP 330)', 'column 5 wins');
+});
+test('Sheet import (old layout): same output as before', async () => {
+  const old = { 'Student ID': 'S9', 'Instructor/Professor': 'Ana Reyes-Test', 'Subject Taught': 'Software Engineering (SE101)', M1: 4, M2: '', P10: 5,
+    'Remarks & Suggestions': 'Good', Date: 'September 20, 2026' };
+  const [r] = await normRows([old]);
+  assert.strictEqual(r['Student ID'], 'S9');
+  assert.strictEqual(r['Instructor/Professor'], 'Ana Reyes-Test');
+  assert.strictEqual(r['Subject Taught'], 'Software Engineering (SE101)');
+  assert.strictEqual(r.M1, 4); assert.strictEqual(r.M2, null); assert.strictEqual(r.M3, null); assert.strictEqual(r.P10, 5);
+  assert.strictEqual(r['Remarks & Suggestions'], 'Good'); assert.strictEqual(r.Date, 'September 20, 2026');
+  const [lc] = await normRows([{ student_id: 'S8', Instructor: 'Ana Reyes-Test', m1: 2, p1: 1, Remarks: 'ok' }]);
+  assert.strictEqual(lc['Student ID'], 'S8'); assert.strictEqual(lc.M1, 2); assert.strictEqual(lc.P1, 1);
+});
+test('Sheet import (new layout): Map to Target Format -> null-aware ratings, no stamp key, dedupe per student+instructor+course', async () => {
+  const rows = await normRows([newSheetRow({}, { 1: '' }), newSheetRow({ 'ID Number': 7000002 }, { 1: 4 })]);
+  const mapped = await run('Map to Target Format', {}, {
+    'Google LINK from phone1': { body: { term_id: TERM, semester: '1st', academic_year: '2026' } },
+    'Normalize Sheet Rows': { __items: rows },
+    'get instructor id5': { __items: [{ instructor_id: INSTR }, { instructor_id: INSTR }] },
+    'get subject id7': { __items: [{ subject_id: SUBJ }, { subject_id: SUBJ }] },
+    'GET TERM BY ID1': { __items: [{ current_term_id: TERM }, { current_term_id: TERM }] } });
+  assert.strictEqual(mapped.length, 2);
+  const nodes = { 'SAST image from phone': { body: { user_id: STAFF } } };
+  const raw = await run('Code in JavaScript', null, nodes, mapped.map((x) => x.json));
+  assert.strictEqual(raw.length, 2, 'two students are two rows');
+  assert.strictEqual(raw[0].json.m1, null, 'blank rating is NULL, never 0');
+  assert.strictEqual(raw[1].json.m1, 4);
+  assert.strictEqual(raw[0].json.student_id, '7000001');
+  assert.ok(!('stamp_no' in raw[0].json), 'sheet rows have no stamp number');
+  const dup = await run('Code in JavaScript', null, nodes, [mapped[0].json, mapped[0].json]);
+  assert.strictEqual(dup.length, 1, 'same student + instructor + course + term is deduped');
+});
+test('Sheet import: the workflow reads the sheet through Normalize Sheet Rows only', () => {
+  const node = (n) => wf.nodes.find((x) => x.name === n);
+  assert.ok(wf.connections['Get row(s) in sheet1'].main[0].some((c) => c.node === 'Normalize Sheet Rows'));
+  assert.ok(wf.connections['Normalize Sheet Rows'].main[0].some((c) => c.node === 'get instructor id5'));
+  assert.ok(!codeOf('Map to Target Format').includes("$('Get row(s) in sheet1')"));
+  assert.ok(!node('get subject id7').parameters.options.queryReplacement.includes("$('Get row(s) in sheet1')"));
+  assert.ok(!/gemini|openrouter/i.test(codeOf('Normalize Sheet Rows')), 'no AI call in the normaliser');
+});
+
+test('Sheet import: answers before the Gemini loop (responseNode), clear error answer, zero rows throw', async () => {
+  const hook = wf.nodes.find((x) => x.name === 'Google LINK from phone1');
+  assert.strictEqual(hook.parameters.responseMode, 'responseNode');
+  // the job row (migration 018) sits between Map to Target Format and the answer; the done marker after If19
+  assert.deepStrictEqual(wf.connections['Map to Target Format'].main[0].map((c) => c.node), ['Create Sheet Import Job']);
+  assert.deepStrictEqual(wf.connections['Create Sheet Import Job'].main[0].map((c) => c.node), ['Sheet Import Response']);
+  assert.deepStrictEqual(wf.connections['Sheet Import Response'].main[0].map((c) => c.node), ['After Sheet Response']);
+  assert.deepStrictEqual(wf.connections['After Sheet Response'].main[0].map((c) => c.node), ['If19', 'Sheet Import Summary']);
+  for (const n of ['Get row(s) in sheet1', 'Normalize Sheet Rows']) {
+    assert.ok(wf.connections[n].main[1].some((c) => c.node === 'Sheet Import Error Response'), n + ' error output');
+  }
+  const mapped = [{ instructor_ID: 'i', true_subject_id: 's' }, { instructor_ID: null, true_subject_id: 's' }, { instructor_ID: 'i', true_subject_id: 's' }];
+  const ctx = { 'Map to Target Format': { __items: mapped } };
+  const evalExpr = async (nodeName, nodes, $json) => {
+    const raw = wf.nodes.find((x) => x.name === nodeName).parameters.responseBody;
+    const m = raw.match(/^=\{\{([\s\S]*)\}\}$/);
+    const $ = (ref) => ({ all: () => ((nodes[ref] || {}).__items || []).map((j) => ({ json: j })) });
+    return new Function('$', '$json', `return (${m[1]});`)($, $json);
+  };
+  const body = await evalExpr('Sheet Import Response', ctx, {});
+  assert.strictEqual(body.status, 'success');
+  assert.deepStrictEqual([body.rows, body.matched, body.unmatched, body.imported_count, body.error_count], [3, 2, 1, 2, 1]);
+  assert.ok(/AI remark analysis continues in the background/.test(body.message));
+  const err403 = await evalExpr('Sheet Import Error Response', {}, { error: { message: 'The caller does not have permission [403]' } });
+  assert.ok(/Share the sheet with the service account email as Viewer/.test(err403.error));
+  await assert.rejects(() => run('Normalize Sheet Rows', undefined, {}, [{}]), /no data rows/);
+});
+
+// ---- placeholder comments ("N/A", "none", ...) are NULL, never text
+const PLACEHOLDERS = ['', ' ', 'N/A', 'n/a', 'NA', 'N.A.', 'n.a', 'NONE', 'None.', 'nothing', 'No Comment', 'no comments', 'NO  REMARKS',
+  'wala', 'Wala man', '-', '--', '.', '..', 'x', 'X', '???', '...', ' - ', '\u2019'];
+const REAL_COMMENTS = ['None of the lessons were clear', 'wala koy problema', 'N/A for me, but good class', 'nothing beats this teacher', 'Good', 'x2', 'No comment on grading, but he is late', 'na-late siya'];
+test('Placeholder comments: only whole-value matches become NULL (sheet, phone/corrections raw row, remark AI input)', async () => {
+  const sheetRows = PLACEHOLDERS.concat(REAL_COMMENTS).map((c) => newSheetRow({ Comments: c }));
+  const norm = await normRows(sheetRows);
+  PLACEHOLDERS.forEach((c, i) => assert.strictEqual(norm[i]['Remarks & Suggestions'], '', `sheet: ${JSON.stringify(c)} is blank`));
+  REAL_COMMENTS.forEach((c, i) => assert.strictEqual(norm[PLACEHOLDERS.length + i]['Remarks & Suggestions'], c, `sheet: ${c} kept`));
+  const nodes = { 'SAST image from phone': { body: { user_id: STAFF } } };
+  const rowOf = (c) => ({ instructor_ID: INSTR, true_subject_id: SUBJ, current_term_id: TERM, 'Student ID': 'A1', M1: 4, 'Remarks & Suggestions': c });
+  for (const c of PLACEHOLDERS) {
+    const raw = (await run('Code in JavaScript', null, nodes, [rowOf(c)]))[0].json;
+    assert.strictEqual(raw.Remarks_and_Suggestions, null, `raw row: ${JSON.stringify(c)} -> NULL`);
+  }
+  for (const c of REAL_COMMENTS) {
+    const raw = (await run('Code in JavaScript', null, nodes, [rowOf(c)]))[0].json;
+    assert.strictEqual(raw.Remarks_and_Suggestions, c, `raw row: ${c} kept`);
+  }
+  const grouped = await run('Group feedback by instructor1', undefined, {}, [rowOf('N/A'), rowOf('None'), rowOf('Very patient teacher')]);
+  const remarks = grouped.flatMap((g) => g.json.remarks.map((r) => r.remark));
+  assert.deepStrictEqual(remarks, ['Very patient teacher'], 'the remark AI never sees a placeholder');
+  assert.ok(/cleanRemark\(\s*data\["Remarks & Suggestions"\]/.test(codeOf('Prepare New Student Data1')), 'single-remark AI path cleans too');
+});
+
+// ---- Google Sheet import job (migration 018): the app polls sheet_import_jobs until the flow really ends
+// Run-aware mock: nodes = { name: { runs: [[out0, out1], ...] } } (a loop node has one entry per pass) or
+// { items: [...] } (one run, output 0). Unknown node = unexecuted (throws like n8n). all(b, r) for a run
+// that does not exist throws ("Run r of node ... not found"), unless lenient (returns [] instead).
+function jobMock(nodes, { lenient = false } = {}) {
+  return (ref) => {
+    if (!Object.prototype.hasOwnProperty.call(nodes, ref)) throw new Error(`Referenced node is unexecuted: ${ref}`);
+    const v = nodes[ref];
+    const runs = v.runs || [[v.items || []]];
+    const all = (b = 0, r) => {
+      const ri = r === undefined ? runs.length - 1 : r;
+      if (ri >= runs.length) {
+        if (lenient) return [];
+        throw new Error(`Run ${ri} of node "${ref}" not found`);
+      }
+      return (runs[ri][b] || []).map((json) => ({ json }));
+    };
+    return { all, first: (b) => all(b)[0], isExecuted: true };
+  };
+}
+async function runJob(name, nodes, { input = [], prevNode, lenient } = {}) {
+  const $input = { all: () => input.map((json) => ({ json })), first: () => (input[0] ? { json: input[0] } : undefined) };
+  const fn = new AsyncFunction('$', '$input', '$prevNode', codeOf(name));
+  return fn(jobMock(nodes, { lenient }), $input, prevNode);
+}
+const JOB_ID = '11111111-2222-4333-8444-555555555555';
+function sheetJobNodes(extra = {}) {
+  const row = (ok) => (ok ? { instructor_ID: INSTR, true_subject_id: SUBJ } : { instructor_ID: '', true_subject_id: SUBJ });
+  return {
+    'Create Sheet Import Job': { items: [{ id: JOB_ID }] },
+    'Map to Target Format': { items: [row(1), row(1), row(1), row(1), row(0)] },
+    'Code in JavaScript': { items: [{}, {}, {}, {}] },
+    'Insert or update rows in a table1': { runs: [[[{ id: 1 }, { id: 2 }]], [[{ id: 3 }, { id: 4 }]], [[{}]]] },
+    'Insert import_errors1': { runs: [[[{}], []]] },
+    'Group feedback by instructor1': { items: [{ g: 1 }, { g: 2 }] },
+    'Unified AI Analysis1': { runs: [[[{ text: 'a' }], []], [[{ text: 'b' }], []]] },
+    'Parse Unified AI Result1': { runs: [[[{}], []], [[{}], []]] },
+    'insert data to student remarks2': { runs: [[[{ success: true }], []], [[{ success: true }], []]] },
+    'store results2': { runs: [[[{ success: true }], []], [[{ success: true }], []]] },
+    'insert to word cloud2': { runs: [[[{ success: true }], []], [[{ success: true }], []]] },
+    'update to overall total2': { runs: [[[{ ok: 1 }], []]] },
+    ...extra,
+  };
+}
+
+test('Sheet import job: the summary gives the real counts after a clean import', async () => {
+  const out = await runJob('Sheet Import Summary', sheetJobNodes());
+  assert.strictEqual(out.length, 1);
+  const s = out[0].json;
+  assert.strictEqual(s.job_id, JOB_ID);
+  assert.deepStrictEqual([s.rows, s.matched, s.unmatched, s.imported_count, s.error_count, s.ai_groups, s.ai_failed],
+    [5, 4, 1, 4, 1, 2, 0]);
+  assert.strictEqual(s.has_problems, false);
+  assert.strictEqual(s.first_failed_node, null);
+  assert.ok(/4 of 5 rows saved/.test(s.message) && /1 unmatched rows sent to Import Errors/.test(s.message), s.message);
+  assert.ok(/AI remark analysis done for 2 of 2 instructors/.test(s.message), s.message);
+});
+
+test('Sheet import job: the summary counts failed rows, AI failures and other failed saves over every loop run', async () => {
+  const nodes = sheetJobNodes({
+    'Insert or update rows in a table1': { runs: [[[{ id: 1 }, { error: 'duplicate key' }]], [[{ id: 3 }, { id: 4 }]]] },
+    'Unified AI Analysis1': { runs: [[[{ text: 'a' }], []], [[], [{ error: '429 Too Many Requests' }]], [[{ text: 'c' }], []]] },
+    'Group feedback by instructor1': { items: [{}, {}, {}] },
+    'insert data to student remarks2': { runs: [[[], [{ error: 'violates check' }]]] },
+    'store results2': { runs: [[[{ success: true }], []], [[], [{ error: 'x' }]]] },
+  });
+  const s = (await runJob('Sheet Import Summary', nodes))[0].json;
+  assert.strictEqual(s.imported_count, 3);
+  assert.strictEqual(s.error_count, 2, 'unmatched + the row that failed');
+  assert.strictEqual(s.ai_failed, 2, 'one AI failure after retries + one failed remark insert');
+  assert.strictEqual(s.ai_groups, 3);
+  assert.strictEqual(s.has_problems, true);
+  assert.strictEqual(s.first_failed_node, 'Insert or update rows in a table1');
+  assert.ok(/Problems: 1 rows could not be saved; AI remark analysis failed for 2 of 3 instructors; an AI summary could not be saved/.test(s.message), s.message);
+});
+
+test('Sheet import job: the summary survives unexecuted nodes, a lenient run lookup, and no job id', async () => {
+  // every row unmatched: the raw upsert path and the remark loop never ran
+  const nodes = {
+    'Create Sheet Import Job': { items: [{ id: JOB_ID }] },
+    'Map to Target Format': { items: [{ instructor_ID: '' }, { instructor_ID: '' }] },
+    'Insert import_errors1': { runs: [[[{}, {}], []]] },
+  };
+  const s = (await runJob('Sheet Import Summary', nodes))[0].json;
+  assert.deepStrictEqual([s.rows, s.matched, s.unmatched, s.imported_count, s.error_count, s.ai_groups, s.has_problems],
+    [2, 0, 2, 0, 2, 0, false]);
+  assert.ok(/0 of 2 rows saved, 2 unmatched/.test(s.message), s.message);
+  // an n8n that returns [] for a missing run instead of throwing: bounded, same result
+  const t = (await runJob('Sheet Import Summary', sheetJobNodes(), { lenient: true }))[0].json;
+  assert.deepStrictEqual([t.imported_count, t.ai_failed, t.has_problems], [4, 0, false]);
+  // the job insert failed (migration 018 missing): nothing to update
+  assert.deepStrictEqual(await runJob('Sheet Import Summary', sheetJobNodes({ 'Create Sheet Import Job': { items: [{ error: 'relation does not exist' }] } })), []);
+  const noJob = sheetJobNodes();
+  delete noJob['Create Sheet Import Job'];
+  assert.deepStrictEqual(await runJob('Sheet Import Summary', noJob), []);
+});
+
+test('Sheet import job: Describe Import Failure names the failed step for staff', async () => {
+  const ai = (await runJob('Describe Import Failure', {}, { input: [{ error: '429 Too Many Requests' }], prevNode: { name: 'Unified AI Analysis1', outputIndex: 1 } }))[0].json;
+  assert.strictEqual(ai.failed_node, 'Unified AI Analysis1');
+  assert.ok(/after 3 tries/.test(ai.message) && /survey rows are saved/.test(ai.message) && /Error: 429 Too Many Requests$/.test(ai.message), ai.message);
+  const raw = (await runJob('Describe Import Failure', {}, { input: [{ error: { message: 'duplicate key value' } }, { error: 'y' }], prevNode: { name: 'If14' } }))[0].json;
+  assert.strictEqual(raw.failed_node, 'Insert or update rows in a table1');
+  assert.ok(/could not be saved to the database\. \(2 items\) Error: duplicate key value/.test(raw.message), raw.message);
+  assert.strictEqual(raw.failed_items, 2);
+  const unknown = (await runJob('Describe Import Failure', {}, { input: [{}] }))[0].json;
+  assert.strictEqual(unknown.failed_node, 'unknown step');
+  const long = (await runJob('Describe Import Failure', {}, { input: [{ error: 'e'.repeat(5000) }], prevNode: { name: 'store results2' } }))[0].json;
+  assert.ok(long.message.length <= 1000);
+});
+
+function evalExpr(expr, scope) {
+  const src = expr.replace(/^=\{\{/, '').replace(/\}\}$/, '');
+  const names = Object.keys(scope);
+  return new Function(...names, `return (${src});`)(...names.map((k) => scope[k]));
+}
+
+test('Sheet import job: the early answer carries job_id + status processing, and falls back without a job', () => {
+  const body = wf.nodes.find((n) => n.name === 'Sheet Import Response').parameters.responseBody;
+  const nodes = sheetJobNodes();
+  const r = evalExpr(body, { $: jobMock(nodes) });
+  assert.strictEqual(r.status, 'processing');
+  assert.strictEqual(r.job_id, JOB_ID);
+  assert.strictEqual(r.final, false);
+  assert.deepStrictEqual([r.rows, r.matched, r.unmatched, r.imported_count, r.error_count, r.unmatched_count], [5, 4, 1, 4, 1, 1]);
+  assert.ok(/not final/.test(r.message));
+  const old = evalExpr(body, { $: jobMock({ 'Map to Target Format': nodes['Map to Target Format'] }) });
+  assert.strictEqual(old.status, 'success');
+  assert.strictEqual(old.job_id, undefined);
+  const failed = evalExpr(body, { $: jobMock(sheetJobNodes({ 'Create Sheet Import Job': { items: [{ error: 'no table' }] } })) });
+  assert.strictEqual(failed.status, 'success');
+});
+
+test('Sheet import job: the job row gets the execution id and only a uuid requester', () => {
+  const p = wf.nodes.find((n) => n.name === 'Create Sheet Import Job').parameters.options.queryReplacement;
+  const base = sheetJobNodes();
+  const withUser = (uid) => evalExpr(p, { $: jobMock({ ...base, 'Google LINK from phone1': { items: [{ body: { user_id: uid } }] } }), $execution: { id: '4321' } });
+  assert.deepStrictEqual(withUser(JOB_ID), [5, 4, 1, '4321', JOB_ID]);
+  assert.deepStrictEqual(withUser('robert'), [5, 4, 1, '4321', '']);
+  const stopped = wf.nodes.find((n) => n.name === 'Mark Import Job Stopped').parameters.options.queryReplacement;
+  const sv = evalExpr(stopped, { $json: { execution: { id: '77', lastNodeExecuted: 'Group feedback by instructor1', error: { message: 'Cannot read properties of undefined' } } } });
+  assert.strictEqual(sv[0], '77');
+  assert.strictEqual(sv[1], 'Group feedback by instructor1');
+  assert.ok(/stopped at step "Group feedback by instructor1": Cannot read properties of undefined/.test(sv[2]), sv[2]);
+  const done = wf.nodes.find((n) => n.name === 'Mark Import Job Done').parameters.options.queryReplacement;
+  const dv = evalExpr(done, { $json: { job_id: JOB_ID, rows: 5, matched: 4, unmatched: 1, imported_count: 4, error_count: 1, ai_groups: 2, ai_failed: 0, has_problems: false, first_failed_node: null, message: 'm' } });
+  assert.deepStrictEqual(dv, [JOB_ID, 5, 4, 1, 4, 1, 2, 0, false, '', 'm']);
+});
+
+test('Sheet import job: wiring and execution order (done marker last, Wait1 feeds kept, no AI involved)', () => {
+  const byName = Object.fromEntries(wf.nodes.map((n) => [n.name, n]));
+  const tgt = (s, i) => ((wf.connections[s] || {}).main || [])[i] ? wf.connections[s].main[i].map((c) => c.node) : [];
+  assert.deepStrictEqual(tgt('Map to Target Format', 0), ['Create Sheet Import Job']);
+  assert.deepStrictEqual(tgt('Create Sheet Import Job', 0), ['Sheet Import Response']);
+  assert.deepStrictEqual(tgt('After Sheet Response', 0), ['If19', 'Sheet Import Summary']);
+  assert.ok(byName['Sheet Import Summary'].position[1] > byName.If19.position[1], 'summary below If19: runs after the whole If19 branch');
+  assert.ok(byName['Describe Import Failure'].position[1] < byName.Wait1.position[1], 'failure recorded before the loop goes on');
+  assert.strictEqual(wf.settings.executionOrder, 'v1');
+  for (const [s, i] of [['Unified AI Analysis1', 1], ['Parse Unified AI Result1', 1], ['insert data to student remarks2', 1],
+    ['insert data to student remarks2', 0]]) {
+    assert.ok(tgt(s, i).includes('Wait1'), `${s}[${i}] still feeds Wait1`);
+  }
+  assert.strictEqual(byName['insert data to student remarks2'].onError, 'continueErrorOutput');
+  assert.ok(!('queryBatching' in (byName['insert data to student remarks2'].parameters.options || {})),
+    'single query: success OR error output fires, never both (Wait1 fed once)');
+  const reach = (start) => {
+    const seen = new Set();
+    const stack = [start];
+    while (stack.length) {
+      const c = stack.pop();
+      if (seen.has(c)) continue;
+      seen.add(c);
+      for (const outs of Object.values(wf.connections[c] || {})) for (const l of outs) for (const e of l || []) stack.push(e.node);
+    }
+    return seen;
+  };
+  const ai = wf.nodes.filter((n) => /langchain|googleGemini|gemini/i.test(n.type) || /generativelanguage/.test(JSON.stringify(n.parameters))).map((n) => n.name);
+  for (const start of ['Sheet Import Summary', 'Describe Import Failure', 'Import Job Error Trigger']) {
+    const hit = ai.filter((a) => reach(start).has(a) && a !== start);
+    assert.deepStrictEqual(hit, [], `${start} reaches no AI node`);
+  }
+  assert.strictEqual(byName['Import Job Error Trigger'].type, 'n8n-nodes-base.errorTrigger');
+  assert.ok(!wf.settings.errorWorkflow, 'no other error workflow (the own Error Trigger runs)');
 });
 
 (async () => {

@@ -11,6 +11,8 @@ return [{
     task_id: ctx.task_id,
     review_reasons: [],
     identity_check: null,
+    auto_rejected: null,
+    stamp_no: d.stamp_no || null,   // the stamp stored with the raw row
     message: parts.join(' ').slice(0, 1000),
   },
 }];

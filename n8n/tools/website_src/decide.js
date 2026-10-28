@@ -1,5 +1,7 @@
 // Auto-credit unless OMR fails, a header field is blank/unreadable, the image was already scanned in
-// another batch, or the form clearly names another instructor/subject.
+// another batch, the form clearly names another instructor/subject, or its stamp is not one number
+// both readers agree on (stamp.js). A form whose ACCEPTED stamp is already stored for the term is
+// auto-rejected (duplicate_stamp); an unconfirmed one only gets a duplicate hint (review).
 const NAME_MATCH_MIN      = 0.70;   // another instructor needs this score to be a match
 const MATCH_MARGIN        = 0.10;   // best other match must beat the second by this
 const BATCH_MARGIN        = 0.20;   // and must beat the batch by this (the staff picked the batch)
@@ -30,6 +32,7 @@ function spotCheckRoll(taskId) {
 }
 // @@include profanity.js
 // @@include name_match.js
+// @@include remark_clean.js
 function errText(j) {
   if (!j) return '';
   const e = j.error;
@@ -93,6 +96,25 @@ const batchName = String(id.batch_instructor_name || fm.batch_instructor_name ||
 const batchCode = String(id.batch_subject_code || fm.batch_subject_code || '').trim();
 const batchSubjectName = String(id.batch_subject_name || fm.batch_subject_name || '').trim();
 const termId = (idOk ? id.resolved_term_id : ctx.term_id) || null;
+
+// stamp rule (2026-10-16): the one stamp read on the page (stamp_status 'ok'), else null. A stamp
+// already stored for this term on another page (Identity Check) auto-rejects the page: it beats
+// every other outcome (reused_image, spot_check, the min-answered auto-discard).
+const STAMP_RE = /^[0-9]{3,12}$/;
+const stampNo = rec.stamp_status === 'ok' && STAMP_RE.test(String(rec.stamp_no ?? '')) ? String(rec.stamp_no) : null;
+const asObject = (v) => {
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+  if (typeof v === 'string') {
+    try { const o = JSON.parse(v); return o && typeof o === 'object' && !Array.isArray(o) ? o : null; } catch (e) { return null; }
+  }
+  return null;
+};
+const duplicateOf = stampNo && idOk && id.duplicate_stamp_exists === true ? (asObject(id.duplicate_stamp_of) || {}) : null;
+const stampDuplicate = duplicateOf !== null;
+// two-reader rule (2026-10-17): a stamp that is not accepted (not 'ok') was checked as a hint
+// (rec.stamp_hint, Identity Check $6): a match is shown to staff, never an auto-reject
+const stampHint = !stampNo && STAMP_RE.test(String(rec.stamp_hint ?? '')) ? String(rec.stamp_hint) : null;
+const duplicateHint = stampHint && idOk && id.duplicate_stamp_exists === true ? (asObject(id.duplicate_stamp_of) || {}) : null;
 const batchInstructorId = String(ctx.instructor_id || '').toLowerCase();
 
 // Batch bias: only a clear winner over the batch counts. strong = others that could be a match.
@@ -271,7 +293,7 @@ if (!studentId) {
 
 // the same image file was already marked in another batch (backend lookup by sha256)
 const reused = ctx.reused_image;
-if (reused) {
+if (reused && !stampDuplicate) {
   reasons.push('reused_image');
   notes.push(`This exact image file was already scanned in another batch (${reused.batch_id}, result: ${reused.status}). Check that it is not the same student's form counted twice before approving.`);
 }
@@ -288,6 +310,22 @@ if (idOk && id.duplicate_student_exists === true && studentId) {
       + (id.duplicate_student_task_id ? ` (task ${id.duplicate_student_task_id})` : ' (from a phone scan or sheet import)')
       + '. This page was not saved over it; check whether the student submitted twice or the student ID was misread.');
   }
+}
+
+if (duplicateHint) {
+  notes.push(`Possible duplicate: a form with stamp ${stampHint} is already stored for this term`
+    + (duplicateHint.submitted_date ? ` (saved ${duplicateHint.submitted_date})` : '')
+    + '. The stamp on this page was not confirmed, so check the sheet before crediting it.');
+}
+
+if (stampDuplicate) {
+  // first reason; reused_image / spot_check never go with it
+  const rest = reasons.filter((r) => r !== 'duplicate_stamp' && r !== 'reused_image' && r !== 'spot_check');
+  reasons.length = 0;
+  reasons.push('duplicate_stamp', ...rest);
+  notes.unshift(`This form was already scanned: stamp ${stampNo} is already stored for this term`
+    + (duplicateOf.submitted_date ? ` (saved ${duplicateOf.submitted_date})` : '')
+    + '. This copy was discarded automatically and is not counted.');
 }
 
 // spot check: only ever applied to an otherwise-clean page, pre-filled with the batch values
@@ -316,8 +354,9 @@ for (const prefix of ['m', 'p']) {
 const answered = Object.values(ratings).filter((v) => v !== null).length;
 
 const remarkIn = String(rec.remarks || '').trim();
-const remark = maskProfanity(remarkIn);
-const remarksMasked = rec.remarks_masked === true || remark !== remarkIn;
+const remarkMasked = maskProfanity(remarkIn);
+const remark = cleanRemark(remarkMasked) || '';   // 'N/A', 'none', ... -> '' (stored as NULL)
+const remarksMasked = rec.remarks_masked === true || remarkMasked !== remarkIn;
 const agreementPercent = typeof rec.agreement_percent === 'number' ? rec.agreement_percent : null;
 
 // today's date in Manila time
@@ -328,7 +367,9 @@ const dp = Object.fromEntries(
 );
 const today = `${dp.year}-${dp.month}-${dp.day}`;
 
-const reviewNote = [rec.review_note, ...notes].filter(Boolean).join(' ') || null;
+const reviewNote = (stampDuplicate ? [notes[0], rec.review_note, ...notes.slice(1)] : [rec.review_note, ...notes])
+  .filter(Boolean).join(' ') || null;
+const stampCandidates = Array.isArray(rec.stamp_candidates) ? rec.stamp_candidates : [];
 
 return [{
   json: {
@@ -347,6 +388,11 @@ return [{
     subject_code: batchCode,
     subject_name: batchSubjectName,
     student_id: studentId,
+    stamp_no: stampNo,                          // stored with the raw row (Website Raw Upsert)
+    stamp_source: stampNo ? (rec.stamp_source || 'gemini') : null,
+    stamp_status: rec.stamp_status || 'unreadable',
+    auto_reject: stampDuplicate ? 'duplicate_stamp' : null,
+    duplicate_of: duplicateOf,
     remark,
     remarks_masked: remarksMasked,
     submitted_date: today,
@@ -370,11 +416,19 @@ return [{
       ratings: rec.ratings ?? null,
       summary: `${answered}/20 answered`
         + (agreementPercent !== null ? `, agreement ${agreementPercent}%` : '')
-        + (flagged ? ` — flagged: ${reasons.join(', ')}` : ' — clean'),
+        + (stampDuplicate ? ` — discarded: ${reasons.join(', ')}` : flagged ? ` — flagged: ${reasons.join(', ')}` : ' — clean'),
       python_raw_ratings: rec.python_raw_ratings ?? null,
       comparisons: rec.comparisons ?? null,
       agreement_percent: agreementPercent,
       review_note: reviewNote,
+      stamp_status: rec.stamp_status || 'unreadable',
+      stamp_candidates: stampCandidates,
+      stamp_raw: rec.stamp_raw ?? null,
+      stamp_source: stampNo ? (rec.stamp_source || 'gemini') : null,
+      stamp_check: rec.stamp_check ?? null,
+      stamp_hint: stampHint,
+      ...(duplicateHint ? { stamp_duplicate_hint: duplicateHint } : {}),
+      ...(stampDuplicate ? { duplicate_of: duplicateOf } : {}),
       ocr_instructor: ocrI,
       ocr_subject: ocrS,
       known_subject: knownS,

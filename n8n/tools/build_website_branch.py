@@ -3,8 +3,10 @@
 
 Re-runnable:  python build_website_branch.py [INPUT_JSON] [OUTPUT_JSON] [LAYOUT_JSON]
 Live export:  python build_website_branch.py --live LIVE_EXPORT_JSON [OUTPUT_JSON]
-              applies only step 6 below (apply_sast_v2) to a live n8n export of this build
-              (e.g. 'perfect 2.1.json' -> ../perfect-2.1.json); ids/positions/name/id kept.
+              applies only steps 6 to 10 below (apply_sast_v2, apply_phone_name_privacy,
+              apply_check_only_rule, apply_min_answers_rule, apply_stamp_rule) to a
+              live n8n export of this build (e.g. 'perfect 2.1.json' -> ../perfect-2.1.json);
+              ids/positions/name/id kept.
 
 Defaults:
   INPUT  = C:\\Users\\rodzh\\Downloads\\perfect 101 (4).json   (read only, never modified)
@@ -26,11 +28,13 @@ What it does
      batch, is held for review: *_missing / reused_image); a form naming another instructor/subject is
      flagged with the matched one pre-filled as the suggestion, and nothing is credited until
      staff approve it (decide.js). The batch wins unless another instructor/subject clearly beats
-     it (token fuzzy scoring in name_match.js); a form that matches nobody is not flagged. The
-     phone Gemini prompt gets the known instructors/subjects ('Phone Known Names', known_names.sql)
-     and returns known_instructor / known_subject; the website prompt gets the known SUBJECTS only
-     ('Website Known Names', website_known_names.sql: no instructor names are sent to Gemini) and
-     returns known_subject. OMR ratings come from Python, cross-checked by Gemini (row
+     it (token fuzzy scoring in name_match.js); a form that matches nobody is not flagged. No
+     Gemini call ever gets instructor names (privacy): both main prompts get the known SUBJECTS
+     only ('Phone Known Names', known_names.sql / 'Website Known Names', website_known_names.sql)
+     and return known_subject. The form's instructor is matched locally against the database
+     (website: 'Website Form Match' + decide.js; phone: 'Phone Instructor Candidates',
+     phone_instructor_candidates.sql, after the Gemini call + nmBestInstructor in the phone
+     reconciler). OMR ratings come from Python, cross-checked by Gemini (row
      agreement >= AGREEMENT_MIN, see reconcile.js); all text comes only from Gemini.
   2. Clean pages: 'Website Raw Upsert' stores the raw row (same row/key as the shared
      upsert, never over another page's row), 'Website Respond Saved' answers the website
@@ -113,6 +117,42 @@ What it does
          null) in 'Code in JavaScript', '2. Format Final Results1', 'build the record1' and
          'Map target1'; 'Map to Target Format3', 'Website Map to Target Format' and 'Map target'
          default a missing rating to null.
+  7. No instructor names to Gemini on the phone either (apply_phone_name_privacy; idempotent):
+       * 'Phone Known Names' runs known_names.sql (subjects only, no parameters); the phone prompt
+         ('ai validation ocr and omr') lists only the known subjects and asks only for known_subject.
+       * 'Phone Instructor Candidates' (phone_instructor_candidates.sql, continue on error) sits
+         between 'Is not a SAST form?' (false) and 'Phone Remark Check', i.e. AFTER the Gemini call;
+         the phone reconciler matches the raw instructor reading against it locally
+         (name_match.js nmBestInstructor): a clear match -> the exact database name (found by 'get
+         instructor id6'); several close matches -> flagged 'instructor_ambiguous'; no match -> the
+         raw reading, as before. Every copy of name_match.js is refreshed.
+       * assert_no_instructor_names_to_gemini: no Gemini request may carry an instructor list.
+  8. Check-only rule (apply_check_only_rule; idempotent): only a check or slash mark counts. The
+     OMR returns a rejected row (x, shade, circle, dot) as blank and names it in
+     omr_debug[].invalid_mark; both reconcilers keep that row blank (source 'invalid_mark', never
+     gemini_fill, no conflict, not a blank for too_many_blanks), add a per-row review note (no
+     review flag for them). Both main Gemini prompts get
+     one line (CHECK_ONLY_LINE); 'Website Reconcile OCR OMR' is refreshed from reconcile.js.
+  9. Min-answered rule (apply_min_answers_rule; idempotent): fewer than 5 of 20 answered on a reliable
+     scan -> the queue row is stored discarded, the website answer says so, no staff push.
+ 10. Stamp rule (apply_stamp_rule; idempotent; needs migration 015): both Gemini prompts ask for the
+     required stamp_numbers (STAMP_PROMPT_PARAGRAPH); both reconcilers keep one readable stamp
+     (website_src/stamp.js) or flag stamp_missing / stamp_unreadable / multiple_stamps; a stamp already
+     stored for the term auto-rejects the page as duplicate_stamp (website: 'Website Identity Check' $6
+     and the 'Website Raw Upsert' race via public.save_website_raw_row; phone: 'Phone Stamp Check' ->
+     'Phone Stamp Verdict' before If31); 'build flagged record1' stores it discarded/rejected (after and
+     above the min-answered block) with stamp_no/stamp_source; raw rows get the stamp ('Code in
+     JavaScript' only when the mapper sent one, so sheet rows never clear it); corrections take
+     body.stamp_no / body.stamp_source and answer HTTP 409 duplicate_stamp ('Correction Stamp Check' ->
+     'Correction Stamp Duplicate?' -> 'Correction Duplicate Stamp Response') before 'Mark Queue
+     Validated1', which also writes the stamp to the queue row.
+ 11. OCR cross-check (apply_ocr_crosscheck; idempotent; 2026-10-28): website_src/ocr_crosscheck.js in both
+     reconcilers: with the OMR's confident ink check of the box (ocr_meta.ink, located), an AI student ID
+     on an empty ID box is dropped (student_id_unverified), a written ID box read empty is
+     student_id_missed (phone), remarks_missed / remarks_unverified likewise; Gemini's corrected_rows
+     (white ink) -> white_ink_correction. Review only; an older OMR without ocr_meta.ink changes nothing.
+     INVALID_MARK_TEXT names the OMR's new 'double' mark. Both Gemini prompts get WHITE_INK_LINE and a
+     required corrected_rows array.
 """
 from __future__ import annotations
 
@@ -223,7 +263,11 @@ REMARK_ALERT_FEEDS = ["If25", "PushNotificaton for sentiment analysisi5"]   # ex
 
 # Flagged-scan staff push: its input (the queue POST, Prefer: return=minimal) has no body.
 FLAGGED_FCM = "Get staff FCM for flagged scan"
-FLAGGED_FCM_PARAMS = "={{ [ $('build flagged record1').first().json.user_id ?? null ] }}"
+# Before the min-answered rule; a live export with it is upgraded by apply_min_answers_rule.
+FLAGGED_FCM_PARAMS_V1 = "={{ [ $('build flagged record1').first().json.user_id ?? null ] }}"
+# A form stored as discarded (min-answered rule) needs nobody: NULL matches no row, so no push.
+FLAGGED_FCM_PARAMS = ("={{ [ $('build flagged record1').first().json.status === 'discarded' ? null "
+                      ": ($('build flagged record1').first().json.user_id ?? null) ] }}")
 # Phone subject lookup: its input ('get instructor id6', alwaysOutputData) is an EMPTY item when
 # the instructor is not matched, and n8n drops empty values from a '{{ }}' parameter list.
 PHONE_SUBJECT_LOOKUP = "get subject id4"
@@ -258,22 +302,32 @@ HELPER_HEADERS = {
     "name_match.js": "name matcher",
     "layout_check.js": "layout check",
     "rating.js": "SAST rating",
+    "stamp.js": "stamp reader",
+    "remark_words.js": "remark words",
+    "remark_clean.js": "remark placeholders",
+    "ai_sentences.js": "AI sentences",
+    "ai_interpretation.js": "AI interpretation",
+    "ai_tone.js": "AI tone",
+    "ocr_crosscheck.js": "OCR cross-check",
 }
 # Known names for the main Gemini OCR prompt: a new Postgres node right before the Gemini call;
-# Gemini returns the raw reading plus its closest known entry. Phone: instructors + subjects
-# (known_names.sql). Website: subjects only (website_known_names.sql), no instructor names.
+# Gemini returns the raw reading plus its closest known SUBJECT. Subjects only on both branches
+# (phone: known_names.sql, website: website_known_names.sql): no instructor names reach Gemini.
 WEB_KNOWN_NAMES = "Website Known Names"
 PHONE_KNOWN_NAMES = "Phone Known Names"
+# Phone: creditable instructors for the LOCAL match in the reconciler, queried after the Gemini call.
+PHONE_CANDIDATES = "Phone Instructor Candidates"
+# Must never appear in a Gemini request (privacy; assert_no_instructor_names_to_gemini).
+INSTRUCTOR_LIST_MARKERS = ("known_instructor", "Known instructors", "instructor_list", "instructor_names",
+                           "$('" + PHONE_CANDIDATES + "')", "$('Website Form Match')", "first_name", "last_name")
 PHONE_OMR_NODE = "image to ocr and omr python"
 SUBJECT_HINT_OLD = "2. subject: CTU course code (DDMGT, IT, CSO, HCI, ADBAS, IDA + digits)."
 SUBJECT_HINT_NEW = "2. subject: the course code and/or subject title, as written."
 KNOWN_ANCHOR = "6. student_id: digits only."
 KNOWN_HEAD = (
-    "\n7. known_instructor: the one instructor in the list below that the written name refers to, copied "
-    "exactly from the list; empty if none clearly fits or no name is written.\n"
-    "8. known_subject: the code of the one subject in the list below that the written subject refers to, "
-    "copied exactly from the list; empty if none clearly fits or no subject is written.\n"
-    "The lists only help to read messy handwriting: instructor and subject above stay exactly as written.\n"
+    "\n7. known_subject: the code of the one subject in the list below that the written subject "
+    "refers to, copied exactly from the list; empty if none clearly fits or no subject is written.\n"
+    "The list only helps to read messy handwriting: subject above stays exactly as written.\n"
 )
 KNOWN_SCHEMA_ANCHOR = '"document_check": {'
 # Layout safety net (both main Gemini prompts): Gemini also reports the rating column headers as
@@ -288,7 +342,51 @@ COLUMN_ORDER_ADD = (
     r"mark is in, not by its position."
 )
 COLUMN_ORDER_SCHEMA_ADD = '"column_order": { "type": "ARRAY", "items": { "type": "STRING" } },\n        '
-KNOWN_SCHEMA_ADD ='"known_instructor": { "type": "STRING" },\n        "known_subject": { "type": "STRING" },\n        '
+KNOWN_SCHEMA_ADD = '"known_subject": { "type": "STRING" },\n        '
+# Phone prompt as built before apply_phone_name_privacy (only used to migrate a live export).
+OLD_PHONE_KNOWN_SCHEMA = '"known_instructor": { "type": "STRING" },\n        '
+OLD_PHONE_KNOWN_EXPR_RE = re.compile(r"\{\{ JSON\.stringify\(\(\(\) => \{ try \{ const k = \$\('"
+                                     + re.escape(PHONE_KNOWN_NAMES) + r"'\)[\s\S]*?\.slice\(1, -1\) \}\}")
+OLD_PHONE_RECONCILE_MARK = "nmKnownInstructor(gText('known_instructor')"
+# phone_reconcile.js as built by apply_phone_name_privacy (local instructor match), before the
+# check-only rule; a live export with this code is replaced by the current phone_reconcile.js.
+PRIVACY_PHONE_RECONCILE_MARK = "$('" + "Phone Instructor Candidates" + "')"
+# Check-only rule (OMR 2026-10-08: only a check or slash counts; the OMR names a rejected mark in
+# omr_debug[].invalid_mark). One line in both main Gemini prompts (no names, no schema change); both
+# reconcilers keep such a row blank (website_src/reconcile.js, phone_reconcile.js: source 'invalid_mark').
+WEB_RECONCILE = "Website Reconcile OCR OMR"
+WEB_GEMINI_NODE = "Website AI Validation"
+WEB_RECONCILE_MARK = "// Python gives the ratings, Gemini cross-checks; text comes from Gemini.\n"
+CHECK_ONLY_ANCHOR = "- Two bubbles shaded in one row -> 'blank'."
+CHECK_ONLY_LINE = ("- Only a check mark or a slash (/) counts as an answer; read an x, a fully shaded bubble, "
+                   "a circle or a dot as 'blank'.")
+# Min-answered rule (teacher, 2026-10-08): fewer than 5 of the 20 items answered -> the form is
+# discarded. The reconcilers decide (auto_discard); 'build flagged record1' then stores the queue row
+# already discarded, the website answer says so, and no staff push is sent.
+WEB_FLAGGED_RECORD = "Website Flagged Record"
+WEB_FLAGGED_RECORD_MARK = "// Queue record for any flagged or failed website page.\n"
+MIN_ANSWERS_MARK = "// min-answered rule (teacher, 2026-10-08)"
+MIN_ANSWERS_ANCHOR = "\nreturn [{ json: record }];"
+MIN_ANSWERS_BLOCK = (
+    "\n" + MIN_ANSWERS_MARK + ": fewer than 5 of the 20 items answered on a reliable scan\n"
+    "// (the reconciler's auto_discard). Stored already discarded, like the website Discard button, so it\n"
+    "// is never counted and nobody has to review it.\n"
+    "if (rec.auto_discard === true) {\n"
+    "  const answered = Number.isInteger(rec.answered_count) ? rec.answered_count : null;\n"
+    "  record.status = 'discarded';\n"
+    "  record.review_action = 'rejected';\n"
+    "  record.review_correction = {\n"
+    "    action: 'rejected',\n"
+    "    auto: true,\n"
+    "    rule: 'min_answered_5',\n"
+    "    note: 'Fewer than 5 of the 20 items were answered' + (answered !== null ? ' (only ' + answered + ')' : '')\n"
+    "      + ', so this form was discarded automatically and is not counted.',\n"
+    "    reviewed_by: null,\n"
+    "    reviewed_by_name: 'Automatic rule',\n"
+    "    at: new Date().toISOString(),\n"
+    "  };\n"
+    "}\n"
+)
 PHONE_IMAGE_ITEM = "$('SAST image from phone').item.json.body.image"
 PHONE_IMAGE_FIRST = "$('SAST image from phone').first().json.body.image"
 INCLUDE_RE = re.compile(r"^// @@include ([\w.]+)\n", re.M)
@@ -334,35 +432,29 @@ def patch_gemini_prompt(body: str, where: str) -> str:
 
 
 def known_names_expression(node_name: str) -> str:
-    """Prompt text with the known lists from the Known Names node (JSON-escaped for the body); empty
-    when the lookup failed, so Gemini then just reads the form as before."""
+    """Prompt text with the known SUBJECT list from the Known Names node (JSON-escaped for the body);
+    never an instructor name (privacy). Empty when the lookup failed or there are no subjects, so
+    Gemini then just reads the form as before."""
     js = ("JSON.stringify((() => { try { const k = $('" + node_name + "').first().json || {}; "
-          "if (!k.instructor_list && !k.subject_list) return ''; "
-          "return " + json.dumps(KNOWN_HEAD) + " + 'Known instructors: ' + (k.instructor_list || 'none') "
-          "+ '\\nKnown subjects (code = title): ' + (k.subject_list || 'none'); "
+          "if (!k.subject_list) return ''; "
+          "return " + json.dumps(KNOWN_HEAD) + " + 'Known subjects (code = title): ' + (k.subject_list || 'none'); "
           "} catch (e) { return ''; } })()).slice(1, -1)")
     if "{{" in js or "}}" in js:
         raise SystemExit("known names expression must not contain '{{' or '}}'")
     return "{{ " + js + " }}"
 
 
-def patch_gemini_known(body: str, node_name: str, where: str) -> str:
-    """Main Gemini OCR prompt: neutral subject hint, the known lists, and two optional schema fields
-    (known_instructor / known_subject); every existing field stays as it was."""
+def patch_gemini_known(body: str, node_name: str, where: str, extra_schema: str = "") -> str:
+    """Main Gemini OCR prompt (phone + website): neutral subject hint, the known SUBJECT list, one
+    optional schema field (known_subject) plus extra_schema; every existing field stays as it was."""
     body = replace_once(body, SUBJECT_HINT_OLD, SUBJECT_HINT_NEW, where)
     body = replace_once(body, KNOWN_ANCHOR, KNOWN_ANCHOR + known_names_expression(node_name), where)
-    return replace_once(body, KNOWN_SCHEMA_ANCHOR, KNOWN_SCHEMA_ADD + KNOWN_SCHEMA_ANCHOR, where)
+    return replace_once(body, KNOWN_SCHEMA_ANCHOR, extra_schema + KNOWN_SCHEMA_ADD + KNOWN_SCHEMA_ANCHOR, where)
 
 
-# --- Website AI Validation only: header crop, confidence, few-shot examples, and no instructor
-# name list sent to Gemini (privacy). Local fuzzy matching against the batch/creditable
-# instructors (form_match.sql, decide.js) is unaffected: only what Gemini itself is told changes.
-KNOWN_HEAD_WEBSITE = (
-    "\n7. known_subject: the code of the one subject in the list below that the written subject "
-    "refers to, copied exactly from the list; empty if none clearly fits or no subject is written.\n"
-    "The list only helps to read messy handwriting: subject above stays exactly as written.\n"
-)
-KNOWN_SCHEMA_ADD_WEBSITE = '"known_subject": { "type": "STRING" },\n        '
+# --- Website AI Validation only: header crop, confidence, few-shot examples. Like the phone, no
+# instructor name list is sent to Gemini (privacy); local fuzzy matching against the batch/creditable
+# instructors (form_match.sql, decide.js) does the instructor match.
 CONFIDENCE_SCHEMA_ADD = (
     '"instructor_confidence": { "type": "STRING", "enum": ["high", "medium", "low"] },\n        '
     '"subject_confidence": { "type": "STRING", "enum": ["high", "medium", "low"] },\n        '
@@ -381,25 +473,10 @@ MAX_OCR_EXAMPLES = 5
 OCR_EXAMPLE_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 
-def known_names_expression_website(node_name: str) -> str:
-    """Website only (privacy): the known SUBJECT list only -- no instructor names are sent to
-    Gemini. Empty when the lookup failed or there are no subjects, same as the phone prompt."""
-    js = ("JSON.stringify((() => { try { const k = $('" + node_name + "').first().json || {}; "
-          "if (!k.subject_list) return ''; "
-          "return " + json.dumps(KNOWN_HEAD_WEBSITE) + " + 'Known subjects (code = title): ' + (k.subject_list || 'none'); "
-          "} catch (e) { return ''; } })()).slice(1, -1)")
-    if "{{" in js or "}}" in js:
-        raise SystemExit("known names expression (website) must not contain '{{' or '}}'")
-    return "{{ " + js + " }}"
-
-
 def patch_gemini_known_website(body: str, node_name: str, where: str) -> str:
-    """Website only: neutral subject hint, the known SUBJECT list (no instructor names), one
-    optional schema field (known_subject) plus the optional per-field confidence enums."""
-    body = replace_once(body, SUBJECT_HINT_OLD, SUBJECT_HINT_NEW, where)
-    body = replace_once(body, KNOWN_ANCHOR, KNOWN_ANCHOR + known_names_expression_website(node_name), where)
-    return replace_once(body, KNOWN_SCHEMA_ANCHOR,
-                        CONFIDENCE_SCHEMA_ADD + KNOWN_SCHEMA_ADD_WEBSITE + KNOWN_SCHEMA_ANCHOR, where)
+    """Website: as the phone (known SUBJECT list, known_subject) plus the optional per-field
+    confidence enums."""
+    return patch_gemini_known(body, node_name, where, CONFIDENCE_SCHEMA_ADD)
 
 
 def header_image_part_expr(page_json_path: str) -> str:
@@ -469,9 +546,16 @@ def few_shot_contents_prefix(examples: list[tuple[bytes, str, dict]]) -> str:
     return ",\n    ".join(turns) + ",\n    "
 
 
-def known_names_node(name, pos, params_js):
-    """Phone: known instructors/subjects for the prompt. A failure goes on with an empty list."""
-    return pg_node(name, pos, read("known_names.sql"), "={{ [ " + params_js + " ] }}", "continueRegularOutput",
+def known_names_node(name, pos):
+    """Phone: known SUBJECTS for the prompt (no instructor names reach Gemini), no query
+    parameters. A failure goes on with an empty list."""
+    return pg_node(name, pos, read("known_names.sql"), None, "continueRegularOutput", always_output=True)
+
+
+def phone_candidates_node(name, pos):
+    """Phone: creditable instructors for the reconciler's local match (never sent to Gemini), no
+    query parameters. A failure goes on (the reconciler then keeps the raw reading)."""
+    return pg_node(name, pos, read("phone_instructor_candidates.sql"), None, "continueRegularOutput",
                    always_output=True)
 
 
@@ -608,6 +692,36 @@ def respond_node(name, pos):
     }
 
 
+# 'Website Identity Check': batch ids, term, student id, task_id, and (stamp rule) the page's stamp
+# ('' when the reconciler did not read exactly one stamp). $json = the reconciler's record.
+_P = "$('Website Prepare Scan').first(0).json"
+IDENTITY_CHECK_PARAMS = "={{ [ " + ", ".join([
+    _P + ".instructor_id",
+    _P + ".subject_id",
+    _P + ".term_id ?? null",
+    "String($json.student_id ?? '').trim()",
+    _P + ".task_id",
+    # two-reader rule: an accepted stamp (auto-reject on a match) or else the stamp_hint (only a note)
+    "($json.stamp_status === 'ok' ? String($json.stamp_no ?? '') : String($json.stamp_hint ?? ''))",
+]) + " ] }}"
+# 'Website Raw Upsert' -> public.save_website_raw_row (migration 015): the Decide record + its stamp.
+_D = "$('Website Decide').first(0).json"
+RAW_UPSERT_PARAMS = "={{ [ " + ", ".join([
+    _D + ".instructor_id",
+    _D + ".subject_id",
+    _D + ".term_id",
+    "(String(" + _D + ".student_id ?? '').trim() || null)",
+    "(String(" + _D + ".instructor_name ?? '').trim() || null)",
+    "(String(" + _D + ".remark ?? '').trim() || null)",
+    _D + ".submitted_date",
+    "(" + _D + ".staff_id || null)",
+    _D + ".task_id",
+    "JSON.stringify(" + _D + ".ratings ?? {})",
+    "(" + _D + ".stamp_no || null)",
+    "(" + _D + ".stamp_no ? (" + _D + ".stamp_source || 'gemini') : null)",
+]) + " ] }}"
+
+
 def build_website_nodes(orig_by_name):
     P = "$('Website Prepare Scan').first(0).json"
     nodes = []
@@ -699,14 +813,7 @@ def build_website_nodes(orig_by_name):
     # --- batch integrity check, the form's instructor/subject vs the database, decision ---
     nodes.append(pg_node(
         "Website Identity Check", [-51968, 12096], read("identity_check.sql"),
-        "={{ [ " + ", ".join([
-            P + ".instructor_id",
-            P + ".subject_id",
-            P + ".term_id ?? null",
-            "String($json.student_id ?? '').trim()",
-            P + ".task_id",
-        ]) + " ] }}",
-        "continueErrorOutput"))
+        IDENTITY_CHECK_PARAMS, "continueErrorOutput"))
     # The form's instructor/subject (Gemini) vs the database: scores only; Decide applies the
     # thresholds. Input: 'Website Identity Check' (either output); its error output -> Decide
     # (form_match_failed). Parameters as an array (n8n drops empty '{{ }}' values).
@@ -725,22 +832,9 @@ def build_website_nodes(orig_by_name):
                          "8f0b6c1e-web0-4d01-9a01-000000000003"))
 
     # --- clean: store the raw row, answer, then hand off to the shared flow ---
-    D = "$('Website Decide').first(0).json"
     nodes.append(pg_node(
         "Website Raw Upsert", [-51296, 12000], read("website_raw_upsert.sql"),
-        "={{ [ " + ", ".join([
-            D + ".instructor_id",
-            D + ".subject_id",
-            D + ".term_id",
-            "(String(" + D + ".student_id ?? '').trim() || null)",
-            "(String(" + D + ".instructor_name ?? '').trim() || null)",
-            "(String(" + D + ".remark ?? '').trim() || null)",
-            D + ".submitted_date",
-            "(" + D + ".staff_id || null)",
-            D + ".task_id",
-            "JSON.stringify(" + D + ".ratings ?? {})",
-        ]) + " ] }}",
-        "continueErrorOutput"))
+        RAW_UPSERT_PARAMS, "continueErrorOutput"))
     nodes.append(if_node("Website Raw Stored?", [-51072, 12000], "={{ $json.saved === true }}",
                          "8f0b6c1e-web0-4d01-9a01-000000000004"))
     nodes.append(code_node("Website Success Response", [-50848, 11904], "website_success_response.js"))
@@ -968,6 +1062,418 @@ def patch_sheet_map_to_target(node):
     node["parameters"]["jsCode"] = prepend_filter(code, SHEET_MAP)
 
 
+# ---------------------------------------------------------------- Google Sheet header matching (2026-10-18)
+# The instructor changed the sheet layout. 'Normalize Sheet Rows' (website_src/sheet_normalize.js) sits
+# between 'Get row(s) in sheet1' and 'get instructor id5' and matches columns by normalised header, so
+# the old and the new layout both reach the unchanged lookups / 'Map to Target Format'. No database change.
+SHEET_GET_ROWS = "Get row(s) in sheet1"
+SHEET_NORMALIZE = "Normalize Sheet Rows"
+SHEET_INSTRUCTOR_LOOKUP = "get instructor id5"
+SHEET_SUBJECT_LOOKUP = "get subject id7"
+
+
+def apply_sheet_header_match(out) -> list[str]:
+    """Idempotent (full build and live export). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (SHEET_GET_ROWS, SHEET_INSTRUCTOR_LOOKUP, SHEET_SUBJECT_LOOKUP, SHEET_MAP):
+        if name not in by_name:
+            raise SystemExit(f"apply_sheet_header_match: no node named {name!r}")
+    done = []
+    new_code = read_js("sheet_normalize.js")
+    if SHEET_NORMALIZE not in by_name:
+        pos = by_name[SHEET_GET_ROWS]["position"]
+        node = code_node(SHEET_NORMALIZE, [pos[0] + 224, pos[1] + 176], "sheet_normalize.js")
+        out["nodes"].append(node)
+        conns = out["connections"]
+        old = conns.get(SHEET_GET_ROWS, {}).get("main", [[]])
+        if old != [[{"node": SHEET_INSTRUCTOR_LOOKUP, "type": "main", "index": 0}]]:
+            raise SystemExit(f"{SHEET_GET_ROWS}: unexpected connections; the input changed")
+        conns[SHEET_GET_ROWS]["main"] = [[{"node": SHEET_NORMALIZE, "type": "main", "index": 0}]]
+        add_connection(conns, SHEET_NORMALIZE, 0, SHEET_INSTRUCTOR_LOOKUP, 0)
+        done.append(f"{SHEET_NORMALIZE}: new node between {SHEET_GET_ROWS} and {SHEET_INSTRUCTOR_LOOKUP}")
+    else:
+        node = by_name[SHEET_NORMALIZE]
+        if node["parameters"]["jsCode"] != new_code:
+            node["parameters"]["jsCode"] = new_code
+            done.append(f"{SHEET_NORMALIZE}: refreshed from sheet_normalize.js")
+    old_ref = "$('Get row(s) in sheet1')"
+    new_ref = "$('Normalize Sheet Rows')"
+    mp = by_name[SHEET_MAP]["parameters"]
+    if old_ref in mp["jsCode"]:
+        if mp["jsCode"].count(old_ref + ".all()") != 1:
+            raise SystemExit(f"{SHEET_MAP}: sheet reference changed; the input changed")
+        mp["jsCode"] = mp["jsCode"].replace(old_ref, new_ref)
+        done.append(f"{SHEET_MAP}: reads {SHEET_NORMALIZE}")
+    opts = by_name[SHEET_SUBJECT_LOOKUP]["parameters"].setdefault("options", {})
+    qr = opts.get("queryReplacement", "")
+    if old_ref in qr:
+        if qr.count(old_ref) != 1:
+            raise SystemExit(f"{SHEET_SUBJECT_LOOKUP}: sheet reference changed; the input changed")
+        opts["queryReplacement"] = qr.replace(old_ref, new_ref)
+        done.append(f"{SHEET_SUBJECT_LOOKUP}: reads {SHEET_NORMALIZE}")
+    return done
+
+
+# ---------------------------------------------------------------- Google Sheet early answer (2026-10-18)
+# 'Google LINK from phone1' used responseMode lastNode: the app's request waited for the whole workflow,
+# including the per-instructor Gemini remark loop (6 s Wait1 each), and the proxy returned 504 while n8n
+# kept running. Now: responseNode. 'Sheet Import Response' answers right after the rows are read, matched
+# and mapped, then 'After Sheet Response' re-emits the mapped rows into If19 (same pattern as
+# 'Respond to Webhook5' -> 'After Correction Response'). A failure before that (Google 403, zero rows)
+# goes through the error outputs of 'Get row(s) in sheet1' / 'Normalize Sheet Rows' to
+# 'Sheet Import Error Response' (HTTP 422). Failures in the database lookups between still give n8n's
+# own 500. No Respond node is downstream of If19.
+SHEET_HOOK = "Google LINK from phone1"
+SHEET_RESPONSE = "Sheet Import Response"
+SHEET_AFTER = "After Sheet Response"
+SHEET_ERROR_RESPONSE = "Sheet Import Error Response"
+SHEET_AFTER_CODE = (
+    "// webhook already answered, now pass the mapped sheet rows to If19\n"
+    "return $('Map to Target Format').all().map((item) => ({ json: item.json }));\n")
+# With 'Create Sheet Import Job' (apply_sheet_import_jobs, migration 018) the answer carries job_id and
+# status 'processing': the counts are what was found, not the final result (the app polls the job). No
+# job (node missing or its insert failed): the earlier answer, unchanged.
+SHEET_RESPONSE_BODY = (
+    "={{ (() => {\n"
+    "  const rows = $('Map to Target Format').all().map((i) => i.json);\n"
+    "  const matched = rows.filter((r) => r.instructor_ID && r.true_subject_id).length;\n"
+    "  const unmatched = rows.length - matched;\n"
+    "  let jobId = null;\n"
+    "  try { const j = $('Create Sheet Import Job').first(); jobId = j && j.json && j.json.id ? String(j.json.id) : null; } catch (e) { jobId = null; }\n"
+    "  if (jobId) {\n"
+    "    return {\n"
+    "      status: 'processing',\n"
+    "      job_id: jobId,\n"
+    "      final: false,\n"
+    "      rows: rows.length,\n"
+    "      matched: matched,\n"
+    "      unmatched: unmatched,\n"
+    "      imported_count: matched,\n"
+    "      error_count: unmatched,\n"
+    "      unmatched_count: unmatched,\n"
+    "      message: 'Found ' + rows.length + ' rows (' + matched + ' matched, ' + unmatched + ' unmatched). "
+    "Saving the rows and the AI remark analysis are still running; these numbers are not final.'\n"
+    "    };\n"
+    "  }\n"
+    "  return {\n"
+    "    status: 'success',\n"
+    "    rows: rows.length,\n"
+    "    matched: matched,\n"
+    "    unmatched: unmatched,\n"
+    "    imported_count: matched,\n"
+    "    error_count: unmatched,\n"
+    "    unmatched_count: unmatched,\n"
+    "    message: 'Imported ' + rows.length + ' rows. Unmatched rows go to Import Errors. "
+    "The AI remark analysis continues in the background.'\n"
+    "  };\n"
+    "})() }}")
+SHEET_ERROR_BODY = (
+    "={{ (() => {\n"
+    "  const raw = $json.error;\n"
+    "  const text = String((raw && (raw.message || raw.description)) || raw || '');\n"
+    "  let message = 'The sheet could not be read: ' + (text || 'unknown error');\n"
+    "  if (/403|permission|forbidden|not have access/i.test(text)) {\n"
+    "    message = 'Google denied access to the sheet. Share the sheet with the service account email as Viewer, then import again.';\n"
+    "  } else if (/404|not found/i.test(text)) {\n"
+    "    message = 'The sheet was not found. Check the link and the tab name (SAST Survey Data).';\n"
+    "  } else if (/no data rows/i.test(text)) {\n"
+    "    message = 'The sheet has no data rows (tab SAST Survey Data).';\n"
+    "  }\n"
+    "  return { status: 'error', error: message, message: message };\n"
+    "})() }}")
+
+
+def apply_sheet_early_response(out) -> list[str]:
+    """Idempotent. Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (SHEET_HOOK, SHEET_MAP, SHARED_ENTRY_CLEAN, SHEET_GET_ROWS, SHEET_NORMALIZE):
+        if name not in by_name:
+            raise SystemExit(f"apply_sheet_early_response: no node named {name!r}")
+    conns = out["connections"]
+    done = []
+    hook = by_name[SHEET_HOOK]["parameters"]
+    if hook.get("responseMode") != "responseNode":
+        hook["responseMode"] = "responseNode"
+        done.append(f"{SHEET_HOOK}: responseMode responseNode")
+    mp = by_name[SHEET_MAP]["position"]
+    if SHEET_RESPONSE not in by_name:
+        out["nodes"].append({
+            "parameters": {"respondWith": "json", "responseBody": SHEET_RESPONSE_BODY,
+                           "options": {"responseCode": 200}},
+            "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.5,
+            "position": [mp[0] + 224, mp[1] + 176], "id": nid(SHEET_RESPONSE), "name": SHEET_RESPONSE})
+        out["nodes"].append({
+            "parameters": {"jsCode": SHEET_AFTER_CODE}, "type": "n8n-nodes-base.code", "typeVersion": 2,
+            "position": [mp[0] + 448, mp[1] + 176], "id": nid(SHEET_AFTER), "name": SHEET_AFTER})
+        out["nodes"].append({
+            "parameters": {"respondWith": "json", "responseBody": SHEET_ERROR_BODY,
+                           "options": {"responseCode": 422}},
+            "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.5,
+            "position": [mp[0] - 448, mp[1] + 352], "id": nid(SHEET_ERROR_RESPONSE),
+            "name": SHEET_ERROR_RESPONSE})
+        main = conns.get(SHEET_MAP, {}).get("main", [])
+        if len(main) != 1 or [c["node"] for c in main[0]] != [SHARED_ENTRY_CLEAN]:
+            raise SystemExit(f"{SHEET_MAP}: expected a single connection to {SHARED_ENTRY_CLEAN}; the input changed")
+        conns[SHEET_MAP]["main"] = [[]]
+        add_connection(conns, SHEET_MAP, 0, SHEET_RESPONSE, 0)
+        add_connection(conns, SHEET_RESPONSE, 0, SHEET_AFTER, 0)
+        add_connection(conns, SHEET_AFTER, 0, SHARED_ENTRY_CLEAN, 0)
+        done.append(f"{SHEET_MAP} -> {SHEET_RESPONSE} -> {SHEET_AFTER} -> {SHARED_ENTRY_CLEAN}")
+    else:
+        by_name[SHEET_RESPONSE]["parameters"]["responseBody"] = SHEET_RESPONSE_BODY
+        by_name[SHEET_ERROR_RESPONSE]["parameters"]["responseBody"] = SHEET_ERROR_BODY
+        by_name[SHEET_AFTER]["parameters"]["jsCode"] = SHEET_AFTER_CODE
+    # error outputs -> clear 422 answer; zero rows: Get rows emits one empty item, Normalize throws
+    get_rows = by_name[SHEET_GET_ROWS]
+    if not get_rows.get("alwaysOutputData"):
+        get_rows["alwaysOutputData"] = True
+        done.append(f"{SHEET_GET_ROWS}: alwaysOutputData (zero rows reach {SHEET_NORMALIZE})")
+    for name in (SHEET_GET_ROWS, SHEET_NORMALIZE):
+        n = by_name[name]
+        if n.get("onError") != "continueErrorOutput":
+            n["onError"] = "continueErrorOutput"
+            done.append(f"{name}: onError continueErrorOutput")
+        main = conns.setdefault(name, {}).setdefault("main", [[]])
+        while len(main) < 2:
+            main.append([])
+        if not any(c["node"] == SHEET_ERROR_RESPONSE for c in main[1]):
+            main[1].append({"node": SHEET_ERROR_RESPONSE, "type": "main", "index": 0})
+            done.append(f"{name} error output -> {SHEET_ERROR_RESPONSE}")
+    return done
+
+
+# ---------------------------------------------------------------- Google Sheet import job (2026-10-18)
+# The early answer made the app say "finished" while n8n was still saving rows and running the Gemini
+# remark loop. Now the import writes public.sheet_import_jobs (migration 018) and the app polls it:
+#   Map to Target Format -> 'Create Sheet Import Job' (status processing, $execution.id) -> Sheet Import
+#   Response (+ job_id) -> After Sheet Response -> If19 ... and, as After Sheet Response's SECOND child,
+#   placed BELOW If19: 'Sheet Import Summary' -> 'Mark Import Job Done' (finished_at + real counts).
+#   executionOrder v1 runs a node's children top to bottom and depth first, so the whole If19 branch
+#   (raw upsert loop, recompute, import_errors, the paced remark loop incl. Wait1) ends before it.
+# Error outputs after the answer -> 'Describe Import Failure' -> 'Mark Import Job Failed' (status
+# error, first failed node + message). Wait1 keeps every feed it had (insert data to student remarks2
+# now has an error output, and it goes to Wait1 too), so the paced loop still advances once per group.
+# A node without an error output that throws, Stop and Error, or a timeout fails the execution: the
+# workflow's own 'Import Job Error Trigger' (n8n runs a failed workflow's Error Trigger when no other
+# error workflow is set) -> 'Mark Import Job Stopped' (status error, failed_node = the last node).
+SHEET_JOB_CREATE = "Create Sheet Import Job"
+SHEET_JOB_SUMMARY = "Sheet Import Summary"
+SHEET_JOB_DONE = "Mark Import Job Done"
+SHEET_JOB_DESCRIBE = "Describe Import Failure"
+SHEET_JOB_FAILED = "Mark Import Job Failed"
+SHEET_JOB_TRIGGER = "Import Job Error Trigger"
+SHEET_JOB_STOPPED = "Mark Import Job Stopped"
+SHEET_IF19 = "If19"
+# (node, output that carries the failure, onError it needs or None = keep, its error output also feeds Wait1)
+SHEET_JOB_FAIL_SOURCES = [
+    (UNIFIED_AI, 1, None, True),
+    (UNIFIED_PARSE, 1, None, True),
+    ("insert data to student remarks2", 1, "continueErrorOutput", True),
+    ("store results2", 1, "continueErrorOutput", False),
+    ("insert to word cloud2", 1, "continueErrorOutput", False),
+    ("update to overall total2", 1, "continueErrorOutput", False),
+    ("Insert import_errors1", 1, None, False),
+    ("If14", 0, None, False),   # If14 true = a raw row came back from the upsert with .error
+]
+_UUID_RE_JS = r"/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i"
+SHEET_JOB_CREATE_PARAMS = (
+    "={{ (() => {\n"
+    "  const rows = $('Map to Target Format').all().map((i) => i.json);\n"
+    "  const matched = rows.filter((r) => r.instructor_ID && r.true_subject_id).length;\n"
+    "  const hook = $('Google LINK from phone1').first().json || {};\n"
+    "  const uid = String((hook.body || {}).user_id || '');\n"
+    "  return [rows.length, matched, rows.length - matched, String($execution.id || ''), "
+    + _UUID_RE_JS + ".test(uid) ? uid : ''];\n"
+    "})() }}")
+SHEET_JOB_FAILED_PARAMS = "={{ [ String($execution.id || ''), String($json.failed_node || ''), String($json.message || '') ] }}"
+SHEET_JOB_DONE_PARAMS = ("={{ [ $json.job_id, $json.rows, $json.matched, $json.unmatched, $json.imported_count, "
+                         "$json.error_count, $json.ai_groups, $json.ai_failed, $json.has_problems ? true : false, "
+                         "String($json.first_failed_node || ''), String($json.message || '') ] }}")
+SHEET_JOB_STOPPED_PARAMS = (
+    "={{ (() => {\n"
+    "  const ex = $json.execution || {};\n"
+    "  const node = String(ex.lastNodeExecuted || '');\n"
+    "  const err = ex.error || {};\n"
+    "  const text = String(err.message || err.description || 'unknown error').replace(/\\s+/g, ' ').slice(0, 400);\n"
+    "  return [String(ex.id || ''), node, 'The import stopped at step \"' + (node || 'unknown') + '\": ' + text + "
+    "'. Rows saved before that step are kept. Check Import Errors and the dashboard before importing this sheet again.'];\n"
+    "})() }}")
+
+
+def _sheet_job_order(by_name) -> list[str]:
+    """Positions that the execution order depends on (executionOrder v1: siblings run top first).
+    'Sheet Import Summary' must be BELOW If19 (it runs after the whole If19 branch); 'Describe Import
+    Failure' ABOVE Wait1 (the failure is recorded before the loop goes on). Moves only what is wrong."""
+    done = []
+    if19 = by_name[SHEET_IF19]["position"]
+    for name, dx in ((SHEET_JOB_SUMMARY, 0), (SHEET_JOB_DONE, 224)):
+        n = by_name.get(name)
+        if n and n["position"][1] <= if19[1]:
+            base = by_name[SHEET_AFTER]["position"]
+            n["position"] = [base[0] + 224 + dx, max(base[1], if19[1]) + 224]
+            done.append(f"{name} moved below {SHEET_IF19}")
+    wait = by_name[REMARK_LOOP_WAIT]["position"]
+    for name, dx in ((SHEET_JOB_DESCRIBE, 224), (SHEET_JOB_FAILED, 448)):
+        n = by_name.get(name)
+        if n and n["position"][1] >= wait[1]:
+            n["position"] = [wait[0] + dx, wait[1] - 560]
+            done.append(f"{name} moved above {REMARK_LOOP_WAIT}")
+    return done
+
+
+def apply_sheet_import_jobs(out) -> list[str]:
+    """Idempotent (full build and live export; after apply_sheet_early_response and
+    apply_gemini_rate_limit). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (SHEET_MAP, SHEET_RESPONSE, SHEET_AFTER, SHEET_IF19, REMARK_LOOP_WAIT,
+                 *[s[0] for s in SHEET_JOB_FAIL_SOURCES]):
+        if name not in by_name:
+            raise SystemExit(f"apply_sheet_import_jobs: no node named {name!r}")
+    if (out.get("settings") or {}).get("executionOrder") != "v1":
+        raise SystemExit("apply_sheet_import_jobs: needs settings.executionOrder v1 (the done marker runs last)")
+    if (out.get("settings") or {}).get("errorWorkflow"):
+        raise SystemExit("apply_sheet_import_jobs: an error workflow is set; the own Error Trigger would never run")
+    conns = out["connections"]
+    done = []
+
+    def ensure_pg(name, pos, sql_file, params, execute_once=True):
+        sql = read(sql_file)
+        n = by_name.get(name)
+        if n is None:
+            n = pg_node(name, pos, sql, params, "continueRegularOutput")
+            if execute_once:
+                n["executeOnce"] = True
+            out["nodes"].append(n)
+            by_name[name] = n
+            done.append(f"{name}: new node ({sql_file})")
+            return n
+        assert_no_param_in_sql_comments(name, sql)
+        p = n["parameters"]
+        if p.get("query") != sql or p.get("options", {}).get("queryReplacement") != params:
+            p["query"] = sql
+            p.setdefault("options", {})["queryReplacement"] = params
+            done.append(f"{name}: refreshed from {sql_file}")
+        if execute_once and not n.get("executeOnce"):
+            n["executeOnce"] = True
+            done.append(f"{name}: executeOnce")
+        if n.get("onError") != "continueRegularOutput":
+            n["onError"] = "continueRegularOutput"
+            done.append(f"{name}: onError continueRegularOutput")
+        return n
+
+    def ensure_code(name, pos, src_file):
+        code = read_js(src_file)
+        n = by_name.get(name)
+        if n is None:
+            n = code_node(name, pos, src_file, "continueRegularOutput")
+            out["nodes"].append(n)
+            by_name[name] = n
+            done.append(f"{name}: new node ({src_file})")
+        elif n["parameters"].get("jsCode") != code:
+            n["parameters"]["jsCode"] = code
+            done.append(f"{name}: refreshed from {src_file}")
+        return n
+
+    def connect(src, idx, dst):
+        before = json.dumps(conns.get(src), sort_keys=True)
+        add_connection(conns, src, idx, dst, 0)
+        if json.dumps(conns.get(src), sort_keys=True) != before:
+            done.append(f"{src}[{idx}] -> {dst}")
+
+    # 1. the job row, before the early answer
+    mp = by_name[SHEET_MAP]["position"]
+    ensure_pg(SHEET_JOB_CREATE, [mp[0] + 112, mp[1] + 352], "sheet_job_create.sql", SHEET_JOB_CREATE_PARAMS)
+    if targets_of(conns, SHEET_MAP, 0) == [SHEET_RESPONSE]:
+        conns[SHEET_MAP]["main"][0] = []
+        done.append(f"{SHEET_MAP} -> {SHEET_JOB_CREATE} -> {SHEET_RESPONSE}")
+    elif targets_of(conns, SHEET_MAP, 0) != [SHEET_JOB_CREATE]:
+        raise SystemExit(f"{SHEET_MAP}: expected one connection to {SHEET_RESPONSE}; the input changed")
+    add_connection(conns, SHEET_MAP, 0, SHEET_JOB_CREATE, 0)
+    connect(SHEET_JOB_CREATE, 0, SHEET_RESPONSE)
+    if targets_of(conns, SHEET_JOB_CREATE, 0) != [SHEET_RESPONSE]:
+        raise SystemExit(f"{SHEET_JOB_CREATE}: unexpected connections; the input changed")
+
+    # 2. the done marker: After Sheet Response's second child, below If19
+    if targets_of(conns, SHEET_AFTER, 0) not in ([SHEET_IF19], [SHEET_IF19, SHEET_JOB_SUMMARY]):
+        raise SystemExit(f"{SHEET_AFTER}: unexpected connections; the input changed")
+    ap, if19 = by_name[SHEET_AFTER]["position"], by_name[SHEET_IF19]["position"]
+    low = max(ap[1], if19[1]) + 224
+    ensure_code(SHEET_JOB_SUMMARY, [ap[0] + 224, low], "sheet_job_summary.js")
+    ensure_pg(SHEET_JOB_DONE, [ap[0] + 448, low], "sheet_job_done.sql", SHEET_JOB_DONE_PARAMS)
+    connect(SHEET_AFTER, 0, SHEET_JOB_SUMMARY)
+    connect(SHEET_JOB_SUMMARY, 0, SHEET_JOB_DONE)
+
+    # 3. failures after the answer that do not stop the import
+    wp = by_name[REMARK_LOOP_WAIT]["position"]
+    ensure_code(SHEET_JOB_DESCRIBE, [wp[0] + 224, wp[1] - 560], "sheet_job_failure.js")
+    ensure_pg(SHEET_JOB_FAILED, [wp[0] + 448, wp[1] - 560], "sheet_job_failed.sql", SHEET_JOB_FAILED_PARAMS)
+    connect(SHEET_JOB_DESCRIBE, 0, SHEET_JOB_FAILED)
+    for src, idx, mode, feeds_wait in SHEET_JOB_FAIL_SOURCES:
+        n = by_name[src]
+        if mode and n.get("onError") != mode:
+            if idx == 1 and targets_of(conns, src, 1):
+                raise SystemExit(f"{src}: output 1 already used; the input changed")
+            n["onError"] = mode
+            done.append(f"{src}: onError {mode}")
+        if idx == 1 and n["type"] != "n8n-nodes-base.if" and n.get("onError") != "continueErrorOutput":
+            raise SystemExit(f"{src}: has no error output; the input changed")
+        if feeds_wait:
+            connect(src, idx, REMARK_LOOP_WAIT)
+        connect(src, idx, SHEET_JOB_DESCRIBE)
+
+    # 4. the execution itself failed: this workflow's own Error Trigger
+    if SHEET_JOB_TRIGGER not in by_name:
+        n = {"parameters": {}, "type": "n8n-nodes-base.errorTrigger", "typeVersion": 1,
+             "position": [ap[0], low + 224], "id": nid(SHEET_JOB_TRIGGER), "name": SHEET_JOB_TRIGGER}
+        out["nodes"].append(n)
+        by_name[SHEET_JOB_TRIGGER] = n
+        done.append(f"{SHEET_JOB_TRIGGER}: new node")
+    ensure_pg(SHEET_JOB_STOPPED, [ap[0] + 224, low + 224], "sheet_job_stopped.sql", SHEET_JOB_STOPPED_PARAMS)
+    connect(SHEET_JOB_TRIGGER, 0, SHEET_JOB_STOPPED)
+
+    done += _sheet_job_order(by_name)
+    return done
+
+
+def targets_of(conns, src, idx):
+    outs = conns.get(src, {}).get("main", [])
+    return [c["node"] for c in (outs[idx] if idx < len(outs) and outs[idx] else [])]
+
+
+# ---------------------------------------------------------------- placeholder comments -> NULL (2026-10-18)
+# 'N/A', 'none', ... are not comments: the raw row stores NULL (Code in JavaScript, Website Decide) and the
+# remark AI paths never see them (so student_remarks gets no "N/A" row). website_src/remark_clean.js.
+REMARK_CLEAN_MARK = "// remark placeholders, from website_src/remark_clean.js"
+REMARK_CLEAN_EDITS = [
+    (CODE_IN_JS, "maskProfanity(String(r['Remarks & Suggestions'] ?? '').trim()) || null",
+     "maskProfanity(cleanRemark(r['Remarks & Suggestions']) || '') || null"),
+    ("Group feedback by instructor1", 'String(\n      data["Remarks & Suggestions"] ??\n      data.remark ??\n      ""\n    ).trim()',
+     'cleanRemark(\n      data["Remarks & Suggestions"] ??\n      data.remark ??\n      ""\n    ) || ""'),
+    ("Prepare New Student Data1", 'String(\n      data["Remarks & Suggestions"] || ""\n    ).trim()',
+     'cleanRemark(\n      data["Remarks & Suggestions"] || ""\n    ) || ""'),
+]
+
+
+def apply_remark_placeholders(out) -> list[str]:
+    """Idempotent (full build and live export). Website Decide / Normalize Sheet Rows get the helper from
+    their sources (refreshed elsewhere). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name, old, new in REMARK_CLEAN_EDITS:
+        if name not in by_name:
+            raise SystemExit(f"apply_remark_placeholders: no node named {name!r}")
+        code = by_name[name]["parameters"]["jsCode"]
+        if REMARK_CLEAN_MARK in code:
+            continue
+        code = replace_once(code, old, new, name)
+        by_name[name]["parameters"]["jsCode"] = helper_block("remark_clean.js") + "\n" + code
+        done.append(f"{name}: placeholder comments -> blank/NULL")
+    wd = by_name.get("Website Decide")
+    if wd is not None and wd["parameters"]["jsCode"] != read_js("decide.js"):
+        raise SystemExit("Website Decide: not the current decide.js; run the stamp refresh first")
+    return done
+
+
 def patch_correction_map(node):
     """'Map target' (sast-manual-correction) / 'Map target1' (import-error-correction): the
     corrected remark is typed text -> deterministic sexual-word mask (no image re-check). These
@@ -1068,7 +1574,7 @@ def add_phone_remark_check(out):
 
 def add_phone_known_names(out):
     """Phone scans: 'image to ocr and omr python' -> 'Phone Known Names' -> the Gemini call, whose
-    prompt lists the known instructors/subjects. The Gemini body reads the phone image with
+    prompt lists the known subjects (no instructor names). The Gemini body reads the phone image with
     .first() (one scan per execution) instead of .item, so the extra node never breaks item pairing."""
     conns = out["connections"]
     by_name = {n["name"]: n for n in out["nodes"]}
@@ -1077,7 +1583,7 @@ def add_phone_known_names(out):
         raise SystemExit(f"{PHONE_OMR_NODE} does not feed only {PHONE_GEMINI_NODE}: {outs}; the input changed")
     outs[0] = []
     a, b = by_name[PHONE_OMR_NODE]["position"], by_name[PHONE_GEMINI_NODE]["position"]
-    out["nodes"].append(known_names_node(PHONE_KNOWN_NAMES, [(a[0] + b[0]) // 2, max(a[1], b[1]) + 176], "null"))
+    out["nodes"].append(known_names_node(PHONE_KNOWN_NAMES, [(a[0] + b[0]) // 2, max(a[1], b[1]) + 176]))
     add_connection(conns, PHONE_OMR_NODE, 0, PHONE_KNOWN_NAMES, 0)
     add_connection(conns, PHONE_KNOWN_NAMES, 0, PHONE_GEMINI_NODE, 0)
     gem = by_name[PHONE_GEMINI_NODE]["parameters"]
@@ -1085,26 +1591,705 @@ def add_phone_known_names(out):
     gem["jsonBody"] = patch_gemini_known(body, PHONE_KNOWN_NAMES, PHONE_GEMINI_NODE)
 
 
+def add_phone_instructor_candidates(out):
+    """Phone scans: 'Is not a SAST form?' (false) -> 'Phone Instructor Candidates' -> 'Phone Remark
+    Check'. After the Gemini call, so the list can never be put into a prompt; the remark check and
+    the reconciler read their inputs by node name, so the extra node changes nothing else."""
+    conns = out["connections"]
+    by_name = {n["name"]: n for n in out["nodes"]}
+    outs = conns[PHONE_NOT_FORM_NODE]["main"]
+    if len(outs) < 2 or [c["node"] for c in outs[1]] != [PHONE_REMARK_CHECK]:
+        raise SystemExit(f"{PHONE_NOT_FORM_NODE}[1] is not just {PHONE_REMARK_CHECK}: {outs}; the input changed")
+    outs[1] = []
+    a, b = by_name[PHONE_NOT_FORM_NODE]["position"], by_name[PHONE_REMARK_CHECK]["position"]
+    out["nodes"].append(phone_candidates_node(PHONE_CANDIDATES, [(a[0] + b[0]) // 2, max(a[1], b[1]) + 176]))
+    add_connection(conns, PHONE_NOT_FORM_NODE, 1, PHONE_CANDIDATES, 0)
+    add_connection(conns, PHONE_CANDIDATES, 0, PHONE_REMARK_CHECK, 0)
+
+
+def refresh_helper_copies(out, name: str) -> list[str]:
+    """Replace every copy of a shared helper (website_src/<name>, between its marker lines) in the
+    Code nodes with the current source. Returns the node names that changed."""
+    title = HELPER_HEADERS[name]
+    start, end = f"// {title}, from website_src/{name}\n", f"// end of {title}\n"
+    changed = []
+    for n in out["nodes"]:
+        code = n.get("parameters", {}).get("jsCode")
+        if not isinstance(code, str) or start not in code:
+            continue
+        i = code.index(start)
+        j = code.index(end, i) + len(end)
+        new = code[:i] + helper_block(name) + code[j:]
+        if new != code:
+            n["parameters"]["jsCode"] = new
+            changed.append(n["name"])
+    return changed
+
+
+def assert_no_instructor_names_to_gemini(out):
+    """Privacy: no Gemini request (HTTP body or LLM chain prompt) may carry an instructor list or
+    read a node that returns instructor names."""
+    for n in out["nodes"]:
+        p = n.get("parameters", {})
+        is_gemini = ("generativelanguage.googleapis.com" in str(p.get("url", ""))
+                     or n.get("type", "").startswith("@n8n/n8n-nodes-langchain."))
+        if not is_gemini:
+            continue
+        text = json.dumps(p, ensure_ascii=False)
+        hits = [m for m in INSTRUCTOR_LIST_MARKERS if m in text or json.dumps(m)[1:-1] in text]
+        if hits:
+            raise SystemExit(f"{n['name']}: Gemini request carries instructor names ({hits}); privacy rule")
+
+
+def apply_phone_name_privacy(out) -> list[str]:
+    """No instructor names to Gemini on the phone branch (idempotent; works on the full build and
+    on a live export of an earlier build). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    kn = by_name[PHONE_KNOWN_NAMES]
+    if kn["parameters"].get("query") != read("known_names.sql") or kn["parameters"].get("options"):
+        assert_no_param_in_sql_comments(PHONE_KNOWN_NAMES, read("known_names.sql"))
+        kn["parameters"]["query"] = read("known_names.sql")
+        kn["parameters"]["options"] = {}
+        done.append(f"{PHONE_KNOWN_NAMES}: known_names.sql (subjects only, no parameters)")
+    gem = by_name[PHONE_GEMINI_NODE]["parameters"]
+    body = gem["jsonBody"]
+    if OLD_PHONE_KNOWN_SCHEMA in body or "Known instructors" in body:
+        if len(OLD_PHONE_KNOWN_EXPR_RE.findall(body)) != 1:
+            raise SystemExit(f"{PHONE_GEMINI_NODE}: old known-names expression not found exactly once; the input changed")
+        body = OLD_PHONE_KNOWN_EXPR_RE.sub(lambda m: known_names_expression(PHONE_KNOWN_NAMES), body)
+        body = replace_once(body, OLD_PHONE_KNOWN_SCHEMA, "", PHONE_GEMINI_NODE)
+        gem["jsonBody"] = body
+        done.append(f"{PHONE_GEMINI_NODE}: subject list only, no known_instructor")
+    rec = by_name[PHONE_RECONCILE]["parameters"]
+    new_rec = read_js("phone_reconcile.js")
+    if rec["jsCode"] != new_rec:
+        if OLD_PHONE_RECONCILE_MARK not in rec["jsCode"] and PRIVACY_PHONE_RECONCILE_MARK not in rec["jsCode"]:
+            raise SystemExit(f"{PHONE_RECONCILE}: neither a previous build nor phone_reconcile.js (hand edit?)")
+        rec["jsCode"] = new_rec
+        done.append(f"{PHONE_RECONCILE}: phone_reconcile.js (local instructor match, check-only rule)")
+    changed = [n for n in refresh_helper_copies(out, "name_match.js") if n != PHONE_RECONCILE]
+    if changed:
+        done.append(f"name_match.js refreshed in {', '.join(changed)}")
+    if PHONE_CANDIDATES not in by_name:
+        add_phone_instructor_candidates(out)
+        done.append(f"added {PHONE_CANDIDATES}: {PHONE_NOT_FORM_NODE}[false] -> {PHONE_CANDIDATES} -> {PHONE_REMARK_CHECK}")
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+def apply_check_only_rule(out) -> list[str]:
+    """Check-only rule (idempotent; full build and live export): one line in both main Gemini prompts,
+    and the website reconciler refreshed from website_src/reconcile.js (the phone one is refreshed by
+    apply_phone_name_privacy). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        if CHECK_ONLY_LINE not in gem["jsonBody"]:
+            gem["jsonBody"] = replace_once(gem["jsonBody"], CHECK_ONLY_ANCHOR,
+                                           CHECK_ONLY_LINE + r"\n" + CHECK_ONLY_ANCHOR, name)
+            done.append(f"{name}: check-only prompt line")
+    rec = by_name[WEB_RECONCILE]["parameters"]
+    new_rec = read_js("reconcile.js")
+    if rec["jsCode"] != new_rec:
+        if not rec["jsCode"].startswith(WEB_RECONCILE_MARK):
+            raise SystemExit(f"{WEB_RECONCILE}: not a previous build of reconcile.js (hand edit?)")
+        rec["jsCode"] = new_rec
+        done.append(f"{WEB_RECONCILE}: reconcile.js (check-only rule)")
+    if CHECK_ONLY_LINE not in by_name[PHONE_GEMINI_NODE]["parameters"]["jsonBody"]:
+        raise SystemExit("check-only prompt line missing")
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+def apply_min_answers_rule(out) -> list[str]:
+    """Min-answered rule (idempotent; full build and live export): a form with fewer than 5 of the
+    20 items answered on a reliable scan is stored in failed_scan_queue already discarded. The two
+    reconcilers (refreshed by apply_check_only_rule / apply_phone_name_privacy) set auto_discard;
+    here: 'Website Flagged Record' passes it on, 'build flagged record1' stores the row discarded,
+    the website answer says so, and the staff push is skipped. Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    wfr = by_name[WEB_FLAGGED_RECORD]["parameters"]
+    new_wfr = read_js("flagged_record.js")
+    if wfr["jsCode"] != new_wfr:
+        if not wfr["jsCode"].startswith(WEB_FLAGGED_RECORD_MARK):
+            raise SystemExit(f"{WEB_FLAGGED_RECORD}: not a previous build of flagged_record.js (hand edit?)")
+        wfr["jsCode"] = new_wfr
+        done.append(f"{WEB_FLAGGED_RECORD}: flagged_record.js (auto_discard, answered_count)")
+    bf = by_name[BUILD_FLAGGED]["parameters"]
+    if MIN_ANSWERS_MARK not in bf["jsCode"]:
+        if bf["jsCode"].count(MIN_ANSWERS_ANCHOR) != 1:
+            raise SystemExit(f"{BUILD_FLAGGED}: return line not found exactly once; the input changed")
+        bf["jsCode"] = bf["jsCode"].replace(MIN_ANSWERS_ANCHOR, MIN_ANSWERS_BLOCK + MIN_ANSWERS_ANCHOR)
+        done.append(f"{BUILD_FLAGGED}: auto_discard -> status 'discarded'")
+    resp = by_name[FLAGGED_RESPOND]["parameters"]
+    new_resp = flagged_respond_expression()
+    if resp.get("responseBody") != new_resp:
+        body = str(resp.get("responseBody", ""))
+        if "$('Website Flagged Record')" not in body or "Flagged for manual review" not in body:
+            raise SystemExit(f"{FLAGGED_RESPOND}: not a previous build of the website contract (hand edit?)")
+        resp["responseBody"] = new_resp
+        done.append(f"{FLAGGED_RESPOND}: 'Discarded automatically' message")
+    opts = by_name[FLAGGED_FCM]["parameters"].setdefault("options", {})
+    if opts.get("queryReplacement") != FLAGGED_FCM_PARAMS:
+        if opts.get("queryReplacement") != FLAGGED_FCM_PARAMS_V1:
+            raise SystemExit(f"{FLAGGED_FCM}: unexpected parameters; the input changed")
+        opts["queryReplacement"] = FLAGGED_FCM_PARAMS
+        done.append(f"{FLAGGED_FCM}: no push for a discarded form")
+    for name, src in ((WEB_RECONCILE, "reconcile.js"), (PHONE_RECONCILE, "phone_reconcile.js")):
+        if by_name[name]["parameters"]["jsCode"] != read_js(src):
+            raise SystemExit(f"{name}: not the current {src}; run the reconciler refresh first")
+    return done
+
+
+# Word cloud words (apply_wordcloud_words): real word counts computed in code, added next to the AI themes.
+GET_PREVIOUS_ANALYSIS = "Get Previous Instructor Analysis1"
+PREPARE_UNIFIED_INPUT = "Prepare Unified AI Input1"
+GET_OLD_WORDCLOUD = "Get the old wordcloud1"
+PREPARE_EXISTING_WORDCLOUD = "Prepare Existing Wordcloud1"
+PREPARE_INDIVIDUAL_INPUT = "Prepare Individual AI Input1"
+WORDS_MARK = "instructor_name_tokens"
+WORDS_LIMIT_UNIFIED = 60   # batch path: the top N real words per instructor and batch (plus the themes)
+# The instructor's name tokens (lowercase letters only), looked up in the database for the word counter.
+# They stay inside n8n: no AI node reads them.
+NAME_TOKENS_SQL = (
+    "COALESCE((SELECT jsonb_agg(DISTINCT t.tok) FROM (SELECT lower(x) AS tok FROM public.user_info ui, "
+    "regexp_split_to_table(coalesce(ui.first_name, '') || ' ' || coalesce(ui.last_name, ''), '[^[:alpha:]]+') AS x "
+    "WHERE ui.id = $1::uuid) t WHERE length(t.tok) >= 2), '[]'::jsonb)")
+GET_OLD_WORDCLOUD_QUERY_V1 = ("SELECT\n    word,\n    count\nFROM public.instructor_wordcloud\n"
+                              "WHERE instructor_id = $1::uuid\n  AND term_id = $2::uuid\nORDER BY count DESC;")
+GET_OLD_WORDCLOUD_QUERY = (
+    "SELECT w.word, w.count, n.tokens AS instructor_name_tokens\n"
+    "FROM (SELECT " + NAME_TOKENS_SQL + " AS tokens) n\n"
+    "LEFT JOIN public.instructor_wordcloud w\n"
+    "  ON w.instructor_id = $1::uuid AND w.term_id = $2::uuid\n"
+    "ORDER BY w.count DESC NULLS LAST;")
+WORDS_BLOCK_UNIFIED = (
+    "const finalKeywords =\n  keywords.slice(0, 10);\n\n"
+    "// real word counts from the remarks (code only), merged with the themes before the upsert\n"
+    "let cloudWords = finalKeywords;\n"
+    "if (Array.isArray(original.instructor_name_tokens)) {\n"
+    "  cloudWords = mergeWordCounts(finalKeywords, remarkWords(feedback.map((f) => f.remark), "
+    "original.instructor_name_tokens, profaneKeyword, " + str(WORDS_LIMIT_UNIFIED) + "), 'new_count');\n"
+    "}\n")
+WORDS_BLOCK_INDIVIDUAL = (
+    "// real word counts from this remark (code only), merged with the themes before the upsert\n"
+    "if (Array.isArray(original.instructor_name_tokens)) {\n"
+    "  const themes = keywords.filter((k) => k && k.word).map((k) => ({ word: String(k.word).trim(), count: 1 }));\n"
+    "  const words = remarkWords([original.new_student_remark], original.instructor_name_tokens, profaneKeyword)\n"
+    "    .map((w) => ({ word: w.word, count: w.new_count }));\n"
+    "  keywords = mergeWordCounts(themes, words, 'count');\n"
+    "}\n\n")
+
+
+def add_remark_words_helper(code: str, where: str) -> str:
+    """Put website_src/remark_words.js after the sexual-word filter (once; refreshed when present)."""
+    title = HELPER_HEADERS["remark_words.js"]
+    start, end = f"// {title}, from website_src/remark_words.js\n", f"// end of {title}\n"
+    if start in code:
+        i = code.index(start)
+        j = code.index(end, i) + len(end)
+        return code[:i] + helper_block("remark_words.js") + code[j:]
+    return replace_once(code, "// end of sexual-word filter\n",
+                        "// end of sexual-word filter\n" + helper_block("remark_words.js"), where)
+
+
+# ---------------------------------------------------------------- AI sentences (2026-10-18)
+# Root cause of the run-on paragraph: the grouped path asked Gemini for ONE string, which came back as
+# comma-joined fragments; the single-scan path asked for arrays of short theme names and the Postgres
+# node (`$5::text`) turned the array into "a,b,c". Both prompts now ask for 2-5 full sentences as a
+# JSON array; both parsers store them as ONE text value, one sentence per line (website_src/ai_sentences.js).
+AI_SENTENCES_MARK = "// AI sentences, from website_src/ai_sentences.js"
+SENTENCE_RULES = (
+    "Return {what} as a JSON array of 3 to 5 short, complete sentences.\n\n"
+    "Each sentence is one separate point: a full sentence in plain English that ends with a period.\n\n"
+    "Never one long paragraph, never comma-joined fragments, never bullets or numbering inside a sentence.\n\n"
+    "Never use an instructor name. Do not invent information.\n\n"
+    "{hist}\n")
+SENTENCE_HISTORY = (
+    "The {prev} may hold this as one paragraph or as separate lines: use it only as evidence "
+    "and write it again as separate sentences, merged with the new evidence.")
+UNIFIED_EXAMPLE_V1 = '    "positives": ["Clear, complete sentence."],\n    "improvements": ["Clear, complete sentence."],\n'
+UNIFIED_EXAMPLE_NEW = (
+    '    "positives": [\n      "First complete sentence.",\n      "Second complete sentence.",\n      "Third complete sentence."\n    ],\n'
+    '    "improvements": [\n      "First complete sentence.",\n      "Second complete sentence.",\n      "Third complete sentence."\n    ],\n')
+INDIVIDUAL_EXAMPLE_V1 = (
+    '  "positive_themes": [\n    "The instructor explains difficult topics clearly."\n  ],\n'
+    '  "improvement_insights": [\n    "More worked examples would help students follow the lessons."\n  ],\n')
+INDIVIDUAL_EXAMPLE_NEW = (
+    '  "positive_themes": [\n    "The instructor explains difficult topics clearly.",\n'
+    '    "The lessons are well prepared and organized.",\n    "Grading is fair and consistent."\n  ],\n'
+    '  "improvement_insights": [\n    "More worked examples would help students follow the lessons.",\n'
+    '    "The pace of some discussions could be slower.",\n    "Quizzes could be shorter."\n  ],\n')
+UNIFIED_AI_EDITS = [
+    ("Do not invent strengths.\n",
+     "Do not invent strengths.\n\n"
+     + SENTENCE_RULES.format(what='"positives"', hist=SENTENCE_HISTORY.format(prev="historical analysis"))),
+    ("Do not invent problems.\n",
+     "Do not invent problems.\n\n"
+     + SENTENCE_RULES.format(what='"improvements"', hist=SENTENCE_HISTORY.format(prev="historical analysis"))),
+    ('    "positives": "",\n    "improvements": "",\n',
+     '    "positives": ["Clear, complete sentence."],\n    "improvements": ["Clear, complete sentence."],\n'),
+    ("- evaluation fields are strings\n",
+     "- interpretation and suggestion are strings\n"
+     "- positives and improvements are arrays of 3 to 5 complete sentences, each ending with a period\n"),
+]
+INDIVIDUAL_AI_EDITS = [
+    ("Avoid duplicates and different phrases describing the same concept.\n\n"
+     "==================================================\nIMPROVEMENT INSIGHTS\n",
+     "Avoid duplicates and different phrases describing the same concept.\n\n"
+     + SENTENCE_RULES.format(what='"positive_themes"', hist=SENTENCE_HISTORY.format(prev="existing AI analysis"))
+     + "\n==================================================\nIMPROVEMENT INSIGHTS\n"),
+    ("Avoid duplicates and different phrases describing the same concept.\n\n"
+     "==================================================\nAI SUGGESTION\n",
+     "Avoid duplicates and different phrases describing the same concept.\n\n"
+     + SENTENCE_RULES.format(what='"improvement_insights"', hist=SENTENCE_HISTORY.format(prev="existing AI analysis"))
+     + "\n==================================================\nAI SUGGESTION\n"),
+    ('  "positive_themes": [\n    "Teaching clarity"\n  ],\n  "improvement_insights": [\n    "Examples"\n  ],\n',
+     '  "positive_themes": [\n    "The instructor explains difficult topics clearly."\n  ],\n'
+     '  "improvement_insights": [\n    "More worked examples would help students follow the lessons."\n  ],\n'),
+]
+AI_SENTENCES_PARSE_EDITS = {
+    UNIFIED_PARSE: [
+        ("    cleanText(\n      rawEvaluation.positives\n    )", "    aiSentences(\n      rawEvaluation.positives\n    )"),
+        ("    cleanText(\n      rawEvaluation.improvements\n    )", "    aiSentences(\n      rawEvaluation.improvements\n    )")],
+    INDIVIDUAL_PARSE: [
+        ("    positive_themes: result.positive_themes || [],\n",
+         "    positive_themes: aiSentences(result.positive_themes),\n"),
+        ("    improvement_insights: result.improvement_insights || [],\n",
+         "    improvement_insights: aiSentences(result.improvement_insights),\n")],
+}
+
+
+def apply_ai_sentences(out) -> list[str]:
+    """Idempotent (full build and live export). Prompts ask for sentence arrays; both parsers turn the
+    answer (array or string, old format included) into one clean sentence per line. Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (UNIFIED_AI, INDIVIDUAL_AI, UNIFIED_PARSE, INDIVIDUAL_PARSE):
+        if name not in by_name:
+            raise SystemExit(f"apply_ai_sentences: no node named {name!r}")
+    done = []
+    for name, edits in ((UNIFIED_AI, UNIFIED_AI_EDITS), (INDIVIDUAL_AI, INDIVIDUAL_AI_EDITS)):
+        text = by_name[name]["parameters"]["text"]
+        if "2 to 5 short, complete sentences" in text:
+            text = text.replace("2 to 5", "3 to 5").replace(UNIFIED_EXAMPLE_V1, UNIFIED_EXAMPLE_NEW)                 .replace(INDIVIDUAL_EXAMPLE_V1, INDIVIDUAL_EXAMPLE_NEW)
+            by_name[name]["parameters"]["text"] = text
+            done.append(f"{name}: prompt now asks for 3 to 5 sentences")
+        elif "3 to 5 short, complete sentences" not in text:
+            for old, new in edits:
+                text = replace_once(text, old, new, name)
+            by_name[name]["parameters"]["text"] = text
+            done.append(f"{name}: prompt asks for sentence arrays")
+    title = HELPER_HEADERS["ai_sentences.js"]
+    end = f"// end of {title}\n"
+    for name, edits in AI_SENTENCES_PARSE_EDITS.items():
+        old_code = by_name[name]["parameters"]["jsCode"]
+        code = old_code
+        if AI_SENTENCES_MARK in code:
+            i = code.index(AI_SENTENCES_MARK)
+            code = code[:i] + helper_block("ai_sentences.js") + code[code.index(end, i) + len(end):]
+        else:
+            for old, repl in edits:
+                code = replace_once(code, old, repl, name)
+            code = replace_once(code, "// end of remark words\n",
+                                "// end of remark words\n" + helper_block("ai_sentences.js"), name)
+        if code != old_code:
+            by_name[name]["parameters"]["jsCode"] = code
+            done.append(f"{name}: sentences, one per line")
+    return done
+
+
+def apply_wordcloud_words(out) -> list[str]:
+    """Word cloud words (idempotent; full build and live export). The AI themes stay exactly as they
+    are; real word counts (website_src/remark_words.js: no AI, no tokens) are merged into the same
+    wordcloud items before the upsert, so a theme and a word with the same text never produce two
+    rows (counts are summed). The instructor's name tokens come from the database (user_info) through
+    the existing lookup nodes and are never read by an AI node. Missing tokens -> no words (fail safe).
+    Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (GET_PREVIOUS_ANALYSIS, PREPARE_UNIFIED_INPUT, GET_OLD_WORDCLOUD, PREPARE_EXISTING_WORDCLOUD,
+                 PREPARE_INDIVIDUAL_INPUT, UNIFIED_PARSE, INDIVIDUAL_PARSE):
+        if name not in by_name:
+            raise SystemExit(f"apply_wordcloud_words: no node named {name!r}")
+    done = []
+
+    def set_param(name, key, new):
+        p = by_name[name]["parameters"]
+        if p[key] != new:
+            p[key] = new
+            done.append(f"{name}: {key}")
+
+    # unified (batch) path: name tokens ride along Get Previous -> Prepare Unified -> Parse Unified
+    q = by_name[GET_PREVIOUS_ANALYSIS]["parameters"]["query"]
+    if WORDS_MARK not in q:
+        q = replace_once(q, ") AS previous_remarks;",
+                         ") AS previous_remarks,\n\n    " + NAME_TOKENS_SQL + " AS instructor_name_tokens;",
+                         GET_PREVIOUS_ANALYSIS)
+    set_param(GET_PREVIOUS_ANALYSIS, "query", q)
+    code = by_name[PREPARE_UNIFIED_INPUT]["parameters"]["jsCode"]
+    if WORDS_MARK not in code:
+        code = replace_once(code, "      feedback_count:\n        feedback.length\n",
+                            "      feedback_count:\n        feedback.length,\n\n"
+                            "      instructor_name_tokens:\n        Array.isArray(previous.instructor_name_tokens)\n"
+                            "          ? previous.instructor_name_tokens\n          : null\n", PREPARE_UNIFIED_INPUT)
+    set_param(PREPARE_UNIFIED_INPUT, "jsCode", code)
+    code = by_name[UNIFIED_PARSE]["parameters"]["jsCode"]
+    code = add_remark_words_helper(code, UNIFIED_PARSE)
+    if "cloudWords" not in code:
+        code = replace_once(code, "const finalKeywords =\n  keywords.slice(0, 10);\n", WORDS_BLOCK_UNIFIED, UNIFIED_PARSE)
+        code = replace_once(code, "for (\n  const keyword of finalKeywords\n) {",
+                            "for (\n  const keyword of cloudWords\n) {", UNIFIED_PARSE)
+    set_param(UNIFIED_PARSE, "jsCode", code)
+
+    # individual (single scan) path: Get the old wordcloud1 -> Prepare Existing Wordcloud1 -> Merge2 ->
+    # Prepare Individual AI Input1 -> Add Parse Code node1
+    q = by_name[GET_OLD_WORDCLOUD]["parameters"]["query"]
+    if WORDS_MARK not in q:
+        if q != GET_OLD_WORDCLOUD_QUERY_V1:
+            raise SystemExit(f"{GET_OLD_WORDCLOUD}: unexpected query; the input changed")
+        q = GET_OLD_WORDCLOUD_QUERY
+    set_param(GET_OLD_WORDCLOUD, "query", q)
+    code = by_name[PREPARE_EXISTING_WORDCLOUD]["parameters"]["jsCode"]
+    if WORDS_MARK not in code:
+        code = replace_once(code, "          count: Number(item.json.count || 0)\n        }))\n",
+                            "          count: Number(item.json.count || 0)\n        })),\n\n"
+                            "      instructor_name_tokens:\n        rows.map((item) => item.json.instructor_name_tokens)\n"
+                            "          .find((t) => Array.isArray(t)) || null\n", PREPARE_EXISTING_WORDCLOUD)
+    set_param(PREPARE_EXISTING_WORDCLOUD, "jsCode", code)
+    code = by_name[PREPARE_INDIVIDUAL_INPUT]["parameters"]["jsCode"]
+    if WORDS_MARK not in code:
+        code = replace_once(code, "      existing_wordcloud: data.wordcloud || []\n",
+                            "      existing_wordcloud: data.wordcloud || [],\n\n"
+                            "      instructor_name_tokens: Array.isArray(data.instructor_name_tokens)\n"
+                            "        ? data.instructor_name_tokens\n        : null\n", PREPARE_INDIVIDUAL_INPUT)
+    set_param(PREPARE_INDIVIDUAL_INPUT, "jsCode", code)
+    code = by_name[INDIVIDUAL_PARSE]["parameters"]["jsCode"]
+    code = add_remark_words_helper(code, INDIVIDUAL_PARSE)
+    if "real word counts from this remark" not in code:
+        code = replace_once(code, "for (const keyword of keywords) {\n",
+                            WORDS_BLOCK_INDIVIDUAL + "for (const keyword of keywords) {\n", INDIVIDUAL_PARSE)
+        code = replace_once(code, "      word: String(keyword.word).trim(),\n      count: 1\n",
+                            "      word: String(keyword.word).trim(),\n      count: keyword.count || 1\n", INDIVIDUAL_PARSE)
+    set_param(INDIVIDUAL_PARSE, "jsCode", code)
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+# ---------------------------------------------------------------- interpretation summary (2026-10-24)
+# student_interpretation ("What Your Students Are Saying" in the app) was a short note about ONE
+# student on the single-scan path. Both prompts now ask for one paragraph (5 to 8 sentences) about ALL
+# students' comments for the instructor and term. The single-scan path gets the stored remarks too:
+# 'Get Existing AI Suggestion1' (website_src/existing_ai_suggestion.sql) always returns one row with
+# previous_remarks (last 100, remark + tone only) -> 'Prepare Existing AI1' -> Merge2 (input 2) ->
+# 'Prepare Individual AI Input1' -> prompt block PREVIOUS STUDENT REMARKS. Both parsers clean and cap
+# the paragraph (website_src/ai_interpretation.js); the single-scan parser keeps the stored text when
+# Gemini returns none.
+GET_EXISTING_AI = "Get Existing AI Suggestion1"
+PREPARE_EXISTING_AI = "Prepare Existing AI1"
+INTERP_MARK = "5 to 8 complete sentences"
+INTERP_HELPER_MARK = "// AI interpretation, from website_src/ai_interpretation.js"
+GET_EXISTING_AI_QUERY_V1 = (
+    "SELECT\n    instructor_id,\n    term_id,\n    ai_suggestion,\n    student_interpretation,\n"
+    "    positive_themes,\n    improvement_insights,\n    overall_tone\nFROM public.instructor_ai_suggestions\n"
+    "WHERE instructor_id = $1::uuid\n  AND term_id = $2::uuid\nLIMIT 1;")
+GET_EXISTING_AI_PARAMS = "={{ [$json.instructor_ID, $json.current_term_id] }}"
+INTERP_RULES = (
+    "Write ONE paragraph of 5 to 8 complete sentences (about 120 to 200 words) in plain English.\n\n"
+    "Summarise what students say across ALL the evidence: {sources}.\n\n"
+    "Cover:\n"
+    "- what students praise most, and how common it is (\"most students\", \"several students\", \"a few students\");\n"
+    "- the main concerns or requests (for example pacing, examples, grading, attitude);\n"
+    "- specific things students mention, such as teaching methods or class activities;\n"
+    "- the overall mood of the comments (mostly positive, mixed, or critical).\n\n"
+    "Summarise Bisaya/Cebuano and Tagalog comments in English.\n\n"
+    "Rules:\n"
+    "- Never use an instructor name or a student name.\n"
+    "- Never invent anything: every statement must be supported by the evidence. When there are too few "
+    "comments for 5 sentences, write fewer sentences instead of inventing.\n"
+    "- Never quote a vulgar or sexual word, or a masked word (asterisks such as ****).\n"
+    "- No bullet points, no numbering, no headings, no line breaks.\n"
+    "- Do not mention AI, surveys, batches, historical or previous data, updates, or the word cloud.\n")
+SEP60 = "=" * 60
+SEP50 = "=" * 50
+UNIFIED_INTERP_V1 = (
+    "INSTRUCTOR INTERPRETATION\n" + SEP60 + "\n\nUse:\n\n- previous_analysis\n- previous_wordcloud\n"
+    "- previous_remarks\n- feedback\n\nThe result should represent the instructor's overall evaluation based on "
+    "combined evidence.\n\nDo NOT mention:\n\n- previous surveys\n- historical data\n- new batch\n- updated analysis\n"
+    "- AI\n- wordcloud\n\nWrite naturally as an instructor evaluation summary.\n\nDo not invent information.\n")
+UNIFIED_INTERP_NEW = (
+    "INTERPRETATION (evaluation.interpretation)\n" + SEP60 + "\n\n"
+    "\"interpretation\" is the summary the instructor reads under \"What Your Students Are Saying\".\n\n"
+    + INTERP_RULES.format(sources="the historical analysis, the historical remarks and the new feedback"))
+UNIFIED_INTERP_EDITS = [
+    (UNIFIED_INTERP_V1, UNIFIED_INTERP_NEW),
+    ('    "interpretation": "",\n',
+     '    "interpretation": "One paragraph of 5 to 8 complete sentences summarising what students say.",\n'),
+    ("- interpretation and suggestion are strings\n",
+     "- interpretation and suggestion are strings\n"
+     "- interpretation is ONE paragraph of 5 to 8 complete sentences (about 120 to 200 words) about ALL "
+     "students' comments, with no names, no bullets and nothing invented\n"),
+]
+INDIVIDUAL_INTERP_EDITS = [
+    ("You have three sources of information:\n\n1. EXISTING AI ANALYSIS\n2. EXISTING WORDCLOUD\n"
+     "3. NEW STUDENT FEEDBACK\n",
+     "You have four sources of information:\n\n1. EXISTING AI ANALYSIS\n2. EXISTING WORDCLOUD\n"
+     "3. PREVIOUS STUDENT REMARKS\n4. NEW STUDENT FEEDBACK\n"),
+    (SEP50 + "\nNEW STUDENT FEEDBACK\n",
+     SEP50 + "\nPREVIOUS STUDENT REMARKS\n" + SEP50 + "\n\n"
+     "Earlier students' remarks for this instructor and term (newest first, at most 100; remark text and tone "
+     "only). They are already processed: use them only as evidence for the student interpretation. Never take "
+     "keywords from them and never use them for overall_tone.\n\n"
+     "{{ JSON.stringify($json.previous_remarks || []) }}\n\n"
+     + SEP50 + "\nNEW STUDENT FEEDBACK\n"),
+    ("Write a short interpretation of what the NEW student is communicating.\n\nDo not invent information.\n",
+     "Write an UPDATED OVERALL interpretation of what ALL students are saying, not only the new student.\n\n"
+     "\"student_interpretation\" is the summary the instructor reads under \"What Your Students Are Saying\".\n\n"
+     + INTERP_RULES.format(sources="the EXISTING AI ANALYSIS (its student_interpretation is the previous summary), "
+                                   "the PREVIOUS STUDENT REMARKS and the NEW STUDENT FEEDBACK")
+     + "\nRewrite the previous summary so it also reflects the new feedback; do not just add a sentence about "
+       "the new student.\n"),
+    ('  "student_interpretation": "Short interpretation of the new student feedback.",\n',
+     '  "student_interpretation": "One paragraph of 5 to 8 complete sentences summarising what all students say.",\n'),
+    ("- overall_tone MUST be exactly Positive, Critical, or Neutral.\n",
+     "- overall_tone MUST be exactly Positive, Critical, or Neutral.\n"
+     "- student_interpretation MUST be ONE paragraph of 5 to 8 complete sentences about ALL students "
+     "(existing analysis, previous remarks and the new feedback), not only the new student.\n"),
+]
+PREPARE_EXISTING_AI_EDIT = (
+    '        overall_tone: item?.json?.overall_tone || "Neutral"\n      }\n    }\n',
+    '        overall_tone: item?.json?.overall_tone || "Neutral"\n      },\n\n'
+    "      // earlier students' remarks (text + tone) for the interpretation summary\n"
+    "      previous_remarks: (() => {\n"
+    "        let r = item?.json?.previous_remarks;\n"
+    "        if (typeof r === \"string\") { try { r = JSON.parse(r); } catch (e) { r = []; } }\n"
+    "        return Array.isArray(r) ? r : [];\n"
+    "      })()\n    }\n")
+PREPARE_INDIVIDUAL_INTERP_EDIT = (
+    "      existing_wordcloud: data.wordcloud || [],\n",
+    "      existing_wordcloud: data.wordcloud || [],\n\n"
+    "      // remark text and tone only (no student id, no names) for the interpretation summary\n"
+    "      previous_remarks: (Array.isArray(data.previous_remarks) ? data.previous_remarks : [])\n"
+    "        .map((r) => ({ remark: String(r?.remark ?? \"\").replace(/\\s+/g, \" \").trim(), tone: r?.tone ?? null }))\n"
+    "        .filter((r) => r.remark)\n"
+    "        .slice(0, 100),\n")
+INTERP_PARSE_EDITS = {
+    UNIFIED_PARSE: [("  interpretation:\n    cleanText(\n      rawEvaluation.interpretation\n    ),\n",
+                     "  interpretation:\n    aiInterpretation(\n      rawEvaluation.interpretation\n    ),\n")],
+    INDIVIDUAL_PARSE: [('    student_interpretation: result.student_interpretation || "",\n',
+                        "    // empty answer: keep the stored summary instead of saving a blank\n"
+                        "    student_interpretation: aiInterpretation(result.student_interpretation)\n"
+                        "      || aiInterpretation(original.existing_ai && original.existing_ai.student_interpretation),\n")],
+}
+
+
+def apply_interpretation_summary(out) -> list[str]:
+    """Idempotent (full build and live export / repo perfect-2.1.json). student_interpretation becomes a
+    paragraph about ALL students' comments on both remark AI paths. Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (UNIFIED_AI, INDIVIDUAL_AI, UNIFIED_PARSE, INDIVIDUAL_PARSE, GET_EXISTING_AI,
+                 PREPARE_EXISTING_AI, PREPARE_INDIVIDUAL_INPUT, "Merge2"):
+        if name not in by_name:
+            raise SystemExit(f"apply_interpretation_summary: no node named {name!r}")
+    done = []
+
+    # prompts
+    for name, edits, mark in ((UNIFIED_AI, UNIFIED_INTERP_EDITS, INTERP_MARK),
+                              (INDIVIDUAL_AI, INDIVIDUAL_INTERP_EDITS, "PREVIOUS STUDENT REMARKS")):
+        text = by_name[name]["parameters"]["text"]
+        if mark not in text:
+            for old, new in edits:
+                text = replace_once(text, old, new, name)
+            by_name[name]["parameters"]["text"] = text
+            done.append(f"{name}: interpretation = paragraph about all students")
+
+    # single-scan path: one row with previous_remarks -> Prepare Existing AI1 -> Merge2 -> Prepare Individual
+    node = by_name[GET_EXISTING_AI]
+    sql = read("existing_ai_suggestion.sql")
+    assert_no_param_in_sql_comments(GET_EXISTING_AI, sql)
+    p = node["parameters"]
+    if p.get("query") != sql:
+        if "previous_remarks" not in p.get("query", "") and p.get("query", "").strip() != GET_EXISTING_AI_QUERY_V1:
+            raise SystemExit(f"{GET_EXISTING_AI}: unexpected query; the input changed")
+        p["query"] = sql
+        done.append(f"{GET_EXISTING_AI}: one row + previous_remarks")
+    if p.get("options", {}).get("queryReplacement") != GET_EXISTING_AI_PARAMS:
+        raise SystemExit(f"{GET_EXISTING_AI}: unexpected query parameters; the input changed")
+    if not node.get("alwaysOutputData"):
+        node["alwaysOutputData"] = True
+        done.append(f"{GET_EXISTING_AI}: alwaysOutputData")
+    merge = by_name["Merge2"]["parameters"]
+    if (merge.get("mode"), merge.get("combineBy"), merge.get("numberInputs")) != ("combine", "combineByPosition", 3):
+        raise SystemExit("Merge2: expected combine by position with 3 inputs; the input changed")
+    for name, (old, new) in ((PREPARE_EXISTING_AI, PREPARE_EXISTING_AI_EDIT),
+                             (PREPARE_INDIVIDUAL_INPUT, PREPARE_INDIVIDUAL_INTERP_EDIT)):
+        code = by_name[name]["parameters"]["jsCode"]
+        if "previous_remarks" not in code:
+            by_name[name]["parameters"]["jsCode"] = replace_once(code, old, new, name)
+            done.append(f"{name}: previous_remarks")
+
+    # parsers: clean + cap the paragraph (helper after the AI sentences helper; refreshed when present)
+    title = HELPER_HEADERS["ai_interpretation.js"]
+    end = f"// end of {title}\n"
+    for name, edits in INTERP_PARSE_EDITS.items():
+        old_code = by_name[name]["parameters"]["jsCode"]
+        code = old_code
+        if INTERP_HELPER_MARK in code:
+            i = code.index(INTERP_HELPER_MARK)
+            code = code[:i] + helper_block("ai_interpretation.js") + code[code.index(end, i) + len(end):]
+        else:
+            for old, repl in edits:
+                code = replace_once(code, old, repl, name)
+            code = replace_once(code, "// end of AI sentences\n",
+                                "// end of AI sentences\n" + helper_block("ai_interpretation.js"), name)
+        if code != old_code:
+            by_name[name]["parameters"]["jsCode"] = code
+            done.append(f"{name}: interpretation cleaned and capped")
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+# ---------------------------------------------------------------- remark tone rules (2026-10-24)
+# remark_tones (Unified AI Analysis1) and the new remark's overall_tone (Individual AI Analysis1):
+# meaning first in any language, then one shared rule set and example list. Stored values stay exactly
+# Positive / Critical / Neutral; both parsers read Gemini's value with website_src/ai_tone.js
+# (case-insensitive, negative/mixed -> Critical).
+TONE_MARK = "Never decide from one keyword."
+TONE_HELPER_MARK = "// AI tone, from website_src/ai_tone.js"
+TONE_EXAMPLES = [
+    ("Maayo kaayo mo explain si ma'am.", "Positive"), ("Ang galing magturo ni sir, sobrang linaw.", "Positive"),
+    ("Salamat sa pasensya, sir!", "Positive"), ("Keep it up po!", "Positive"),
+    ("Very approachable and fair.", "Positive"), ("Muy buen profesor.", "Positive"),
+    ("Paspas kaayo mo discuss, dili mi ka sabay.", "Critical"), ("Sana po bagalan ang pagtuturo.", "Critical"),
+    ("Dugangi pa unta ang examples.", "Critical"), ("Maayo ra man siya pero kanunay late.", "Critical"),
+    ("Galing mo sir, wala kaming natutunan.", "Critical"), ("Hindi po malinaw ang grading.", "Critical"),
+    ("Mas maayo unta kung naay review before exam.", "Critical"),
+    ("Okay ra.", "Neutral"), ("Every MWF ang klase.", "Neutral"),
+]
+TONE_RULES = (
+    "First understand what the remark means, in ANY language: English, Tagalog, Bisaya/Cebuano, Hiligaynon, "
+    "Ilocano, Taglish and Bislish mixes, other languages, slang, misspellings, text-speak and emojis. "
+    "Translate it to English in your head before deciding. " + TONE_MARK + "\n\n"
+    "The value MUST be exactly one of:\n\nPositive\nCritical\nNeutral\n\n"
+    "Positive:\nMainly praise, thanks or satisfaction. A \"keep it up\" or \"more of the same\" request is still Positive.\n\n"
+    "Critical:\nAny complaint, problem, unmet need, or request to change something. Request markers include unta, "
+    "sana, dapat, palihug, please, pls, \"mas maayo kung\", \"sana po\". Negated praise (dili maayo, hindi malinaw, "
+    "not clear) and sarcasm (\"galing mo sir, wala kaming natutunan\") are Critical too.\n\n"
+    "Praise plus a specific problem or request:\nCritical.\n\n"
+    "Neutral:\nFactual, unclear, off-topic, only a greeting, or too short to judge.\n\n"
+    "Emoji only:\nJudge by the meaning of the emoji.\n\n"
+    "Examples:\n\n" + "".join(f"\"{r}\"\n→ {t}\n\n" for r, t in TONE_EXAMPLES))
+UNIFIED_TONE_NEW = "REMARK TONE\n" + SEP60 + "\n\nClassify EVERY NEW feedback item.\n\n" + TONE_RULES
+INDIVIDUAL_TONE_NEW = "OVERALL TONE\n" + SEP50 + "\n\nDetermine the tone of the NEW student feedback.\n\n" + TONE_RULES
+UNIFIED_TONE_FN_V1 = (
+    "function normalizeTone(value) {\n\n  if (\n    typeof value === \"string\"\n  ) {\n\n    const tone =\n"
+    "      value.trim();\n\n    if (\n      VALID_TONES.includes(tone)\n    ) {\n      return tone;\n    }\n\n  }\n\n"
+    "  return null;\n}\n")
+TONE_PARSE_EDITS = {
+    UNIFIED_PARSE: [(UNIFIED_TONE_FN_V1,
+                     "// case-insensitive; negative / mixed -> Critical (website_src/ai_tone.js)\n"
+                     "function normalizeTone(value) {\n  return aiTone(value);\n}\n")],
+    INDIVIDUAL_PARSE: [('let tone = result.overall_tone || "Neutral";\n\n'
+                        'if (!["Positive", "Critical", "Neutral"].includes(tone)) {\n  tone = "Neutral";\n}\n',
+                        "// case-insensitive; negative / mixed -> Critical; anything else -> Neutral (website_src/ai_tone.js)\n"
+                        'let tone = aiTone(result.overall_tone) || "Neutral";\n')],
+}
+
+
+def _replace_section(text: str, start: str, stop: str, must: list[str], new: str, where: str) -> str:
+    """Replace text[start .. stop) (start included, stop excluded); both must occur once and the old
+    section must still hold the `must` anchors (else the input changed)."""
+    if text.count(start) != 1:
+        raise SystemExit(f"{where}: expected exactly one {start[:40]!r}; the input changed")
+    i = text.index(start)
+    j = text.find(stop, i)
+    if j < 0 or any(m not in text[i:j] for m in must):
+        raise SystemExit(f"{where}: section {start[:40]!r} changed; the input changed")
+    return text[:i] + new + text[j:]
+
+
+def apply_remark_tone_rules(out) -> list[str]:
+    """Idempotent (full build and live export / repo perfect-2.1.json). Shared tone rules and examples in
+    both remark prompts; tolerant tone parsing in both parsers. Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (UNIFIED_AI, INDIVIDUAL_AI, UNIFIED_PARSE, INDIVIDUAL_PARSE):
+        if name not in by_name:
+            raise SystemExit(f"apply_remark_tone_rules: no node named {name!r}")
+    done = []
+    for name, start, stop, must, new in (
+            (UNIFIED_AI, "REMARK TONE\n" + SEP60 + "\n\n", SEP60 + "\nOVERALL TONE\n",
+             ["Classify EVERY NEW feedback item.", '"Okay ra man."\nNeutral\n'], UNIFIED_TONE_NEW),
+            (INDIVIDUAL_AI, "OVERALL TONE\n" + SEP50 + "\n\n", SEP50 + "\nWORDCLOUD\n",
+             ["Determine the tone of the NEW student feedback.", '"His class is every Monday."'], INDIVIDUAL_TONE_NEW)):
+        text = by_name[name]["parameters"]["text"]
+        if TONE_MARK not in text:
+            by_name[name]["parameters"]["text"] = _replace_section(text, start, stop, must, new, name)
+            done.append(f"{name}: tone rules (any language, request = Critical, examples)")
+    title = HELPER_HEADERS["ai_tone.js"]
+    end = f"// end of {title}\n"
+    for name, edits in TONE_PARSE_EDITS.items():
+        old_code = by_name[name]["parameters"]["jsCode"]
+        code = old_code
+        if TONE_HELPER_MARK in code:
+            i = code.index(TONE_HELPER_MARK)
+            code = code[:i] + helper_block("ai_tone.js") + code[code.index(end, i) + len(end):]
+        else:
+            for old, repl in edits:
+                code = replace_once(code, old, repl, name)
+            code = replace_once(code, "// end of AI interpretation\n",
+                                "// end of AI interpretation\n" + helper_block("ai_tone.js"), name)
+        if code != old_code:
+            by_name[name]["parameters"]["jsCode"] = code
+            done.append(f"{name}: tone read case-insensitively (negative/mixed -> Critical)")
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
 def flagged_respond_expression() -> str:
     """Body of the shared 'Respond to Webhook'. Website executions: the backend
     contract object. Phone executions: exactly the text the node always sent
-    (its body was the fixed string '{{ JSON.stringify($json) }}', not an expression)."""
+    (its body was the fixed string '{{ JSON.stringify($json) }}', not an expression), except a scan
+    auto-rejected by the stamp rule (duplicate_stamp), which gets a JSON object with its message."""
     phone_literal = "'{' + '{ JSON.stringify($json) }' + '}'"
     js = (
         "(() => { "
         "let w = null; "
         "try { const it = $('Website Flagged Record').first(); "
         "w = (it && it.json && it.json._source === 'website') ? it.json : null; } catch (e) { w = null; } "
-        f"if (!w) {{ return {phone_literal}; }} "
         "const failed = !!($json && $json.error !== undefined); "
+        "if (!w) { "
+        "let pr = null; "
+        "try { const b = $('build flagged record1').first(); pr = (b && b.json) ? b.json : null; } catch (e) { pr = null; } "
+        "const rc = (pr && pr.review_correction) || null; "
+        "if (!failed && rc && rc.rule === 'duplicate_stamp') { "
+        "return JSON.stringify({ status: 'discarded', flagged: true, auto_rejected: 'duplicate_stamp', "
+        "task_id: String(pr.task_id || ''), stamp_no: (pr.stamp_no || null), "
+        "duplicate_of: ((pr.partial_data && pr.partial_data.duplicate_of) || null), "
+        "review_reasons: (Array.isArray(pr.review_reasons) ? pr.review_reasons : ['duplicate_stamp']), "
+        "message: 'Discarded automatically: this form was already scanned (stamp ' + (pr.stamp_no || '?') "
+        "+ '), so it is not counted.' }); "
+        "} "
+        f"return {phone_literal}; "
+        "} "
         "const reasons = Array.isArray(w.review_reasons) ? w.review_reasons.slice() : []; "
         "if (failed) { reasons.push('internal_error_not_saved'); } "
         "const note = String(w.review_note || '').trim(); "
+        "const dupStamp = !failed && w.auto_reject === 'duplicate_stamp'; "
+        "const discarded = !failed && !dupStamp && w.auto_discard === true; "
+        "const answered = Number.isInteger(w.answered_count) ? w.answered_count : null; "
         "const message = failed "
         "? 'NOT SAVED: inserting the page into the review queue failed in n8n. Send this page again.' "
+        ": dupStamp "
+        "? ('Discarded automatically: this form was already scanned (stamp ' + (w.stamp_no || '?') "
+        "+ '), so it is not counted.') "
+        ": discarded "
+        "? ('Discarded automatically: fewer than 5 of the 20 items were answered' "
+        "+ (answered !== null ? ' (only ' + answered + ')' : '') + ', so this form is not counted.') "
         ": ('Flagged for manual review (' + (reasons.join(', ') || 'unspecified') + ').' + (note ? ' ' + note : '')).slice(0, 1000); "
         "return JSON.stringify({ status: 'flagged', flagged: true, task_id: String(w.task_id || ''), "
         "review_reasons: reasons, identity_check: (w.identity_check || null), "
+        "auto_rejected: (dupStamp ? 'duplicate_stamp' : null), stamp_no: (w.stamp_no || null), "
         "message: message }); "
         "})()"
     )
@@ -1343,15 +2528,14 @@ def patch_null_ratings(out):
 
     # 'Website Map to Target Format': ?? 0 -> ?? null (website_src/website_map_to_target.js). The build
     # generates it from the source already; a live export still has the old code.
+    # (apply_stamp_rule then refreshes the whole node from the source, which already has ?? null)
     want = read_js("website_map_to_target.js")
     code = code_of(WEBSITE_MAP)
-    if code != want:
+    if code != want and "d.ratings?.[`m${i}`] ?? 0;" in code:
         code = replace_once(code, "  // blank row -> 0, stored as NULL later\n",
                             "  // blank row stays null (stored as NULL, never 0)\n", WEBSITE_MAP)
         code = replace_once(code, "d.ratings?.[`m${i}`] ?? 0;", "d.ratings?.[`m${i}`] ?? null;", WEBSITE_MAP)
         code = replace_once(code, "d.ratings?.[`p${i}`] ?? 0;", "d.ratings?.[`p${i}`] ?? null;", WEBSITE_MAP)
-        if code != want:
-            raise SystemExit(f"{WEBSITE_MAP}: code differs from website_src/website_map_to_target.js")
         set_code(WEBSITE_MAP, code)
 
     # 'build the record1' (sast-manual-correction): parseInt(..) || 0 -> rating(..)
@@ -1430,6 +2614,57 @@ def fix_remark_loop_single_feed(out):
         outs[0] = [c for c in outs[0] if c["node"] != REMARK_LOOP_WAIT]
     if [c["node"] for c in conns[REMARK_LOOP_WAIT]["main"][0]] != [REMARK_LOOP]:
         raise SystemExit(f"{REMARK_LOOP_WAIT} no longer feeds {REMARK_LOOP}; the input changed")
+
+
+# Gemini free tier (gemini-3.5-flash-lite): 15 requests/min. The grouped remark loop is paced to
+# ~10 calls/min (one Gemini call per loop pass + 6 s wait) and retried on a 429.
+REMARK_LOOP_WAIT_SECONDS = 6
+REMARK_PREVIOUS = "Get Previous Instructor Analysis1"
+AI_RETRY = {"retryOnFail": True, "maxTries": 3, "waitBetweenTries": 5000}   # n8n caps the wait at 5000 ms
+
+
+def _feed_wait(conns, src):
+    """Output 1 (the error output) of `src` goes to Wait1, i.e. the loop skips the instructor."""
+    main = conns.setdefault(src, {}).setdefault("main", [])
+    while len(main) < 2:
+        main.append([])
+    if not any(c["node"] == REMARK_LOOP_WAIT for c in main[1]):
+        main[1].append({"node": REMARK_LOOP_WAIT, "type": "main", "index": 0})
+
+
+def apply_gemini_rate_limit(out) -> list[str]:
+    """Keep the n8n workflow under the Gemini free-tier limit (idempotent).
+      * Wait1 (the pause before the next instructor of the grouped remark loop) = 6 s, explicit unit.
+      * 'Unified AI Analysis1' / 'Individual AI Analysis1': retry 3x, 5 s apart (a 429 is retried).
+      * Grouped loop: a final AI failure ('Unified AI Analysis1' error output), a parse failure
+        ('Parse Unified AI Result1' error output, also a missing text) or a failed 'previous analysis'
+        lookup skips that instructor and goes on through Wait1, so one failure never stops the import."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in [REMARK_LOOP_WAIT, UNIFIED_AI, INDIVIDUAL_AI, UNIFIED_PARSE, REMARK_PREVIOUS]:
+        if name not in by_name:
+            raise SystemExit(f"Input workflow has no node named {name!r}")
+    done = []
+    wait = by_name[REMARK_LOOP_WAIT]["parameters"]
+    want = {"resume": "timeInterval", "amount": REMARK_LOOP_WAIT_SECONDS, "unit": "seconds"}
+    if any(wait.get(k) != v for k, v in want.items()):
+        wait.update(want)
+        done.append(f"{REMARK_LOOP_WAIT} = {REMARK_LOOP_WAIT_SECONDS} s")
+    for name in (UNIFIED_AI, INDIVIDUAL_AI):
+        n = by_name[name]
+        if any(n.get(k) != v for k, v in AI_RETRY.items()):
+            n.update(AI_RETRY)
+            done.append(f"{name} retry 3x/5 s")
+    for name, mode in ((UNIFIED_AI, "continueErrorOutput"), (UNIFIED_PARSE, "continueErrorOutput"),
+                       (REMARK_PREVIOUS, "continueRegularOutput")):
+        if by_name[name].get("onError") != mode:
+            by_name[name]["onError"] = mode
+            done.append(f"{name} onError {mode}")
+    for src in (UNIFIED_AI, UNIFIED_PARSE):
+        before = json.dumps(out["connections"].get(src), sort_keys=True)
+        _feed_wait(out["connections"], src)
+        if json.dumps(out["connections"].get(src), sort_keys=True) != before:
+            done.append(f"{src} error output -> {REMARK_LOOP_WAIT}")
+    return done
 
 
 def patch_flagged_fcm_lookup(node):
@@ -1788,13 +3023,698 @@ def place_new_nodes(out, placed):
         a, b = by_name["Website Identity Check"]["position"], by_name["Website Decide"]["position"]
         by_name[FORM_MATCH]["position"] = [(a[0] + b[0]) // 2, max(a[1], b[1]) + 176]
     for name, before, after in ((WEB_KNOWN_NAMES, "Website Python OMR", "Website AI Validation"),
-                                (PHONE_KNOWN_NAMES, PHONE_OMR_NODE, PHONE_GEMINI_NODE)):
+                                (PHONE_KNOWN_NAMES, PHONE_OMR_NODE, PHONE_GEMINI_NODE),
+                                (PHONE_CANDIDATES, PHONE_NOT_FORM_NODE, PHONE_REMARK_CHECK)):
         if name not in placed:
             a, b = by_name[before]["position"], by_name[after]["position"]
             by_name[name]["position"] = [(a[0] + b[0]) // 2, max(a[1], b[1]) + 176]
+    if SHEET_RESPONSE not in placed:
+        m = by_name[SHEET_MAP]["position"]
+        by_name[SHEET_RESPONSE]["position"] = [m[0] + 224, m[1] + 176]
+        by_name[SHEET_AFTER]["position"] = [m[0] + 448, m[1] + 176]
+        by_name[SHEET_ERROR_RESPONSE]["position"] = [m[0] - 448, m[1] + 352]
     if CORRECTION_AFTER not in placed:
         r = by_name[CORRECTION_RESPOND]["position"]
         by_name[CORRECTION_AFTER]["position"] = [r[0] + 224, r[1]]
+    place_stamp_nodes(out, placed)
+    place_correction_match_nodes(out, placed)
+
+
+# ---------------------------------------------------------------- stamp rule (2026-10-16, migration 015)
+# Every paper form carries a numbering-machine stamp (3..12 digits, as printed). Gemini returns every
+# stamped number (stamp_numbers); the reconcilers keep one readable stamp (website_src/stamp.js) or
+# flag the page (stamp_missing / stamp_unreadable / multiple_stamps). A stamp already stored for the
+# term auto-rejects the page (duplicate_stamp): website 'Website Identity Check' ($6) and the race
+# in 'Website Raw Upsert' (public.save_website_raw_row); phone 'Phone Stamp Check' -> 'Phone Stamp
+# Verdict' before If31 (the phone answers success at If31). Corrections (sast-manual-correction) take
+# body.stamp_no / body.stamp_source and answer HTTP 409 duplicate_stamp before anything is saved.
+STAMP_PROMPT_PARAGRAPH = (
+    "stamp_numbers: every number printed on the page by a numbering-machine stamp. A numbering stamp is a "
+    "machine-printed number in ink (usually black) made of evenly spaced, same-size digits, often 5 to 9 digits "
+    "long and sometimes starting with zeros. It can be anywhere on the page (top, bottom, a margin, inside or over "
+    "the table) and in any orientation (upright, sideways, upside down or tilted); read it in its own orientation. "
+    "Check marks, signatures or handwriting may cover part of it. Return each stamped number as a string of digits "
+    "only, exactly as printed, keeping leading zeros; write ? for a digit you cannot read. If there are several "
+    "stamped numbers, return all of them. Return [] when the page has no stamp. Do NOT include the student ID, "
+    "dates, phone numbers, handwritten numbers, rating numbers, or the printed form codes and texts (for example "
+    "\"SS Form2\", \"Revision 3\", \"February 4, 2009\")."
+)
+# authored with literal backslash-n and JSON-escaped quotes, like the rest of the prompt text
+STAMP_PROMPT_ADD = r"\n\n--- STAMP ---\n" + json.dumps(STAMP_PROMPT_PARAGRAPH)[1:-1]
+STAMP_SCHEMA_ADD = '"stamp_numbers": { "type": "ARRAY", "items": { "type": "STRING" } },\n        '
+STAMP_REQUIRED_ANCHOR = '"student_id",\n        "document_check",'
+STAMP_REQUIRED_NEW = '"student_id",\n        "stamp_numbers",\n        "document_check",'
+STAMP_MARK = "// stamp rule (2026-10-16)"
+
+# Two readers (2026-10-17): the OMR (/process, STAMP_FINDER + STAMP_READER) sends stamp_candidates with
+# a tile sheet (upright close-ups of every place a stamp may be) and its own digit reads. Both Gemini
+# requests attach the tile sheet as the LAST image (only when /process sent one) with the STAMP TILES
+# paragraph, get the strict stamp-reading rules and two more required fields (stamp_numbers_page,
+# stamp_reads_tiles); stamp.js accepts a stamp only when Gemini and the Python reader agree. The texts
+# are verbatim from the tile pilot (scratchpad stampfind/gemini_tile_pilot.py, strict variant).
+STAMP_TILE_TEXT = (
+    "\n\n--- STAMP TILES (the LAST image) ---\n"
+    "The last image is a tile sheet made by our scanner software. Each tile is labelled at its left "
+    "(T1, T2, ...) and is a close-up of ONE place on this page where a numbering-machine stamp MAY be, "
+    "already turned so its text runs left to right and enlarged. T<n>a / T<n>b are the same crop, the b "
+    "tile turned 180 degrees: read only the one that is upright. Most tiles are NOT stamps (printed form "
+    "text, logos, table lines, wood or paper texture, handwriting, check marks): ignore them.\n"
+    "Fill three stamp fields:\n"
+    "- stamp_numbers_page: the stamp numbers you read on the FULL PAGE image alone, as if there were no "
+    "tiles.\n"
+    "- stamp_reads_tiles: one entry per stamp you see in the tiles: the tile label and the number read "
+    "from that tile. The same stamp can appear in two tiles: list it once. [] when no tile shows a stamp.\n"
+    "- stamp_numbers: your final answer.\n"
+    "Digits only, keep leading zeros, write ? for each digit you cannot read; never guess a worn, faint "
+    "or missing digit. Ignore handwriting (student ID, dates) and printed form codes and texts "
+    "(\"SS Form2\", \"Revision 3\", \"February 4, 2009\")."
+)
+STAMP_STRICT_TEXT = (
+    "STAMP READING RULES (strict):\n"
+    "- Read each digit of the numbering-machine stamp independently.\n"
+    "- If ANY stroke of a digit is missing, broken, faint, smudged or ambiguous (e.g. 3 vs 7 vs 8, "
+    "0 vs 9 vs 6, 1 vs 7), output ? for that digit. Never guess.\n"
+    "- Never add or drop digits. Numbering-machine stamps have a fixed digit count, and a leading zero "
+    "is printed as a real digit.\n"
+    "- If more than one stamp impression is visible (in any tile or on the page), report all of them.\n"
+    "- Prefer ? over a confident guess; a human will check.\n\n"
+)
+# the pilot put it at the end of the stamp section, i.e. just before '--- BUBBLE GRID ---'
+STAMP_STRICT_ADD = json.dumps("\n\n" + STAMP_STRICT_TEXT.rstrip("\n"))[1:-1]
+STAMP_TILE_SCHEMA_ADD = ('"stamp_numbers_page": { "type": "ARRAY", "items": { "type": "STRING" } },\n        '
+                         '"stamp_reads_tiles": { "type": "ARRAY", "items": { "type": "OBJECT", "properties": { '
+                         '"tile": { "type": "STRING" }, "number": { "type": "STRING" } }, "required": ["tile", "number"] } },\n        ')
+STAMP_TILE_REQUIRED_NEW = ('"student_id",\n        "stamp_numbers",\n        "stamp_numbers_page",\n'
+                           '        "stamp_reads_tiles",\n        "document_check",')
+STAMP_TEXT_END = 'Return ONLY valid JSON matching the schema."'      # end of the prompt text part
+PHONE_PAGE_PART_END = ('"data": "{{ $(\'SAST image from phone\').first().json.body.image }}"\n'
+                       '          }\n        }\n      ]')
+WEB_OMR_NODE = "Website Python OMR"
+PHONE_OMR_NODE = "image to ocr and omr python"
+STAMP_TILE_MAX_B64 = 4000000                      # a tile sheet is ~100-200 KB of base64
+
+
+def stamp_tile_b64_js(omr_node: str) -> str:
+    """JS (n8n expression body) -> the OMR's tile sheet base64, or '' (no block, /process failed, an
+    old OMR, or anything that is not plain base64)."""
+    return ("(() => { let t = ''; try { const sc = $('" + omr_node + "').first().json.stamp_candidates; "
+            "t = (sc && typeof sc.tile_sheet_b64 === 'string') ? sc.tile_sheet_b64 : ''; } catch (e) { t = ''; } "
+            "return (t.length > 100 && t.length < " + str(STAMP_TILE_MAX_B64) + " && t.indexOf('\"') === -1 "
+            "&& t.indexOf(String.fromCharCode(92)) === -1) ? t : ''; })()")
+
+
+def stamp_tile_part_expr(omr_node: str) -> str:
+    """Last Gemini image part: the tile sheet, only when the OMR sent one (else nothing)."""
+    js = ("(() => { const t = " + stamp_tile_b64_js(omr_node) + "; "
+          "return t ? ',\\n        { \"inlineData\": { \"mimeType\": \"image/jpeg\", \"data\": \"' + t + '\" } }' : ''; })()")
+    if "{{" in js or "}}" in js:
+        raise SystemExit("tile part expression must not contain '{{' or '}}'")
+    return "{{ " + js + " }}"
+
+
+def stamp_tile_text_expr(omr_node: str) -> str:
+    """The STAMP TILES paragraph (JSON-escaped like the static prompt text), only with a tile sheet."""
+    js = ("(() => { const t = " + stamp_tile_b64_js(omr_node) + "; "
+          "return t ? JSON.stringify(" + json.dumps(STAMP_TILE_TEXT) + ").slice(1, -1) : ''; })()")
+    if "{{" in js or "}}" in js:
+        raise SystemExit("tile text expression must not contain '{{' or '}}'")
+    return "{{ " + js + " }}"
+
+
+def patch_gemini_stamp_tiles(body: str, name: str, omr_node: str, page_part_end: str) -> str:
+    """Tile sheet image + STAMP TILES paragraph + strict rules + the two extra required fields (once)."""
+    body = replace_once(body, HEADER_BUBBLE_ANCHOR, STAMP_STRICT_ADD + HEADER_BUBBLE_ANCHOR, name)
+    body = replace_once(body, STAMP_TEXT_END, STAMP_TEXT_END[:-1] + stamp_tile_text_expr(omr_node) + '"', name)
+    body = replace_once(body, page_part_end, page_part_end[:-len("\n      ]")] + stamp_tile_part_expr(omr_node)
+                        + "\n      ]", name)
+    body = replace_once(body, STAMP_SCHEMA_ADD, STAMP_SCHEMA_ADD + STAMP_TILE_SCHEMA_ADD, name)
+    return replace_once(body, STAMP_REQUIRED_NEW, STAMP_TILE_REQUIRED_NEW, name)
+
+
+PHONE_ROUTE_IF = "If31"                          # needs_review false -> success answer + credit
+PHONE_STAMP_CHECK = "Phone Stamp Check"          # Postgres (phone_stamp_check.sql), continue on error
+PHONE_STAMP_VERDICT = "Phone Stamp Verdict"      # Code (phone_stamp_verdict.js)
+CORR_STAMP_CHECK = "Correction Stamp Check"      # Postgres (phone_stamp_check.sql), continue on error
+CORR_STAMP_IF = "Correction Stamp Duplicate?"
+CORR_STAMP_RESPOND = "Correction Duplicate Stamp Response"   # HTTP 409 (or 503 check failed), nothing saved
+_PREC = "$('" + PHONE_RECONCILE + "').first().json"
+# an accepted stamp (auto-reject on a match), else the stamp_hint (a match only adds a note)
+PHONE_STAMP_PARAMS = ("={{ [ '', (" + _PREC + ".stamp_status === 'ok' ? String(" + _PREC + ".stamp_no ?? '') : String("
+                      + _PREC + ".stamp_hint ?? '')), String(" + _PREC + ".task_id ?? '') ] }}")
+CORR_STAMP_PARAMS = ("={{ [ String($json.current_term_id ?? ''), String($json.stamp_no ?? ''), "
+                     "String($json.task_id ?? '') ] }}")
+# fail safe: a check that could not run (DB error, no duplicate_stamp_exists) on a correction that
+# carries a stamp is answered as an error too (HTTP 503 stamp_check_failed, nothing saved); a
+# correction without a stamp has nothing to check and goes on
+CORR_STAMP_IF_EXPR = ("={{ $json.duplicate_stamp_exists === true || ($json.duplicate_stamp_exists !== false "
+                      "&& String($('Map target').first().json.stamp_no ?? '') !== '') }}")
+CORR_STAMP_IF_ID = "8f0b6c1e-web0-4d01-9a01-000000000009"
+_CDUP = "$json.duplicate_stamp_of"
+_CJS = ("JSON.stringify({ success: false, code: 'duplicate_stamp', "
+        "message: 'This form was already scanned: stamp ' + String((" + _CDUP + " && " + _CDUP + ".stamp_no) "
+        "|| $('Map target').first().json.stamp_no || '?') + ' is already stored for this term' "
+        "+ ((" + _CDUP + " && " + _CDUP + ".submitted_date) ? ' (saved ' + " + _CDUP + ".submitted_date + ')' : '') "
+        "+ '. Nothing was saved.', duplicate_of: (" + _CDUP + " || null) })")
+_CFAIL = ("JSON.stringify({ success: false, code: 'stamp_check_failed', "
+          "message: 'The stamp check could not run, so nothing was saved. Try again in a moment.', "
+          "duplicate_of: null })")
+CORR_STAMP_RESPONSE_BODY = "={{ $json.duplicate_stamp_exists === true ? " + _CJS + " : " + _CFAIL + " }}"
+CORR_STAMP_RESPONSE_CODE = "={{ $json.duplicate_stamp_exists === true ? 409 : 503 }}"
+MARK_QUERY_V1 = "UPDATE public.failed_scan_queue\nSET status = 'validated', validated_at = NOW()\nWHERE id = $1::uuid;"
+MARK_PARAMS_V1 = "={{ $('sast-manual-correction1').first().json.body.failed_scan_id }}"
+# the queue row also gets the stamp (only when the caller sent the stamp_no key: an older client
+# that does not know the stamp leaves the stamp read on the page in place)
+MARK_QUERY = ("UPDATE public.failed_scan_queue\n"
+              "SET status = 'validated', validated_at = NOW(),\n"
+              "    stamp_no = CASE WHEN $4 = 'true' THEN NULLIF($2, '') ELSE stamp_no END,\n"
+              "    stamp_source = CASE WHEN $4 = 'true' THEN NULLIF($3, '') ELSE stamp_source END\n"
+              "WHERE id = $1::uuid;")
+_CB = "$('sast-manual-correction1').first().json.body"
+MARK_PARAMS = ("={{ [ (" + _CB + ".failed_scan_id ?? null), String($('Map target').first().json.stamp_no ?? ''), "
+               "String($('Map target').first().json.stamp_source ?? ''), "
+               "String(Object.keys(" + _CB + " || {}).includes('stamp_no')) ] }}")
+if any(m in x for x in (CORR_STAMP_RESPONSE_BODY[4:-3], MARK_PARAMS[4:-3], PHONE_STAMP_PARAMS[4:-3])
+       for m in ("{{", "}}")):
+    raise SystemExit("stamp expressions must not contain '{{' or '}}'")
+
+STAMP_COLUMNS_HELPER = (
+    "// stamp rule (2026-10-16): a valid stamp (3..12 digits, as printed) + its source, else NULL + NULL\n"
+    "function stampColumns(r) {\n"
+    "  const s = (typeof r['stamp_no'] === 'string' || typeof r['stamp_no'] === 'number') ? String(r['stamp_no']).trim() : '';\n"
+    "  const ok = /^[0-9]{3,12}$/.test(s);\n"
+    "  const src = ['gemini+python', 'gemini', 'staff', 'override'].includes(r['stamp_source']) ? r['stamp_source'] : 'staff';\n"
+    "  return { stamp_no: ok ? s : null, stamp_source: ok ? src : null };\n"
+    "}\n\n")
+CIJ_STAMP_ANCHOR = "      ...(websiteRawStored ? { _raw_already_stored: true } : {})\n"
+CIJ_STAMP_LINE = ("      // stamp only when the mapper sent one, so sheet rows never clear it\n"
+                  "      ...(Object.prototype.hasOwnProperty.call(r, 'stamp_no') ? stampColumns(r) : {}),\n")
+PHONE_MAP_STAMP_ANCHOR = '  result["task_id"] = separateData.task_id || null;\n'
+PHONE_MAP_STAMP = (
+    "  // stamp rule: the one accepted stamp of the page (a clean scan always has one)\n"
+    "  if (separateData.stamp_status === 'ok' && separateData.stamp_no) {\n"
+    '    result["stamp_no"] = separateData.stamp_no;\n'
+    '    result["stamp_source"] = separateData.stamp_source || "gemini";\n'
+    "  }\n")
+MAP_TARGET_STAMP_ANCHOR = "return [{\n  json: {\n    instructor_ID:"
+MAP_TARGET_STAMP = (
+    STAMP_MARK + ": the stamp typed or confirmed by staff (website review or Flutter): 3..12\n"
+    "// digits, else none. stamp_source 'override' (a rescued duplicate) or 'staff' (anything else).\n"
+    "let correctionStamp = null;\n"
+    "let correctionStampSource = null;\n"
+    "try {\n"
+    "  const sb = $('sast-manual-correction1').first().json.body || {};\n"
+    "  const st = (typeof sb.stamp_no === 'string' || typeof sb.stamp_no === 'number') ? String(sb.stamp_no).trim() : '';\n"
+    "  if (/^[0-9]{3,12}$/.test(st)) {\n"
+    "    correctionStamp = st;\n"
+    "    correctionStampSource = sb.stamp_source === 'override' ? 'override' : 'staff';\n"
+    "  }\n"
+    "} catch (e) {}\n\n")
+MAP_TARGET_TOP_ANCHOR = "    task_id:                data.raw.task_id ?? null,\n"
+MAP_TARGET_TOP = ("    stamp_no:               correctionStamp,         // -> raw row (NULL = no stamp)\n"
+                  "    stamp_source:           correctionStampSource,\n")
+MAP_TARGET_RAW_ANCHOR = "      task_id:            data.raw.task_id         ?? null,\n"
+MAP_TARGET_RAW = ("      stamp_no:           correctionStamp,\n"
+                  "      stamp_source:       correctionStampSource,\n")
+GEMINI_FAILURE_REASONS_OLD = "    review_reasons: ['ai_validation_failed'],\n"
+GEMINI_FAILURE_REASONS_NEW = "    review_reasons: ['ai_validation_failed', 'stamp_unreadable'],\n"
+GEMINI_FAILURE_STAMP_ANCHOR = "    student_id: '',   // text only comes from Gemini\n"
+GEMINI_FAILURE_STAMP = ("    stamp_no: null,   // stamp rule: nothing was read, so the stamp is unreadable\n"
+                        "    stamp_status: 'unreadable',\n"
+                        "    stamp_candidates: [],\n"
+                        "    stamp_raw: null,\n")
+BUILD_FLAGGED_PHONE_OLD = ("let rec;\nif (webRec) {\n  rec = webRec;\n} else try {\n"
+                           "  rec = $('reconcile ocr and omr1').first().json;\n")
+BUILD_FLAGGED_PHONE_NEW = (
+    "// phone runs: the record after the stamp check ('Phone Stamp Verdict'), else the reconciler's\n"
+    "let phoneRec = null;\n"
+    "try {\n"
+    "  const v = $('Phone Stamp Verdict').first();\n"
+    "  phoneRec = (v && v.json && v.json._stage === 'phone_stamp_checked') ? v.json : null;\n"
+    "} catch (eV) {}\n\n"
+    "let rec;\nif (webRec) {\n  rec = webRec;\n} else if (phoneRec) {\n  rec = phoneRec;\n} else try {\n"
+    "  rec = $('reconcile ocr and omr1').first().json;\n")
+BUILD_FLAGGED_STAMP_BLOCK = (
+    "\n" + STAMP_MARK + ": the stamp read on the page goes on every queue row (phone and website).\n"
+    "// A stamp already stored for the term (auto_reject 'duplicate_stamp') stores the row discarded and\n"
+    "// rejected; it comes after the min-answered rule and wins over it. Nobody has to review it and no\n"
+    "// staff push is sent ('Get staff FCM for flagged scan' skips a discarded row).\n"
+    "const STAMP_RE = /^[0-9]{3,12}$/;\n"
+    "record.stamp_no = STAMP_RE.test(String(rec.stamp_no ?? '')) ? String(rec.stamp_no) : null;\n"
+    "record.stamp_source = record.stamp_no ? (rec.stamp_source || 'gemini') : null;   // 'gemini+python': both readers\n"
+    "record.partial_data = {\n"
+    "  ...record.partial_data,\n"
+    "  stamp_status: rec.stamp_status ?? record.partial_data?.stamp_status ?? null,\n"
+    "  stamp_candidates: Array.isArray(rec.stamp_candidates) ? rec.stamp_candidates : (record.partial_data?.stamp_candidates ?? []),\n"
+    "  stamp_raw: rec.stamp_raw ?? record.partial_data?.stamp_raw ?? null,\n"
+    "  // two readers (2026-10-17): what Gemini and the OMR's stamp reader saw, and a possible duplicate\n"
+    "  // of a stamp that was not accepted (a hint for staff, never an auto-reject)\n"
+    "  stamp_check: rec.stamp_check ?? record.partial_data?.stamp_check ?? null,\n"
+    "  stamp_hint: rec.stamp_hint ?? record.partial_data?.stamp_hint ?? null,\n"
+    "  ...((rec.stamp_duplicate_hint || record.partial_data?.stamp_duplicate_hint)\n"
+    "    ? { stamp_duplicate_hint: rec.stamp_duplicate_hint || record.partial_data.stamp_duplicate_hint } : {}),\n"
+    "};\n"
+    "if (rec.auto_reject === 'duplicate_stamp') {\n"
+    "  const dup = (rec.duplicate_of && typeof rec.duplicate_of === 'object') ? rec.duplicate_of : {};\n"
+    "  record.status = 'discarded';\n"
+    "  record.review_action = 'rejected';\n"
+    "  record.review_correction = {\n"
+    "    action: 'rejected',\n"
+    "    auto: true,\n"
+    "    rule: 'duplicate_stamp',\n"
+    "    note: 'This form was already scanned (stamp ' + (record.stamp_no || '?') + ')'\n"
+    "      + (dup.submitted_date ? ', saved ' + dup.submitted_date : '')\n"
+    "      + ', so this copy was discarded automatically and is not counted.',\n"
+    "    reviewed_by: null,\n"
+    "    reviewed_by_name: 'Automatic rule',\n"
+    "    at: new Date().toISOString(),\n"
+    "  };\n"
+    "  record.review_reasons = ['duplicate_stamp',\n"
+    "    ...record.review_reasons.filter((r) => r !== 'duplicate_stamp' && r !== 'reused_image' && r !== 'spot_check')];\n"
+    "  record.partial_data = { ...record.partial_data, duplicate_of: dup, stamp_status: 'ok' };\n"
+    "}\n")
+RAW_SCHEMA_STAMP = [
+    {"id": "stamp_no", "displayName": "stamp_no", "required": False, "defaultMatch": False, "display": True,
+     "type": "string", "canBeUsedToMatch": False, "removed": False},
+    {"id": "stamp_source", "displayName": "stamp_source", "required": False, "defaultMatch": False, "display": True,
+     "type": "string", "canBeUsedToMatch": False, "removed": False},
+]
+# website nodes refreshed from website_src (a live export holds the previous build of them)
+STAMP_WEB_CODE = [("Website Decide", "decide.js"), (WEBSITE_MAP, "website_map_to_target.js"),
+                  ("Website Success Response", "website_success_response.js")]
+STAMP_WEB_SQL = [("Website Identity Check", "identity_check.sql", "-- Batch still valid", IDENTITY_CHECK_PARAMS),
+                 ("Website Raw Upsert", "website_raw_upsert.sql", "-- Same key as the shared upsert", RAW_UPSERT_PARAMS)]
+
+
+def _patch_once(code: str, mark: str, anchor: str, new: str, where: str) -> tuple[str, bool]:
+    """Insert/replace once (guarded): returns (code, changed). Already applied when mark is in code."""
+    if mark in code:
+        return code, False
+    return replace_once(code, anchor, new, where), True
+
+
+def _first_line(text: str) -> str:
+    return text.split("\n", 1)[0]
+
+
+def _stamp_positions(by_name):
+    """Spots for the new nodes, next to their neighbours on the canvas."""
+    r, i = by_name[PHONE_RECONCILE]["position"], by_name[PHONE_ROUTE_IF]["position"]
+    m, k = by_name[CORRECTION_MAP]["position"], by_name[CORRECTION_MARK]["position"]
+    a = by_name[CORRECTION_RESPOND]["position"]
+    return {
+        PHONE_STAMP_CHECK: [(r[0] + i[0]) // 2, max(r[1], i[1]) + 176],
+        PHONE_STAMP_VERDICT: [i[0], max(r[1], i[1]) + 176],
+        CORR_STAMP_CHECK: [(m[0] + k[0]) // 2, max(m[1], k[1]) + 176],
+        CORR_STAMP_IF: [k[0], max(m[1], k[1]) + 176],
+        CORR_STAMP_RESPOND: [a[0], max(m[1], a[1]) + 176],
+    }
+
+
+def place_stamp_nodes(out, placed):
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name, pos in _stamp_positions(by_name).items():
+        if name in by_name and name not in placed:
+            by_name[name]["position"] = pos
+
+
+def apply_stamp_rule(out) -> list[str]:
+    """Stamp rule (idempotent; full build and live export; needs migration 015). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    conns = out["connections"]
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE, PHONE_RECONCILE, PHONE_ROUTE_IF, WEB_RECONCILE, BUILD_FLAGGED,
+                 CODE_IN_JS, PHONE_MAP, CORRECTION_MAP, CORRECTION_MARK, CORRECTION_RESPOND, RAW_UPSERT,
+                 PHONE_GEMINI_FAILURE, FLAGGED_FCM, *[n for n, _ in STAMP_WEB_CODE], *[n for n, *_ in STAMP_WEB_SQL]):
+        if name not in by_name:
+            raise SystemExit(f"apply_stamp_rule: no node named {name!r}")
+
+    # 1. both main Gemini prompts: the stamp paragraph + required stamp_numbers (array of strings)
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        body = gem["jsonBody"]
+        if '"stamp_numbers": {' not in body:
+            body = replace_once(body, HEADER_BUBBLE_ANCHOR, STAMP_PROMPT_ADD + HEADER_BUBBLE_ANCHOR, name)
+            body = replace_once(body, KNOWN_SCHEMA_ANCHOR, STAMP_SCHEMA_ADD + KNOWN_SCHEMA_ANCHOR, name)
+            body = replace_once(body, STAMP_REQUIRED_ANCHOR, STAMP_REQUIRED_NEW, name)
+            gem["jsonBody"] = body
+            done.append(f"{name}: stamp_numbers (prompt + required schema field)")
+        if body.count(STAMP_PROMPT_ADD) != 1 or (body.count(STAMP_REQUIRED_NEW) + body.count(STAMP_TILE_REQUIRED_NEW)) != 1:
+            raise SystemExit(f"{name}: stamp prompt/schema not exactly once")
+
+    # 1b. two readers (2026-10-17): tile sheet (last image, only when /process sent one) + STAMP TILES
+    #     paragraph + strict rules + stamp_numbers_page / stamp_reads_tiles (required); model unchanged
+    web_page_end = header_image_part_expr("$('Website Prepare Scan').first(0).json") + "\n      ]"
+    for name, omr, page_end in ((PHONE_GEMINI_NODE, PHONE_OMR_NODE, PHONE_PAGE_PART_END),
+                                (WEB_GEMINI_NODE, WEB_OMR_NODE, web_page_end)):
+        if omr not in by_name:
+            raise SystemExit(f"apply_stamp_rule: no node named {omr!r}")
+        gem = by_name[name]["parameters"]
+        if '"stamp_reads_tiles": {' not in gem["jsonBody"]:
+            gem["jsonBody"] = patch_gemini_stamp_tiles(gem["jsonBody"], name, omr, page_end)
+            done.append(f"{name}: stamp tile sheet (last image) + STAMP TILES / strict rules + stamp_numbers_page, "
+                        "stamp_reads_tiles")
+        body = gem["jsonBody"]
+        for part in (STAMP_STRICT_ADD, stamp_tile_text_expr(omr), stamp_tile_part_expr(omr), STAMP_TILE_SCHEMA_ADD,
+                     STAMP_TILE_REQUIRED_NEW):
+            if body.count(part) != 1:
+                raise SystemExit(f"{name}: stamp tile patch not exactly once ({part[:40]!r})")
+        if body.find(stamp_tile_part_expr(omr)) < body.find('"inlineData"'):
+            raise SystemExit(f"{name}: the tile sheet must be the last image")
+
+    # 2. both reconcilers carry stamp.js (they are refreshed from website_src by apply_check_only_rule /
+    #    apply_phone_name_privacy); here only checked
+    for name, src in ((WEB_RECONCILE, "reconcile.js"), (PHONE_RECONCILE, "phone_reconcile.js")):
+        if by_name[name]["parameters"]["jsCode"] != read_js(src) or "stReadStamps(" not in read_js(src):
+            raise SystemExit(f"{name}: not the current {src} with the stamp rule; run the reconciler refresh first")
+
+    # 3. website nodes from website_src (a live export holds the previous build)
+    for name, src in STAMP_WEB_CODE:
+        p = by_name[name]["parameters"]
+        new = read_js(src)
+        if p.get("jsCode") != new:
+            if _first_line(p.get("jsCode", "")) != _first_line(new):
+                raise SystemExit(f"{name}: not a previous build of {src} (hand edit?)")
+            p["jsCode"] = new
+            done.append(f"{name}: {src}")
+    for name, src, head, params in STAMP_WEB_SQL:
+        p = by_name[name]["parameters"]
+        sql = read(src)
+        assert_no_param_in_sql_comments(name, sql)
+        if p.get("query") != sql or p.get("options", {}).get("queryReplacement") != params:
+            if not str(p.get("query", "")).startswith(head):
+                raise SystemExit(f"{name}: not a previous build of {src} (hand edit?)")
+            p["query"] = sql
+            p.setdefault("options", {})["queryReplacement"] = params
+            done.append(f"{name}: {src} + parameters")
+
+    # 4. shared nodes
+    bf = by_name[BUILD_FLAGGED]["parameters"]
+    if MIN_ANSWERS_MARK not in bf["jsCode"]:
+        raise SystemExit(f"{BUILD_FLAGGED}: the min-answered block must be applied first")
+    code, ch1 = _patch_once(bf["jsCode"], "$('Phone Stamp Verdict')", BUILD_FLAGGED_PHONE_OLD, BUILD_FLAGGED_PHONE_NEW,
+                            BUILD_FLAGGED)
+    code, ch2 = _patch_once(code, STAMP_MARK, MIN_ANSWERS_ANCHOR, BUILD_FLAGGED_STAMP_BLOCK + MIN_ANSWERS_ANCHOR,
+                            BUILD_FLAGGED)
+    if code.find(MIN_ANSWERS_MARK) > code.find(STAMP_MARK):
+        raise SystemExit(f"{BUILD_FLAGGED}: the stamp block must come after the min-answered block")
+    if ch1 or ch2:
+        bf["jsCode"] = code
+        done.append(f"{BUILD_FLAGGED}: stamp columns, duplicate_stamp -> discarded/rejected, phone stamp verdict")
+
+    cij = by_name[CODE_IN_JS]["parameters"]
+    code, ch1 = _patch_once(cij["jsCode"], "function stampColumns(", "// Map the raw data and include the new database flags\n",
+                            STAMP_COLUMNS_HELPER + "// Map the raw data and include the new database flags\n", CODE_IN_JS)
+    code, ch2 = _patch_once(code, "? stampColumns(r) : {}", CIJ_STAMP_ANCHOR, CIJ_STAMP_LINE + CIJ_STAMP_ANCHOR, CODE_IN_JS)
+    if ch1 or ch2:
+        cij["jsCode"] = code
+        done.append(f"{CODE_IN_JS}: stamp_no / stamp_source (only when the mapper sent one)")
+
+    pm = by_name[PHONE_MAP]["parameters"]
+    code, ch = _patch_once(pm["jsCode"], 'result["stamp_no"]', PHONE_MAP_STAMP_ANCHOR,
+                           PHONE_MAP_STAMP_ANCHOR + PHONE_MAP_STAMP, PHONE_MAP)
+    if ch:
+        pm["jsCode"] = code
+        done.append(f"{PHONE_MAP}: stamp_no (gemini)")
+
+    mt = by_name[CORRECTION_MAP]["parameters"]
+    code, ch1 = _patch_once(mt["jsCode"], STAMP_MARK, MAP_TARGET_STAMP_ANCHOR, MAP_TARGET_STAMP + MAP_TARGET_STAMP_ANCHOR,
+                            CORRECTION_MAP)
+    code, ch2 = _patch_once(code, "stamp_no:               correctionStamp", MAP_TARGET_TOP_ANCHOR,
+                            MAP_TARGET_TOP_ANCHOR + MAP_TARGET_TOP, CORRECTION_MAP)
+    code, ch3 = _patch_once(code, "stamp_no:           correctionStamp", MAP_TARGET_RAW_ANCHOR,
+                            MAP_TARGET_RAW_ANCHOR + MAP_TARGET_RAW, CORRECTION_MAP)
+    if ch1 or ch2 or ch3:
+        mt["jsCode"] = code
+        done.append(f"{CORRECTION_MAP}: body.stamp_no / body.stamp_source")
+
+    gf = by_name[PHONE_GEMINI_FAILURE]["parameters"]
+    code, ch1 = _patch_once(gf["jsCode"], GEMINI_FAILURE_REASONS_NEW, GEMINI_FAILURE_REASONS_OLD,
+                            GEMINI_FAILURE_REASONS_NEW, PHONE_GEMINI_FAILURE)
+    code, ch2 = _patch_once(code, "stamp_status: 'unreadable'", GEMINI_FAILURE_STAMP_ANCHOR,
+                            GEMINI_FAILURE_STAMP_ANCHOR + GEMINI_FAILURE_STAMP, PHONE_GEMINI_FAILURE)
+    if ch1 or ch2:
+        gf["jsCode"] = code
+        done.append(f"{PHONE_GEMINI_FAILURE}: stamp_unreadable")
+
+    schema = by_name[RAW_UPSERT]["parameters"].get("columns", {}).get("schema")
+    if not isinstance(schema, list) or not any(c.get("id") == "task_id" for c in schema):
+        raise SystemExit(f"{RAW_UPSERT}: unexpected column schema; the input changed")
+    added = [copy.deepcopy(c) for c in RAW_SCHEMA_STAMP if not any(x.get("id") == c["id"] for x in schema)]
+    if added:
+        schema.extend(added)
+        done.append(f"{RAW_UPSERT}: column schema + stamp_no, stamp_source")
+
+    if by_name[FLAGGED_FCM]["parameters"].get("options", {}).get("queryReplacement") != FLAGGED_FCM_PARAMS:
+        raise SystemExit(f"{FLAGGED_FCM}: must skip a discarded row (apply_min_answers_rule first)")
+
+    # 5. phone: reconcile ocr and omr1 -> Phone Stamp Check -> Phone Stamp Verdict -> If31
+    pos = _stamp_positions(by_name)
+    if PHONE_STAMP_CHECK not in by_name:
+        outs = conns.get(PHONE_RECONCILE, {}).get("main", [])
+        if len(outs) != 1 or [c["node"] for c in outs[0]] != [PHONE_ROUTE_IF]:
+            raise SystemExit(f"{PHONE_RECONCILE} does not feed only {PHONE_ROUTE_IF}: {outs}; the input changed")
+        if PHONE_STAMP_VERDICT in by_name:
+            raise SystemExit(f"Node name clash: {PHONE_STAMP_VERDICT}")
+        outs[0] = []
+        out["nodes"].append(pg_node(PHONE_STAMP_CHECK, pos[PHONE_STAMP_CHECK], read("phone_stamp_check.sql"),
+                                    PHONE_STAMP_PARAMS, "continueRegularOutput", always_output=True))
+        out["nodes"].append(code_node(PHONE_STAMP_VERDICT, pos[PHONE_STAMP_VERDICT], "phone_stamp_verdict.js"))
+        add_connection(conns, PHONE_RECONCILE, 0, PHONE_STAMP_CHECK, 0)
+        add_connection(conns, PHONE_STAMP_CHECK, 0, PHONE_STAMP_VERDICT, 0)
+        add_connection(conns, PHONE_STAMP_VERDICT, 0, PHONE_ROUTE_IF, 0)
+        done.append(f"added {PHONE_RECONCILE} -> {PHONE_STAMP_CHECK} -> {PHONE_STAMP_VERDICT} -> {PHONE_ROUTE_IF}")
+    else:
+        by_name[PHONE_STAMP_CHECK]["parameters"]["query"] = read("phone_stamp_check.sql")
+        by_name[PHONE_STAMP_CHECK]["parameters"]["options"] = {"queryReplacement": PHONE_STAMP_PARAMS}
+        by_name[PHONE_STAMP_VERDICT]["parameters"]["jsCode"] = read_js("phone_stamp_verdict.js")
+
+    # 6. corrections: Map target -> Correction Stamp Check -> Correction Stamp Duplicate? -> (true) 409
+    #    answer, nothing saved; (false) Mark Queue Validated1 (+ the stamp) -> Respond to Webhook5 -> ...
+    if CORR_STAMP_CHECK not in by_name:
+        outs = conns.get(CORRECTION_MAP, {}).get("main", [])
+        if len(outs) != 1 or [c["node"] for c in outs[0]] != [CORRECTION_MARK]:
+            raise SystemExit(f"{CORRECTION_MAP} does not feed only {CORRECTION_MARK}: {outs}; the input changed")
+        if any(n in by_name for n in (CORR_STAMP_IF, CORR_STAMP_RESPOND)):
+            raise SystemExit("Node name clash: correction stamp nodes")
+        outs[0] = []
+        out["nodes"].append(pg_node(CORR_STAMP_CHECK, pos[CORR_STAMP_CHECK], read("phone_stamp_check.sql"),
+                                    CORR_STAMP_PARAMS, "continueRegularOutput", always_output=True))
+        out["nodes"].append(if_node(CORR_STAMP_IF, pos[CORR_STAMP_IF], CORR_STAMP_IF_EXPR, CORR_STAMP_IF_ID))
+        resp = respond_node(CORR_STAMP_RESPOND, pos[CORR_STAMP_RESPOND])
+        resp["parameters"] = {"respondWith": "json", "responseBody": CORR_STAMP_RESPONSE_BODY,
+                              "options": {"responseCode": CORR_STAMP_RESPONSE_CODE}}
+        out["nodes"].append(resp)
+        add_connection(conns, CORRECTION_MAP, 0, CORR_STAMP_CHECK, 0)
+        add_connection(conns, CORR_STAMP_CHECK, 0, CORR_STAMP_IF, 0)
+        add_connection(conns, CORR_STAMP_IF, 0, CORR_STAMP_RESPOND, 0)
+        add_connection(conns, CORR_STAMP_IF, 1, CORRECTION_MARK, 0)
+        done.append(f"added {CORRECTION_MAP} -> {CORR_STAMP_CHECK} -> {CORR_STAMP_IF} (true: {CORR_STAMP_RESPOND} "
+                    f"409; false: {CORRECTION_MARK})")
+    else:
+        by_name[CORR_STAMP_CHECK]["parameters"]["query"] = read("phone_stamp_check.sql")
+        by_name[CORR_STAMP_CHECK]["parameters"]["options"] = {"queryReplacement": CORR_STAMP_PARAMS}
+        by_name[CORR_STAMP_RESPOND]["parameters"]["responseBody"] = CORR_STAMP_RESPONSE_BODY
+        by_name[CORR_STAMP_RESPOND]["parameters"]["options"] = {"responseCode": CORR_STAMP_RESPONSE_CODE}
+        by_name[CORR_STAMP_IF]["parameters"]["conditions"]["conditions"][0]["leftValue"] = CORR_STAMP_IF_EXPR
+    mk = by_name[CORRECTION_MARK]["parameters"]
+    if mk.get("query") != MARK_QUERY or mk.get("options", {}).get("queryReplacement") != MARK_PARAMS:
+        if mk.get("query", "").strip() != MARK_QUERY_V1 or mk.get("options", {}).get("queryReplacement") != MARK_PARAMS_V1:
+            raise SystemExit(f"{CORRECTION_MARK}: unexpected query/parameters; the input changed")
+        mk["query"] = MARK_QUERY
+        mk.setdefault("options", {})["queryReplacement"] = MARK_PARAMS
+        done.append(f"{CORRECTION_MARK}: queue row also gets stamp_no / stamp_source")
+
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+# ---------------------------------------------------------------- corrections: never validate an unresolved scan
+# 2026-10-24. Before: a correction whose instructor/subject did not resolve (Flutter sent only the typed
+# text, the strict SQL name lookup missed it) still marked the failed_scan_queue row validated and then
+# went If19 (false) -> import_errors, where staff had to pick the instructor and subject AGAIN. Now:
+#   get existing scan image id -> Correction Candidates (Postgres, correction_candidates.sql) -> Correction
+#   Name Match (correction_name_match.js: body ids, else a clear LOCAL name_match.js match) -> get
+#   instructor id7 (by id, else the old strict name lookup) -> ...
+#   Map target -> Correction Ids Found? (true) -> Correction Stamp Check -> ... -> Mark Queue Validated1
+#                                       (false) -> Correction Not Found -> Correction Not Found Response
+#   (HTTP 422 {success:false, code, message, candidates}; nothing saved, the queue row stays pending).
+CORR_IMAGE_LOOKUP = "get existing scan image id"
+CORR_CANDIDATES = "Correction Candidates"
+CORR_NAME_MATCH = "Correction Name Match"
+CORR_IDS_IF = "Correction Ids Found?"
+CORR_IDS_IF_ID = "8f0b6c1e-web0-4d01-9a01-000000000010"
+CORR_IDS_IF_EXPR = ("={{ String($json.instructor_ID ?? '').trim() !== '' "
+                    "&& String($json.true_subject_id ?? '').trim() !== '' }}")
+CORR_NOT_FOUND = "Correction Not Found"
+CORR_NOT_FOUND_RESPOND = "Correction Not Found Response"
+CORR_NOT_FOUND_BODY = "={{ JSON.stringify($json.response) }}"
+CORR_NOT_FOUND_CODE = 422
+_CM = "$('" + CORR_NAME_MATCH + "').first().json"
+# the match node's values, else (it failed: onError continue) the webhook body exactly as before
+CORRECTION_INSTR_PARAMS_V2 = (
+    "={{ [ String(" + _CM + ".instructor_name ?? " + CORRECTION_BODY + ".instructor ?? ''), "
+    "String(" + _CM + ".instructor_id ?? " + CORRECTION_BODY + ".instructor_id ?? '') ] }}")
+CORRECTION_SUBJ_PARAMS_V2 = (
+    "={{ [ $json.instructor_id ?? null, "
+    "String(" + _CM + ".subject_text ?? " + CORRECTION_BODY + ".subject ?? ''), "
+    "String(" + _CM + ".subject_id ?? " + CORRECTION_BODY + ".subject_id ?? '') ] }}")
+
+
+def _correction_match_positions(by_name):
+    a, b = by_name[CORR_IMAGE_LOOKUP]["position"], by_name[CORRECTION_INSTR]["position"]
+    m = by_name[CORRECTION_MAP]["position"]
+    y = min(a[1], b[1]) - 176
+    return {
+        CORR_CANDIDATES: [a[0] + (b[0] - a[0]) // 4, y],
+        CORR_NAME_MATCH: [a[0] + 3 * (b[0] - a[0]) // 4, y],
+        CORR_IDS_IF: [m[0] + 112, m[1] - 176],
+        CORR_NOT_FOUND: [m[0] + 224, m[1] - 176],
+        CORR_NOT_FOUND_RESPOND: [m[0] + 448, m[1] - 176],
+    }
+
+
+def place_correction_match_nodes(out, placed):
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name, pos in _correction_match_positions(by_name).items():
+        if name in by_name and name not in placed:
+            by_name[name]["position"] = pos
+
+
+def apply_correction_name_match(out) -> list[str]:
+    """sast-manual-correction never marks a scan validated (nor makes an import error) unless its
+    instructor AND subject resolved; text-only corrections are matched locally (idempotent; full
+    build and live export; needs apply_stamp_rule first). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    conns = out["connections"]
+    done = []
+    for name in (CORRECTION_HOOK, CORR_IMAGE_LOOKUP, CORRECTION_INSTR, CORRECTION_SUBJ, CORRECTION_MAP,
+                 CORR_STAMP_CHECK, CORRECTION_MARK):
+        if name not in by_name:
+            raise SystemExit(f"apply_correction_name_match: no node named {name!r}")
+    pos = _correction_match_positions(by_name)
+    cand_sql = read("correction_candidates.sql")
+    assert_no_param_in_sql_comments(CORR_CANDIDATES, cand_sql)
+
+    # 1. webhook -> image lookup -> Correction Candidates -> Correction Name Match -> get instructor id7
+    if CORR_NAME_MATCH not in by_name:
+        outs = conns.get(CORR_IMAGE_LOOKUP, {}).get("main", [])
+        if len(outs) != 1 or [c["node"] for c in outs[0]] != [CORRECTION_INSTR]:
+            raise SystemExit(f"{CORR_IMAGE_LOOKUP} does not feed only {CORRECTION_INSTR}: {outs}; the input changed")
+        if CORR_CANDIDATES in by_name:
+            raise SystemExit(f"Node name clash: {CORR_CANDIDATES}")
+        outs[0] = []
+        out["nodes"].append(pg_node(CORR_CANDIDATES, pos[CORR_CANDIDATES], cand_sql, None,
+                                    "continueRegularOutput", always_output=True))
+        out["nodes"].append(code_node(CORR_NAME_MATCH, pos[CORR_NAME_MATCH], "correction_name_match.js",
+                                      on_error="continueRegularOutput"))
+        add_connection(conns, CORR_IMAGE_LOOKUP, 0, CORR_CANDIDATES, 0)
+        add_connection(conns, CORR_CANDIDATES, 0, CORR_NAME_MATCH, 0)
+        add_connection(conns, CORR_NAME_MATCH, 0, CORRECTION_INSTR, 0)
+        done.append(f"added {CORR_IMAGE_LOOKUP} -> {CORR_CANDIDATES} -> {CORR_NAME_MATCH} -> {CORRECTION_INSTR}")
+    else:
+        cp, mp = by_name[CORR_CANDIDATES]["parameters"], by_name[CORR_NAME_MATCH]["parameters"]
+        if cp.get("query") != cand_sql:
+            cp["query"] = cand_sql
+            cp["options"] = {}
+            done.append(f"{CORR_CANDIDATES}: correction_candidates.sql")
+        if mp.get("jsCode") != read_js("correction_name_match.js"):
+            mp["jsCode"] = read_js("correction_name_match.js")
+            done.append(f"{CORR_NAME_MATCH}: correction_name_match.js")
+
+    # 2. the SQL lookups read the match node (body values when it failed)
+    for name, old, new in ((CORRECTION_INSTR, CORRECTION_INSTR_PARAMS, CORRECTION_INSTR_PARAMS_V2),
+                           (CORRECTION_SUBJ, CORRECTION_SUBJ_PARAMS, CORRECTION_SUBJ_PARAMS_V2)):
+        opts = by_name[name]["parameters"].setdefault("options", {})
+        if opts.get("queryReplacement") == new:
+            continue
+        if opts.get("queryReplacement") != old:
+            raise SystemExit(f"{name}: unexpected parameters; the input changed")
+        opts["queryReplacement"] = new
+        done.append(f"{name}: parameters from {CORR_NAME_MATCH}")
+
+    # 3. Map target -> Correction Ids Found? -> (true) Correction Stamp Check; (false) 422, nothing saved
+    if CORR_IDS_IF not in by_name:
+        outs = conns.get(CORRECTION_MAP, {}).get("main", [])
+        if len(outs) != 1 or [c["node"] for c in outs[0]] != [CORR_STAMP_CHECK]:
+            raise SystemExit(f"{CORRECTION_MAP} does not feed only {CORR_STAMP_CHECK}: {outs}; the input changed")
+        if any(n in by_name for n in (CORR_NOT_FOUND, CORR_NOT_FOUND_RESPOND)):
+            raise SystemExit("Node name clash: correction not-found nodes")
+        outs[0] = []
+        out["nodes"].append(if_node(CORR_IDS_IF, pos[CORR_IDS_IF], CORR_IDS_IF_EXPR, CORR_IDS_IF_ID))
+        out["nodes"].append(code_node(CORR_NOT_FOUND, pos[CORR_NOT_FOUND], "correction_not_found.js"))
+        resp = respond_node(CORR_NOT_FOUND_RESPOND, pos[CORR_NOT_FOUND_RESPOND])
+        resp["parameters"] = {"respondWith": "json", "responseBody": CORR_NOT_FOUND_BODY,
+                              "options": {"responseCode": CORR_NOT_FOUND_CODE}}
+        out["nodes"].append(resp)
+        add_connection(conns, CORRECTION_MAP, 0, CORR_IDS_IF, 0)
+        add_connection(conns, CORR_IDS_IF, 0, CORR_STAMP_CHECK, 0)
+        add_connection(conns, CORR_IDS_IF, 1, CORR_NOT_FOUND, 0)
+        add_connection(conns, CORR_NOT_FOUND, 0, CORR_NOT_FOUND_RESPOND, 0)
+        done.append(f"added {CORRECTION_MAP} -> {CORR_IDS_IF} (true: {CORR_STAMP_CHECK}; false: {CORR_NOT_FOUND} -> "
+                    f"{CORR_NOT_FOUND_RESPOND} 422)")
+    else:
+        nf = by_name[CORR_NOT_FOUND]["parameters"]
+        if nf.get("jsCode") != read_js("correction_not_found.js"):
+            nf["jsCode"] = read_js("correction_not_found.js")
+            done.append(f"{CORR_NOT_FOUND}: correction_not_found.js")
+        by_name[CORR_NOT_FOUND_RESPOND]["parameters"] = {
+            "respondWith": "json", "responseBody": CORR_NOT_FOUND_BODY,
+            "options": {"responseCode": CORR_NOT_FOUND_CODE}}
+        by_name[CORR_IDS_IF]["parameters"]["conditions"]["conditions"][0]["leftValue"] = CORR_IDS_IF_EXPR
+
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+# OCR cross-check (2026-10-28, panel recommendations #2, #10, #11): website_src/ocr_crosscheck.js in both
+# reconcilers (the AI's student ID / remark vs the OMR's ocr_meta.ink; Gemini's corrected_rows),
+# INVALID_MARK_TEXT gains 'double' (OMR mark_detect: two marks in one row), and both main Gemini
+# prompts get one white-ink line plus the required corrected_rows array.
+WHITE_INK_LINE = ("- A mark covered by correction fluid or tape (white-out), or heavily crossed out, is erased and is "
+                  "not an answer: read only the remaining uncovered check, and list that row (m1-m10, p1-p10) in "
+                  "corrected_rows ([] if none).")
+CORRECTED_SCHEMA_ANCHOR = '"column_order": { "type": "ARRAY", "items": { "type": "STRING" } },'
+CORRECTED_SCHEMA = '\n        "corrected_rows": { "type": "ARRAY", "items": { "type": "STRING" } },'
+CORRECTED_REQUIRED_ANCHOR = '"scan_quality",\n        "ratings"\n      ]'
+CORRECTED_REQUIRED = '"scan_quality",\n        "corrected_rows",\n        "ratings"\n      ]'
+OCR_CROSSCHECK_CALL = "ocCrossCheck(py, gemini, geminiOk"
+
+
+def apply_ocr_crosscheck(out) -> list[str]:
+    """Panel recommendations #2/#10/#11 (idempotent; full build and live export; needs the stamp rule
+    and the check-only line first): both reconcilers refreshed from website_src (ocr_crosscheck.js,
+    INVALID_MARK_TEXT 'double'); both main Gemini prompts get WHITE_INK_LINE right after the check-only
+    line and a required corrected_rows array in the schema. No instructor names. Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        body = gem["jsonBody"]
+        if WHITE_INK_LINE not in body:
+            if body.count(CHECK_ONLY_LINE) != 1:
+                raise SystemExit(f"{name}: check-only line missing; run apply_check_only_rule first")
+            body = replace_once(body, CHECK_ONLY_ANCHOR + r"\n", CHECK_ONLY_ANCHOR + r"\n" + WHITE_INK_LINE + r"\n", name)
+            done.append(f"{name}: white-ink prompt line")
+        if '"corrected_rows"' not in body:
+            body = replace_once(body, CORRECTED_SCHEMA_ANCHOR, CORRECTED_SCHEMA_ANCHOR + CORRECTED_SCHEMA, name)
+            body = replace_once(body, CORRECTED_REQUIRED_ANCHOR, CORRECTED_REQUIRED, name)
+            done.append(f"{name}: corrected_rows in the response schema (required)")
+        gem["jsonBody"] = body
+        if body.count(WHITE_INK_LINE) != 1 or body.count('"corrected_rows"') != 2:
+            raise SystemExit(f"{name}: white-ink line / corrected_rows schema not exactly once")
+    for name, src, marks in ((WEB_RECONCILE, "reconcile.js", (WEB_RECONCILE_MARK,)),
+                             (PHONE_RECONCILE, "phone_reconcile.js", (PRIVACY_PHONE_RECONCILE_MARK,))):
+        rec = by_name[name]["parameters"]
+        new_rec = read_js(src)
+        if OCR_CROSSCHECK_CALL not in new_rec:
+            raise SystemExit(f"website_src/{src}: lacks the OCR cross-check")
+        if rec["jsCode"] != new_rec:
+            if not any(m in rec["jsCode"] for m in marks):
+                raise SystemExit(f"{name}: not a previous build of {src} (hand edit?)")
+            rec["jsCode"] = new_rec
+            done.append(f"{name}: {src} (OCR cross-check, double mark)")
+    assert_no_instructor_names_to_gemini(out)
+    return done
 
 
 def live_main(argv):
@@ -1810,6 +3730,21 @@ def live_main(argv):
     wf = json.loads(src.read_text(encoding="utf-8"))
     out = copy.deepcopy(wf)
     apply_sast_v2(out)
+    privacy = apply_phone_name_privacy(out)
+    check_only = apply_check_only_rule(out)
+    min_answers = apply_min_answers_rule(out)
+    stamp = apply_stamp_rule(out)
+    words = apply_wordcloud_words(out)
+    sentences = apply_ai_sentences(out)
+    interp = apply_interpretation_summary(out)
+    tones = apply_remark_tone_rules(out)
+    sheet = apply_sheet_header_match(out)
+    remarks = apply_remark_placeholders(out)
+    pacing = apply_gemini_rate_limit(out)
+    early = apply_sheet_early_response(out)
+    jobs = apply_sheet_import_jobs(out)
+    corr_match = apply_correction_name_match(out)
+    crosscheck = apply_ocr_crosscheck(out)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(f"input : {src} (name {wf.get('name')!r}, id {wf.get('id')}, versionId {wf.get('versionId')})")
@@ -1819,6 +3754,21 @@ def live_main(argv):
     print(f"flow  : {RAW_UPSERT_GATE} -> {SAST_PAIRS} -> {SAST_RECOMPUTE} (recompute_sast) -> {SAST_ALERT_IF}")
     print(f"null ratings: {CODE_IN_JS}, {FORMAT_FINAL}, {PHONE_MAP}, {WEBSITE_MAP}, {CORRECTION_BUILD}, "
           f"{', '.join(CORRECTION_MAPS)}")
+    print("phone name privacy: " + ("; ".join(privacy) if privacy else "already applied"))
+    print("check-only rule: " + ("; ".join(check_only) if check_only else "already applied"))
+    print("min-answered rule: " + ("; ".join(min_answers) if min_answers else "already applied"))
+    print("stamp rule: " + ("; ".join(stamp) if stamp else "already applied"))
+    print("wordcloud words: " + ("; ".join(words) if words else "already applied"))
+    print("ai sentences: " + ("; ".join(sentences) if sentences else "already applied"))
+    print("interpretation summary: " + ("; ".join(interp) if interp else "already applied"))
+    print("remark tone rules: " + ("; ".join(tones) if tones else "already applied"))
+    print("sheet header match: " + ("; ".join(sheet) if sheet else "already applied"))
+    print("placeholder comments: " + ("; ".join(remarks) if remarks else "already applied"))
+    print("gemini rate limit: " + ("; ".join(pacing) if pacing else "already applied"))
+    print("sheet early response: " + ("; ".join(early) if early else "already applied"))
+    print("sheet import jobs: " + ("; ".join(jobs) if jobs else "already applied"))
+    print("correction name match: " + ("; ".join(corr_match) if corr_match else "already applied"))
+    print("ocr cross-check: " + ("; ".join(crosscheck) if crosscheck else "already applied"))
     return 0
 
 
@@ -1899,6 +3849,9 @@ def main(argv):
     fix_remark_loop_single_feed(out)
     add_phone_remark_check(out)
     add_phone_known_names(out)
+    apply_phone_name_privacy(out)   # adds Phone Instructor Candidates; no Gemini call gets instructor names
+    apply_check_only_rule(out)      # only check/slash marks count: prompt line (reconcilers come from website_src)
+    apply_min_answers_rule(out)     # fewer than 5 of 20 answered: queue row stored discarded, no push
 
     # 5. connections (website front end + gate after the raw upsert)
     for s, o, t, i in WEBSITE_CONNECTIONS:
@@ -1907,12 +3860,37 @@ def main(argv):
     # 5b. migration 013: one recompute_sast path after the raw upsert; blank ratings stay NULL
     apply_sast_v2(out)
 
+    # 5c. migration 015: the stamp rule (stamp_numbers, duplicate_stamp auto-reject, corrections 409)
+    apply_stamp_rule(out)
+    apply_correction_name_match(out)   # unresolved instructor/subject -> 422, queue row stays pending
+    apply_ocr_crosscheck(out)          # AI student ID / remark vs OMR ink, white-ink rows, double marks
+
+    # 5d. word cloud words (real word counts next to the AI themes)
+    apply_wordcloud_words(out)
+
+    # 5d2. AI positives/improvements as one sentence per line
+    apply_ai_sentences(out)
+    apply_interpretation_summary(out)   # student_interpretation: one paragraph about all students
+    apply_remark_tone_rules(out)        # tone rules/examples in both remark prompts; tolerant tone parsing
+
+    # 5e. Google Sheet import: columns matched by normalised header (old and new layout)
+    apply_sheet_header_match(out)
+    apply_remark_placeholders(out)
+    apply_sheet_early_response(out)   # sheet webhook answers before the Gemini remark loop
+
+    # 5e. Gemini free tier: paced remark loop, retries, no import-stopping failure
+    apply_gemini_rate_limit(out)
+
+    # 5f. sheet import job (migration 018): the app polls sheet_import_jobs until the flow really ends
+    apply_sheet_import_jobs(out)
+
     # 6. secrets -> credentials
     swapped = swap_supabase_credentials(out["nodes"])
 
     # 7. canvas layout from the live export (positions only); new nodes next to their neighbours
     moved, placed = apply_live_layout(out, layout)
     place_new_nodes(out, placed)
+    _sheet_job_order({n["name"]: n for n in out["nodes"]})   # the done marker below If19 (execution order)
 
     # Import inactive: activate after checking the credentials in the editor.
     out["active"] = False

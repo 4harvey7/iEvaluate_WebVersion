@@ -2,7 +2,7 @@
 // Each database token is paired with its best form token (edit distance, initials, prefixes);
 // the score is the weighted share of matched tokens (0.75 database side + 0.25 form side).
 const NM_TOKEN_MIN = 0.55;       // weaker token pairs count as no match
-const NM_KNOWN_RAW_MIN = 0.30;   // Gemini's pick from the list needs this much support from the raw reading
+const NM_KNOWN_RAW_MIN = 0.30;   // Gemini's pick from the subject list needs this much support from the raw reading
 const NM_TITLES = new Set(['prof', 'professor', 'dr', 'doc', 'mr', 'mrs', 'ms', 'miss', 'madam', 'maam', 'sir', 'engr',
   'eng', 'atty', 'arch', 'rev', 'fr', 'hon', 'instr', 'instructor', 'teacher', 'phd', 'edd', 'dba', 'mba', 'mit', 'mat',
   'maed', 'lpt', 'rn', 'cpa', 'jr', 'sr', 'ii', 'iii', 'iv']);
@@ -89,13 +89,22 @@ function nmList(v) {
   if (Array.isArray(v)) return v;
   try { const p = JSON.parse(String(v ?? '')); return Array.isArray(p) ? p : []; } catch (e) { return []; }
 }
-// Gemini's pick from the known instructor list, only when it is on the list and fits the raw reading
-function nmKnownInstructor(known, names, raw) {
-  const key = nmNameTokens(known).join(' ');
-  if (!key) return '';
-  const hit = nmList(names).find((n) => nmNameTokens(n).join(' ') === key);
-  if (!hit) return '';
-  return nmScore(nmNameTokens(hit), nmNameTokens(raw)).score >= NM_KNOWN_RAW_MIN - 1e-6 ? String(hit) : '';
+// Phone reconciler: the database instructor the raw reading names, matched locally (Gemini never
+// sees an instructor list). found = one entry scores >= minScore and beats every other by margin;
+// ambiguous = several entries are that close (also two people with the same name); none = no entry
+// reaches minScore. Only 'found' returns a name.
+function nmBestInstructor(raw, names, minScore, margin) {
+  const got = nmNameTokens(raw);
+  const scored = !got.length ? [] : nmList(names)
+    .map((n) => String(n ?? '').trim())
+    .filter(Boolean)
+    .map((name) => ({ name, score: nmScore(nmNameTokens(name), got).score }))
+    .filter((c) => c.score >= minScore - 1e-6)
+    .sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+  if (!scored.length) return { match: 'none', name: '', score: null, contenders: [] };
+  const close = scored.filter((c) => scored[0].score - c.score < margin - 1e-6);
+  if (close.length > 1) return { match: 'ambiguous', name: '', score: scored[0].score, contenders: close.map((c) => c.name) };
+  return { match: 'found', name: scored[0].name, score: scored[0].score, contenders: [] };
 }
 // same for the subject: known is a subject code from the list
 function nmKnownSubject(known, subjects, raw) {

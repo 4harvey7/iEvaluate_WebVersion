@@ -1,4 +1,5 @@
--- Batch still valid, and no other stored form of this student.
+-- Batch still valid, no other stored form of this student, and (stamp rule, 2026-10-16) no other
+-- stored form with this page's numbering-machine stamp in the resolved term ('' = no stamp).
 WITH
 bi AS (
   -- placeholder instructors never count as disabled
@@ -40,6 +41,10 @@ dup AS (
     AND r.student_id            = btrim($4)
     AND r.task_id IS DISTINCT FROM $5
   LIMIT 1
+),
+stamp AS (
+  SELECT public.sast_stamp_duplicate_of(t.term_id, btrim(COALESCE($6, '')), $5) AS dup
+  FROM t
 )
 SELECT
   (bi.id IS NOT NULL)                                                    AS batch_instructor_exists,
@@ -53,7 +58,10 @@ SELECT
   COALESCE(bs.subject_name, '')                                          AS batch_subject_name,
   t.term_id                                                              AS resolved_term_id,
   EXISTS (SELECT 1 FROM dup)                                             AS duplicate_student_exists,
-  (SELECT dup.task_id FROM dup)                                          AS duplicate_student_task_id
+  (SELECT dup.task_id FROM dup)                                          AS duplicate_student_task_id,
+  (stamp.dup IS NOT NULL)                                                AS duplicate_stamp_exists,
+  stamp.dup                                                              AS duplicate_stamp_of
 FROM t
+CROSS JOIN stamp
 LEFT JOIN bi ON true
 LEFT JOIN bs ON true;

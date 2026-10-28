@@ -3,16 +3,20 @@ const AGREEMENT_MIN = 0.30;   // rows that must not clearly conflict (see confli
 // @@include profanity.js
 // @@include remark_verify.js
 // @@include layout_check.js
+// @@include stamp.js
+// @@include ocr_crosscheck.js
 
 const QUESTIONS         = 10;
 const TOTAL_ROWS        = QUESTIONS * 2;
 const MAX_AGREED_BLANKS = 10;
+const MIN_ANSWERED      = 5;      // teacher rule: fewer answered items -> the form is discarded
 const FLAG_DIFF_MARGIN  = 2;      // levels apart for a real conflict (S vs VS is not one)
 const WEAK_TOP_SCORE    = 0.05;
 const WEAK_MARGIN       = 0.02;
 const WEAK_ROW_LIMIT    = 4;
 const WEAK_BLANK_LIMIT    = 3;    // website only
 const WEAK_DISAGREE_LIMIT = 3;    // website only
+const INVALID_MARK_TEXT = { x: 'an x', shade: 'a shaded bubble', circle: 'a circle', dot: 'a dot', double: 'two marks' };
 const FALLBACK_GRID_SOURCE  = 'fallback';
 const CRITICAL_QUALITY_ISSUES = ['low_light', 'scribbled_grid', 'damaged_form'];
 const AGREEMENT_MIN_ROWS = Math.ceil(AGREEMENT_MIN * TOTAL_ROWS - 1e-9);   // 0.30 -> 6 of 20
@@ -66,6 +70,20 @@ for (const d of (py.omr_debug ?? [])) {
   };
 }
 
+// Teacher rule (OMR, 2026-10-08): only a check or slash counts. The OMR returns a rejected row like
+// a blank one (detected: false) and names the mark in omr_debug[].invalid_mark ('x' | 'shade' |
+// 'circle' | 'dot'); an older OMR build sends no such field (= null). A rejected row stays blank:
+// Gemini never fills it, it is not a Python-vs-Gemini conflict and not a blank for too_many_blanks.
+const invalidByRow = {};
+for (const d of (py.omr_debug ?? [])) {
+  const ri = Number(d.row_index);
+  const mark = d.invalid_mark === null || d.invalid_mark === undefined ? '' : String(d.invalid_mark).trim().toLowerCase();
+  if (Number.isInteger(ri) && mark) invalidByRow[ri] = mark.slice(0, 20);
+}
+// a row Python read as a rating is never invalid, whatever omr_debug says
+const invalidMarkOf = (p, rowIndex) => (p === null ? (invalidByRow[rowIndex] ?? null) : null);
+const markText = (m) => INVALID_MARK_TEXT[m] || `a "${m}" mark`;
+
 // read Gemini by name; the input may be the re-check item
 const gIn = $input.first()?.json ?? {};
 let geminiCallFailed = false;
@@ -106,7 +124,11 @@ function geminiScore(key) {
 const layoutSignals = lcLayoutSignals(py, gemini, geminiOk);
 let exactAgreeRows = 0;
 for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
-  for (let i = 0; i < QUESTIONS; i++) if (pythonScore(section, i) === geminiScore(`${prefix}${i + 1}`)) exactAgreeRows++;
+  for (let i = 0; i < QUESTIONS; i++) {
+    const p = pythonScore(section, i);
+    const g = invalidMarkOf(p, (prefix === 'm' ? 0 : QUESTIONS) + i) ? null : geminiScore(`${prefix}${i + 1}`);
+    if (p === g) exactAgreeRows++;
+  }
 }
 if (lcFallbackSignal(py, geminiOk && pythonOk, exactAgreeRows, TOTAL_ROWS)) layoutSignals.push('fallback_grid_low_agreement');
 const layoutMismatch = layoutSignals.length > 0;
@@ -122,6 +144,7 @@ const conflictRows = [];   // differ AND count against the agreement rule
 const resolvedRows = [];   // differ, but kept as the scanner read them
 const weakGeminiBlankRows = [];
 const weakDisagreeRows = [];
+const invalidRows = [];   // { key, mark }: a non-check mark, left blank
 
 for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
   for (let i = 0; i < QUESTIONS; i++) {
@@ -130,7 +153,9 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
     const conf = confByRow[rowIndex] ?? { top: null, margin: null, weak: false };
 
     const p = pythonScore(section, i);
-    const g = geminiScore(key);
+    const invalidMark = invalidMarkOf(p, rowIndex);
+    const gRead = geminiScore(key);
+    const g = invalidMark ? null : gRead;   // the check-only rule overrides Gemini's reading of that mark
     const agree = p === g;   // both blank counts as agreeing
     if (agree) agreeRows++;
     // scanner sure of a mark -> its reading wins; no confidence data or a layout mismatch -> not sure
@@ -157,6 +182,10 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
       } else if (geminiOk && conf.weak) {
         weakGeminiBlankRows.push(key);
       }
+    } else if (invalidMark) {
+      used = null;
+      source = 'invalid_mark';
+      invalidRows.push({ key, mark: invalidMark });
     } else if (g !== null) {
       used = g;
       source = 'gemini_fill';
@@ -168,7 +197,7 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
     }
     scores[key] = used;
     comparisons.push({ question: key, python: p, gemini: g, used, source, agree, python_weak: p !== null && conf.weak,
-      resolved_by: resolvedBy });
+      resolved_by: resolvedBy, invalid_mark: invalidMark, ...(invalidMark ? { gemini_raw: gRead } : {}) });
   }
 }
 
@@ -237,14 +266,42 @@ if (geminiOk && gemini.scan_quality && gemini.scan_quality.poor_quality === true
 }
 if (agreementKnown && flagAgreeRows < AGREEMENT_MIN_ROWS) reasons.push(`omr_agreement_below_${AGREEMENT_MIN_PCT}`);
 if (weakRows >= WEAK_ROW_LIMIT) reasons.push(`low_confidence_ocr_${weakRows}_rows`);
-if (agreedBlanks > MAX_AGREED_BLANKS) reasons.push(`too_many_blanks_${agreedBlanks}_of_20`);
+// Teacher rule (2026-10-08): fewer than MIN_ANSWERED of the 20 items answered -> the form is discarded
+// and never counted. An answer is a stored rating: Python's, or Gemini's on a row Python read blank,
+// so a row either engine read as a valid mark counts (a disagreement never turns an answer into a
+// blank). Rows the OMR rejected (invalid_mark) are not answers. The page is discarded automatically
+// only when both readers worked on the expected grid; otherwise staff check it (same reason).
+const answeredCount = Object.values(scores).filter((s) => s !== null).length;
+const tooFewAnswers = answeredCount < MIN_ANSWERED;
+const scanReliable = pythonOk && geminiOk && !layoutMismatch && py.table_found !== false
+  && py.grid_source !== FALLBACK_GRID_SOURCE && !reasons.includes('poor_scan_quality')
+  && !reasons.some((r) => r.startsWith('not_a_sast_form'));
+const autoDiscard = tooFewAnswers && scanReliable;
+if (tooFewAnswers) reasons.push(`too_few_answers_${answeredCount}_of_20`);
+// one message for an (almost) empty form: too_few_answers replaces too_many_blanks
+else if (agreedBlanks > MAX_AGREED_BLANKS) reasons.push(`too_many_blanks_${agreedBlanks}_of_20`);
 // unlike phone, grid_not_detected stays even with Gemini ratings
 if (weakGeminiBlankRows.length >= WEAK_BLANK_LIMIT) reasons.push(`python_weak_gemini_blank_${weakGeminiBlankRows.length}_rows`);
 if (weakDisagreeRows.length >= WEAK_DISAGREE_LIMIT) reasons.push(`python_weak_disagreement_${weakDisagreeRows.length}_rows`);
 if (py.grid_source === FALLBACK_GRID_SOURCE) reasons.push('omr_fallback_grid');
 if (layoutMismatch) reasons.push('layout_mismatch');
+// stamp rule (2026-10-16, two readers 2026-10-17): one stamp number that Gemini and the OMR's stamp
+// reader both read, else review (stamp.js)
+const stamp = stCheckStamp(gemini, geminiOk, py.stamp_candidates);
+if (stReason(stamp)) reasons.push(stReason(stamp));
+
+// OCR cross-check (ocr_crosscheck.js): the AI's student ID / remark vs the OMR's ink check of the box,
+// and Gemini's corrected_rows (white ink). Review only; nothing without ocr_meta.ink. A blank ID box
+// read blank is left to Website Decide (student_id_missing), so no student_id_missed here.
+const ocrCheck = ocCrossCheck(py, gemini, geminiOk, { studentIdMissed: false });
+reasons.push(...ocrCheck.reasons);
 
 const noteParts = [];
+if (autoDiscard) {
+  noteParts.push(`Only ${answeredCount} of the ${TOTAL_ROWS} items were answered (at least ${MIN_ANSWERED} are needed), so this form was discarded automatically and is not counted.`);
+} else if (tooFewAnswers) {
+  noteParts.push(`Only ${answeredCount} of the ${TOTAL_ROWS} items have an answer (at least ${MIN_ANSWERED} are needed to count a form), but the scan could not be fully checked. Compare with the sheet: fill in any answers that were missed, or discard the form.`);
+}
 if (geminiOk && gemini.document_check && gemini.document_check.is_sast_form === false) {
   noteParts.push(gemini.document_check.reason || 'This does not look like a SAST evaluation form.');
 }
@@ -273,7 +330,14 @@ if (weakDisagreeRows.length >= WEAK_DISAGREE_LIMIT) {
 if (py.grid_source === FALLBACK_GRID_SOURCE && py.table_found !== false) {
   noteParts.push('The rating grid could not be located, so a fixed fallback grid was used. The row positions may be wrong; verify every rating.');
 }
+if (invalidRows.length) {
+  noteParts.push(`${invalidRows.map((r) => `${r.key}: scanner saw ${markText(r.mark)} (not counted)`).join('; ')}. `
+    + 'Only a check or slash mark counts, so those answers stay blank.'
+    + (invalidRows.some((r) => r.mark === 'double') ? ' A row with two marks has no single answer.' : ''));
+}
 if (layoutMismatch) noteParts.push(lcNote(layoutSignals, geminiOk ? lcColumnOrder(gemini) : null));
+if (stNote(stamp)) noteParts.push(stNote(stamp));
+noteParts.push(...ocrCheck.notes);
 if (!pythonOk) {
   noteParts.push(`The OMR scanner returned no ratings for this page${errText(py) ? ` (${errText(py)})` : ''}, so the answers shown come from the AI only. Verify every rating.`);
 }
@@ -304,13 +368,23 @@ return [{
     remarks_masked: remarkResult.masked,
     remark_check: remarkResult.check,
     date: clean(gText('date')).slice(0, 50),
-    student_id: clean(gText('student_id')).replace(/\s+/g, '').slice(0, 50),
+    student_id: ocrCheck.drop_student_id ? '' : clean(gText('student_id')).replace(/\s+/g, '').slice(0, 50),
+    ocr_check: ocrCheck.check,
     text_source: geminiOk ? 'gemini' : 'none',
+    stamp_no: stamp.stamp_no,                 // the one stamp read on the page (status 'ok'), else null
+    stamp_status: stamp.stamp_status,         // ok | unconfirmed | missing | unreadable | multiple
+    stamp_candidates: stamp.stamp_candidates, // every readable stamp number, in order
+    stamp_raw: stamp.stamp_raw,               // Gemini's stamp_numbers as received
+    stamp_source: stamp.stamp_source,         // 'gemini+python' when ok (both readers agree)
+    stamp_hint: stamp.stamp_hint,             // not ok: the number to check for a duplicate (hint only)
+    stamp_check: stamp.stamp_check,           // what both readers saw (review screens)
 
     ratings: scores,
     document_check: gemini.document_check ?? null,
     needs_review: needsReview,
     review_reasons: reasons,
+    answered_count: answeredCount,
+    auto_discard: autoDiscard,   // fewer than MIN_ANSWERED answered on a reliable scan: stored as discarded
     agreement_percent: agreementPercent,
     agreement_rows: agreementKnown ? agreeRows : null,
     omr_agreement: {
@@ -322,6 +396,8 @@ return [{
       resolved_differences: resolvedRows.length,
       real_differences: realDifferences,
       filled_from_gemini: filledByGemini,
+      invalid_mark_rows: invalidRows.length,   // rows left blank by the check-only rule
+      answered_count: answeredCount,           // rows with a stored rating (min-answered rule)
       comparisons,   // Flutter review screen lists these
     },
     table_found: typeof py.table_found === 'boolean' ? py.table_found : null,
@@ -335,8 +411,9 @@ return [{
     review_note: reviewNote,
     comparisons,
     python_raw_ratings: py.ratings ?? null,
-    summary: `${Object.values(scores).filter((s) => s !== null).length}/${TOTAL_ROWS} answered`
+    summary: `${answeredCount}/${TOTAL_ROWS} answered`
+      + (invalidRows.length ? `, ${invalidRows.length} non-check mark(s) not counted` : '')
       + (agreementPercent !== null ? `, agreement ${agreementPercent}%` : '')
-      + (needsReview ? ` — flagged: ${reasons.join(', ')}` : ' — clean'),
+      + (autoDiscard ? ` — discarded: ${reasons.join(', ')}` : needsReview ? ` — flagged: ${reasons.join(', ')}` : ' — clean'),
   },
 }];

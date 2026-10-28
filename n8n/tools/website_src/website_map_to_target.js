@@ -11,6 +11,11 @@ result['review_reasons'] = [];
 result['omr_comparisons'] = rec.comparisons || null;
 result['review_note'] = d.review_note || null;
 result['task_id'] = d.task_id;
+// stamp rule: already stored by Website Raw Upsert; mapped so the shared row is the same
+if (d.stamp_no) {
+  result['stamp_no'] = d.stamp_no;
+  result['stamp_source'] = d.stamp_source || 'gemini';
+}
 
 result['Student ID'] = d.student_id || '';
 result['Instructor/Professor'] = d.instructor_name || '';

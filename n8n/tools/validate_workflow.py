@@ -40,17 +40,28 @@ Checks
     or analyses a remark; the phone and website remark re-check (Remark Check -> IF -> Verify
     Remark Words -> reconciler, no retry, fail safe) and its time budget; the remark-AI parsers
     drop profane/masked keywords; both main Gemini prompts transcribe without censoring
-  * known names: 'Website Known Names' / 'Phone Known Names' (known_names.sql, continue on error)
-    right before the main Gemini calls, whose prompts list the known instructors/subjects and
-    ask for known_instructor / known_subject -- except the website: 'Website Known Names' runs
-    website_known_names.sql (subjects only, no parameters) and its prompt asks only for
-    known_subject, so no instructor name ever reaches Gemini; Decide (subject pick) and the phone
-    reconciler use them through one identical copy of website_src/name_match.js; not_found never flags
+  * known names: 'Website Known Names' / 'Phone Known Names' (website_known_names.sql /
+    known_names.sql: the same subjects-only query, no parameters, continue on error) right before
+    the main Gemini calls, whose prompts list only the known subjects and ask only for
+    known_subject; Decide (subject pick) and the phone reconciler use them through one identical
+    copy of website_src/name_match.js; not_found never flags
+  * privacy: no Gemini request (HTTP body or LLM chain prompt) carries an instructor list or reads
+    a node that returns instructor names. The phone instructor is matched locally: 'Phone
+    Instructor Candidates' (phone_instructor_candidates.sql, after the Gemini call: 'Is not a SAST
+    form?' false -> it -> 'Phone Remark Check') + nmBestInstructor in the phone reconciler
   * migration 013: one aggregate path Raw Upsert Done -> Code in JavaScript8 -> 'update to overall
     total2' (SELECT * FROM public.recompute_sast($1, $2), continue on error) -> If28, entered once (no
     duplicate low-score pushes); the old Management/Performance chains are gone and unreferenced
   * blank ratings stay NULL: one identical copy of website_src/rating.js where client/OMR values are
     read; no mapper turns a missing m/p rating into 0
+  * stamp rule (migration 015): both Gemini prompts carry the stamp paragraph and the required
+    stamp_numbers; one identical copy of website_src/stamp.js in both reconcilers; Website Identity
+    Check gets the stamp as $6 (duplicate_stamp_exists / duplicate_stamp_of); Website Raw Upsert calls
+    public.save_website_raw_row (12 parameters); phone 'reconcile ocr and omr1' -> 'Phone Stamp Check'
+    -> 'Phone Stamp Verdict' -> If31; build flagged record1 stores duplicate_stamp discarded/rejected
+    after the min-answered block; corrections: Map target -> 'Correction Stamp Check' -> 'Correction
+    Stamp Duplicate?' (true -> 409 'Correction Duplicate Stamp Response', false -> Mark Queue
+    Validated1, which also writes the stamp)
 A live n8n export of this build (e.g. ../perfect-2.1.json) has n8n's own node ids and drops default
 values, so compare it with the build output instead of the original export, or pass a non-existent
 ORIGINAL_JSON to skip the original-diff checks.
@@ -101,12 +112,18 @@ EDITED_SHARED = {  # node -> parameter paths allowed to change
     "Code in JavaScript": [("jsCode",)],
     "build flagged record1": [("jsCode",)],
     "Respond to Webhook": [("responseBody",)],
-    "update to overall total2": [("query",)],   # migration 013: SELECT * FROM public.recompute_sast($1, $2)
+    "update to overall total2": [("query",), ("@", "onError")],   # migration 013: recompute_sast; error output (018)
+    # sheet import job (018): error outputs -> Describe Import Failure
+    "insert data to student remarks2": [("@", "onError")],
+    "store results2": [("@", "onError")],
+    "insert to word cloud2": [("@", "onError")],
     # blank ratings stay NULL (website_src/rating.js)
     "2. Format Final Results1": [("jsCode",)],
     "Map to Target Format3": [("jsCode",)],
     "build the record1": [("jsCode",)],
-    "Insert or update rows in a table1": [("options", "queryBatching"), ("@", "alwaysOutputData")],
+    "Insert or update rows in a table1": [("options", "queryBatching"), ("@", "alwaysOutputData"),
+                                          ("columns", "schema")],   # + stamp_no, stamp_source (migration 015)
+    "Mark Queue Validated1": [("query",), ("options", "queryReplacement")],   # + the corrected stamp (015)
     "get instructor id7": [("query",), ("options", "queryReplacement")],   # + body read by webhook name, id first
     "get subject id6": [("query",), ("options", "queryReplacement")],      # body.subject_id first, array params
     "get instructor id9": [("query",), ("options", "queryReplacement")],
@@ -131,6 +148,15 @@ EDITED_SHARED = {  # node -> parameter paths allowed to change
     "Add Parse Code node1": [("jsCode",)],
     "Unified AI Analysis1": [("text",)],                 # + keyword rule
     "Individual AI Analysis1": [("text",)],
+    # word cloud words (website_src/remark_words.js; instructor name tokens for the counter, never sent to AI)
+    "Get Previous Instructor Analysis1": [("query",)],
+    "Prepare Unified AI Input1": [("jsCode",)],
+    "Get the old wordcloud1": [("query",)],
+    "Prepare Existing Wordcloud1": [("jsCode",)],
+    "Prepare Individual AI Input1": [("jsCode",)],
+    # interpretation summary: the single-scan path also gets previous_remarks (remark + tone only)
+    "Get Existing AI Suggestion1": [("query",)],
+    "Prepare Existing AI1": [("jsCode",)],
 }
 PHONE_REMARK_NODES = ["Phone Remark Check", "Phone Remark Needs Check?", "Phone Verify Remark Words"]
 # nodes that must carry the sexual-word filter (identical copies of website_src/profanity.js)
@@ -144,6 +170,11 @@ REMARK_CHAINS = [("phone", "Is not a SAST form?", "Phone Remark Check", "Phone R
                   "Phone Verify Remark Words", "reconcile ocr and omr1", "ai validation ocr and omr"),
                  ("website", "Website Is Not A Form?", "Website Remark Check", "Website Remark Needs Check?",
                   "Website Verify Remark Words", "Website Reconcile OCR OMR", "Website AI Validation")]
+# phone: creditable instructors for the reconciler's local match, queried after the Gemini call
+PHONE_CANDIDATES = "Phone Instructor Candidates"
+# must never appear in a Gemini request (privacy)
+INSTRUCTOR_LIST_MARKERS = ("known_instructor", "Known instructors", "instructor_list", "instructor_names",
+                           "$('" + PHONE_CANDIDATES + "')", "$('Website Form Match')", "first_name", "last_name")
 # (node before, known-names node, main Gemini node)
 KNOWN_CHAINS = [("Website Python OMR", "Website Known Names", "Website AI Validation"),
                 ("image to ocr and omr python", "Phone Known Names", "ai validation ocr and omr")]
@@ -175,6 +206,22 @@ CORRECTION_MAP = "Map target"
 CORRECTION_MARK = "Mark Queue Validated1"
 CORRECTION_RESPOND = "Respond to Webhook5"
 CORRECTION_AFTER = "After Correction Response"
+# stamp rule (migration 015)
+PHONE_STAMP_CHECK = "Phone Stamp Check"
+PHONE_STAMP_VERDICT = "Phone Stamp Verdict"
+CORR_STAMP_CHECK = "Correction Stamp Check"
+CORR_STAMP_IF = "Correction Stamp Duplicate?"
+CORR_STAMP_RESPOND = "Correction Duplicate Stamp Response"
+# corrections never validate an unresolved scan (2026-10-24, apply_correction_name_match)
+CORR_CANDIDATES = "Correction Candidates"
+CORR_NAME_MATCH = "Correction Name Match"
+CORR_IDS_IF = "Correction Ids Found?"
+CORR_NOT_FOUND = "Correction Not Found"
+CORR_NOT_FOUND_RESPOND = "Correction Not Found Response"
+CORR_MATCH_NODES = [CORR_CANDIDATES, CORR_NAME_MATCH, CORR_IDS_IF, CORR_NOT_FOUND, CORR_NOT_FOUND_RESPOND]
+STAMP_REASONS = ["stamp_missing", "stamp_unreadable", "multiple_stamps", "duplicate_stamp"]
+ST_START = "// stamp reader, from website_src/stamp.js\n"
+ST_END = "// end of stamp reader\n"
 RECONCILERS = ["Website Reconcile OCR OMR", "reconcile ocr and omr1"]
 OLD_OMR_RULES = ["omr_disagreement_", "severe_omr_disagreement_", "low_confidence_omr_", "FLAG_DIFF_COUNT",
                  "SEVERE_CONFLICT_LIMIT", "WEAK_CONFLICT_LIMIT"]
@@ -182,10 +229,26 @@ EXPECTED_CREDENTIAL_IDS = {"supabaseApi": "t8WKxORo7BHCziqr", "httpHeaderAuth": 
 # ("@", key) above = a top-level node field (not under parameters).
 REMARK_LOOP_WAIT = "Wait1"
 REMARK_LOOP_FEED = "insert data to student remarks2"
+# Google Sheet import job (migration 018, apply_sheet_import_jobs)
+SHEET_JOB_CREATE = "Create Sheet Import Job"
+SHEET_JOB_SUMMARY = "Sheet Import Summary"
+SHEET_JOB_DONE = "Mark Import Job Done"
+SHEET_JOB_DESCRIBE = "Describe Import Failure"
+SHEET_JOB_FAILED = "Mark Import Job Failed"
+SHEET_JOB_TRIGGER = "Import Job Error Trigger"
+SHEET_JOB_STOPPED = "Mark Import Job Stopped"
+SHEET_JOB_NODES = [SHEET_JOB_CREATE, SHEET_JOB_SUMMARY, SHEET_JOB_DONE, SHEET_JOB_DESCRIBE, SHEET_JOB_FAILED,
+                   SHEET_JOB_TRIGGER, SHEET_JOB_STOPPED]
+# (source, output) -> Describe Import Failure: failures after the early answer that do not stop the import
+SHEET_JOB_FAIL_SOURCES = [("Unified AI Analysis1", 1), ("Parse Unified AI Result1", 1), (REMARK_LOOP_FEED, 1),
+                          ("store results2", 1), ("insert to word cloud2", 1), ("update to overall total2", 1),
+                          ("Insert import_errors1", 1), ("If14", 0)]
 FLAGGED_FCM = "Get staff FCM for flagged scan"
 PG_QUERY_BATCHING = {"single", "transaction", "independently"}   # n8n Postgres v2 option values
 # (edges of the removed SAST_DEAD_NODES are left out of both sides of the comparison)
-EXPECTED_REMOVED_EDGES = {("If14", "main", 1, RAW_LOOP, 0), (RAW_LOOP, "main", 1, RAW_UPSERT, 0),
+EXPECTED_REMOVED_EDGES = {("Get row(s) in sheet1", "main", 0, "get instructor id5", 0),  # sheet header matching
+                          ("Map to Target Format", "main", 0, "If19", 0),   # sheet webhook answers early
+                          ("If14", "main", 1, RAW_LOOP, 0), (RAW_LOOP, "main", 1, RAW_UPSERT, 0),
                           # Loop Over Items8 is fed back once per group (alert branch no longer feeds Wait1)
                           ("If25", "main", 0, REMARK_LOOP_WAIT, 0),
                           ("PushNotificaton for sentiment analysisi5", "main", 0, REMARK_LOOP_WAIT, 0),
@@ -197,24 +260,57 @@ EXPECTED_REMOVED_EDGES = {("If14", "main", 1, RAW_LOOP, 0), (RAW_LOOP, "main", 1
                           # sast-manual-correction: answered before the shared flow
                           ("Map target", "main", 0, "If19", 0),
                           # phone: the known-names lookup sits between the OMR call and Gemini
-                          ("image to ocr and omr python", "main", 0, "ai validation ocr and omr", 0)}
-EXPECTED_ADDED_EDGES = {(RAW_LOOP, "main", 0, RAW_UPSERT_GATE, 0),
+                          ("image to ocr and omr python", "main", 0, "ai validation ocr and omr", 0),
+                          # stamp rule: phone stamp check before If31; corrections checked before validation
+                          ("reconcile ocr and omr1", "main", 0, "If31", 0),
+                          ("Map target", "main", 0, "Mark Queue Validated1", 0)}
+EXPECTED_ADDED_EDGES = {("Unified AI Analysis1", "main", 1, REMARK_LOOP_WAIT, 0),   # Gemini free tier: a failed AI call / parse skips the
+                        ("Parse Unified AI Result1", "main", 1, REMARK_LOOP_WAIT, 0),  # instructor and still goes through Wait1
+                        ("Get row(s) in sheet1", "main", 0, "Normalize Sheet Rows", 0),  # sheet header matching
+                        ("Normalize Sheet Rows", "main", 0, "get instructor id5", 0),
+                        (RAW_LOOP, "main", 0, RAW_UPSERT_GATE, 0),
                         (RAW_UPSERT, "main", 0, RAW_LOOP, 0),
                         (RAW_LOOP, "main", 1, RAW_SKIP_IF, 0),
                         (RAW_SKIP_IF, "main", 0, RAW_LOOP, 0),
                         (RAW_SKIP_IF, "main", 1, RAW_UPSERT, 0),
                         (RAW_UPSERT_GATE, "main", 0, SAST_PAIRS, 0),
-                        ("get existing scan image id", "main", 0, "get instructor id7", 0),
+                        ("get existing scan image id", "main", 0, CORR_CANDIDATES, 0),   # corrections: local name
+                        (CORR_CANDIDATES, "main", 0, CORR_NAME_MATCH, 0),                # match before the SQL
+                        (CORR_NAME_MATCH, "main", 0, "get instructor id7", 0),           # lookups
                         ("get existing scan image id1", "main", 0, "get instructor id9", 0),
-                        ("Is not a SAST form?", "main", 1, "Phone Remark Check", 0),
+                        ("Is not a SAST form?", "main", 1, PHONE_CANDIDATES, 0),
+                        (PHONE_CANDIDATES, "main", 0, "Phone Remark Check", 0),
                         ("Phone Remark Check", "main", 0, "Phone Remark Needs Check?", 0),
                         ("Phone Remark Needs Check?", "main", 0, "Phone Verify Remark Words", 0),
                         ("Phone Remark Needs Check?", "main", 1, "reconcile ocr and omr1", 0),
                         ("Phone Verify Remark Words", "main", 0, "reconcile ocr and omr1", 0),
                         ("Respond to Webhook5", "main", 0, "After Correction Response", 0),
                         ("After Correction Response", "main", 0, "If19", 0),
+                        ("Map to Target Format", "main", 0, SHEET_JOB_CREATE, 0),   # sheet webhook answers early,
+                        (SHEET_JOB_CREATE, "main", 0, "Sheet Import Response", 0),   # with the job id (018)
+                        ("Sheet Import Response", "main", 0, "After Sheet Response", 0),
+                        ("After Sheet Response", "main", 0, SHEET_JOB_SUMMARY, 0),   # job done marker, below If19
+                        (SHEET_JOB_SUMMARY, "main", 0, SHEET_JOB_DONE, 0),
+                        (SHEET_JOB_DESCRIBE, "main", 0, SHEET_JOB_FAILED, 0),
+                        (SHEET_JOB_TRIGGER, "main", 0, SHEET_JOB_STOPPED, 0),
+                        (REMARK_LOOP_FEED, "main", 1, REMARK_LOOP_WAIT, 0),   # a failed insert still advances the loop
+                        *((s, "main", i, SHEET_JOB_DESCRIBE, 0) for s, i in SHEET_JOB_FAIL_SOURCES),
+                        ("After Sheet Response", "main", 0, "If19", 0),
+                        ("Get row(s) in sheet1", "main", 1, "Sheet Import Error Response", 0),
+                        ("Normalize Sheet Rows", "main", 1, "Sheet Import Error Response", 0),
                         ("image to ocr and omr python", "main", 0, "Phone Known Names", 0),
-                        ("Phone Known Names", "main", 0, "ai validation ocr and omr", 0)}
+                        ("Phone Known Names", "main", 0, "ai validation ocr and omr", 0),
+                        # stamp rule (migration 015)
+                        ("reconcile ocr and omr1", "main", 0, "Phone Stamp Check", 0),
+                        ("Phone Stamp Check", "main", 0, "Phone Stamp Verdict", 0),
+                        ("Phone Stamp Verdict", "main", 0, "If31", 0),
+                        ("Map target", "main", 0, CORR_IDS_IF, 0),                 # unresolved -> 422, nothing saved
+                        (CORR_IDS_IF, "main", 0, "Correction Stamp Check", 0),
+                        (CORR_IDS_IF, "main", 1, CORR_NOT_FOUND, 0),
+                        (CORR_NOT_FOUND, "main", 0, CORR_NOT_FOUND_RESPOND, 0),
+                        ("Correction Stamp Check", "main", 0, "Correction Stamp Duplicate?", 0),
+                        ("Correction Stamp Duplicate?", "main", 0, "Correction Duplicate Stamp Response", 0),
+                        ("Correction Stamp Duplicate?", "main", 1, "Mark Queue Validated1", 0)}
 # (webhook, scan image lookup, mapper that reads it) -- corrections that can end in import_errors
 CORRECTION_IMAGE_CHAINS = [("sast-manual-correction1", "get existing scan image id", "Map target"),
                            ("import-error-correction1", "get existing scan image id1", "Map target1")]
@@ -487,9 +583,11 @@ def main(argv):
           + (f": {corr}" if corr else ""))
     check("duplicate_student_exists" in idsql and "r.task_id IS DISTINCT FROM $5" in idsql
           and "reasons.push('duplicate_student_id')" in dec
-          and "WHERE s.task_id = EXCLUDED.task_id" in by_name["Website Raw Upsert"]["parameters"]["query"],
+          and "public.save_website_raw_row(" in by_name["Website Raw Upsert"]["parameters"]["query"]
+          and "where s.task_id = excluded.task_id" in (HERE.parent.parent / "migrations" / "015_stamp_no.sql").read_text(encoding="utf-8"),
           "same student + instructor + subject + term with another task_id -> duplicate_student_id "
-          "(Identity Check/Decide), and Website Raw Upsert never overwrites another page's row")
+          "(Identity Check/Decide), and Website Raw Upsert (public.save_website_raw_row, migration 015) never overwrites "
+          "another page's row")
     inv = by_name["Website Invalid Request Response"]["parameters"]["jsCode"]
     check("review_reasons: ['invalid_request', 'not_saved_permanent']" in inv and "'internal_error_not_saved'" not in inv,
           "invalid request -> review_reasons ['invalid_request', 'not_saved_permanent'] (not retryable)")
@@ -537,12 +635,13 @@ def main(argv):
     not_null += [f"{n} ('unverified')" for n, c in web_code.items() if "'unverified'" in c]
     params = sorted(set(re.findall(r"\$(\d+)", idsql)), key=int)
     qr_id = by_name["Website Identity Check"]["parameters"]["options"]["queryReplacement"]
-    sql_ok = (params == ["1", "2", "3", "4", "5"] and "similarity" not in idsql
-              and "ocr_instructor" not in qr_id and "subject_code_candidates" not in qr_id)
+    sql_ok = (params == ["1", "2", "3", "4", "5", "6"] and "similarity" not in idsql
+              and "ocr_instructor" not in qr_id and "subject_code_candidates" not in qr_id
+              and "$json.stamp_status === 'ok'" in qr_id)
     check(not ident_bad and not not_null and sql_ok,
           "website: none of the removed identity reasons (" + ", ".join(IDENTITY_REASONS) + "); identity_check null "
-          "in every answer that cannot carry a mismatch; Website Identity Check = batch integrity only (5 parameters, "
-          "no similarity)" + (f": reasons {ident_bad}" if ident_bad else "")
+          "in every answer that cannot carry a mismatch; Website Identity Check = batch integrity only (5 parameters + "
+          "the stamp as $6, no similarity)" + (f": reasons {ident_bad}" if ident_bad else "")
           + (f": identity_check not null in {not_null}" if not_null else "")
           + ("" if sql_ok else f": identity SQL params {params}"))
 
@@ -612,7 +711,8 @@ def main(argv):
             agree_bad.append(f"{name}: AGREEMENT_MIN defined {len(m)} times")
             continue
         mins.add(m[0])
-        body = no_comments(code)
+        # the one allowed read of ocr_fields is the OMR's ink meta (website_src/ocr_crosscheck.js), never its text
+        body = no_comments(code).replace("py?.ocr_fields?.ocr_meta", "", 1)
         agree_bad += [f"{name}: still uses {o}" for o in OLD_OMR_RULES + ["ocr_fields", "pythonOcr"] if o in body]
         if "omr_agreement_below_${AGREEMENT_MIN_PCT}" not in body or "agreement_percent" not in body:
             agree_bad.append(f"{name}: no omr_agreement_below_<pct> reason / agreement_percent output")
@@ -662,7 +762,7 @@ def main(argv):
     uses = {
         "reconcile ocr and omr1": "pfResolveRemark(gText('remarks'), 'Phone Verify Remark Words')",
         "Website Reconcile OCR OMR": "'Website Verify Remark Words')",
-        "Website Decide": "const remark = maskProfanity(remarkIn);",
+        "Website Decide": "const remarkMasked = maskProfanity(remarkIn);",
         "Code in JavaScript": "Remarks_and_Suggestions: maskProfanity(",
         "build flagged record1": "const maskedRemarks = maskProfanity(record.partial_data.remarks);",
         "Map to Target Format": 'result["Remarks & Suggestions"] = maskProfanity(',
@@ -685,7 +785,11 @@ def main(argv):
         vn, gn = by_name[verify], by_name[gemini]
         vp = vn["parameters"]
         cond = by_name[rif]["parameters"]["conditions"]["conditions"]
-        if (targets(conns, notform, 1) != [rcheck] or targets(conns, rcheck, 0) != [rif]
+        # phone: the instructor candidates lookup sits between the not-a-form check and the remark check
+        first = [PHONE_CANDIDATES] if branch == "phone" else [rcheck]
+        if (targets(conns, notform, 1) != first
+                or (branch == "phone" and targets(conns, PHONE_CANDIDATES, 0) != [rcheck])
+                or targets(conns, rcheck, 0) != [rif]
                 or targets(conns, rif, 0) != [verify] or targets(conns, rif, 1) != [reconciler]
                 or targets(conns, verify, 0) != [reconciler] or len(conns.get(verify, {}).get("main", [])) != 1):
             chain_bad.append(f"{branch}: wiring {notform}[1] -> {rcheck} -> {rif} -> {verify} | {reconciler}")
@@ -728,31 +832,25 @@ def main(argv):
             continue
         kp = kn["parameters"]
         is_web = gemini == "Website AI Validation"
-        # website (privacy): subjects only, no parameters; phone: instructors + subjects, unchanged
+        # privacy: subjects only, no parameters, on both branches
         sql_file = "website_known_names.sql" if is_web else "known_names.sql"
         repl = kp.get("options", {}).get("queryReplacement")
-        params_ok = repl is None if is_web else str(repl or "").startswith("={{ [")
         if (kn["type"] != "n8n-nodes-base.postgres" or kp.get("query") != src_sql(sql_file)
                 or kn.get("onError") != "continueRegularOutput" or kn.get("alwaysOutputData") is not True
-                or not params_ok):
-            known_bad.append(f"{known}: Postgres node with {sql_file}, "
-                             + ("no parameters" if is_web else "array parameters")
-                             + ", continue on error, always output")
-        if is_web and re.search(r"user_info|instructor", re.sub(r"--[^\n]*", "", kp.get("query", "")), re.I):
+                or repl is not None):
+            known_bad.append(f"{known}: Postgres node with {sql_file}, no parameters, continue on error, always output")
+        if re.search(r"user_info|instructor", re.sub(r"--[^\n]*", "", kp.get("query", "")), re.I):
             known_bad.append(f"{known}: must not look up or return instructor names (privacy)")
         if targets(conns, before, 0) != [known] or targets(conns, known, 0) != [gemini] or inbound(gemini) != [(known, 0)]:
             known_bad.append(f"wiring {before} -> {known} -> {gemini}")
         gbody = by_name[gemini]["parameters"].get("jsonBody", "")
-        # website (privacy): no instructor names sent to Gemini, so no known_instructor field;
-        # phone: unchanged, both known_instructor and known_subject.
+        # privacy: no instructor names sent to Gemini on either branch, so no known_instructor field
         needles = [f"$('{known}').first()", '"known_subject": { "type": "STRING" }', SUBJECT_HINT_NEW]
         if gemini == "Website AI Validation":
             needles += ['"instructor_confidence": { "type": "STRING", "enum": ["high", "medium", "low"] }',
                         "header_image_base64"]
-            if any(w in gbody for w in ("known_instructor", "Known instructors", "instructor_list", "instructor_names")):
-                known_bad.append(f"{gemini}: must not send an instructor name list to Gemini (privacy)")
-        else:
-            needles.append('"known_instructor": { "type": "STRING" }')
+        if any(w in gbody for w in ("known_instructor", "Known instructors", "instructor_list", "instructor_names")):
+            known_bad.append(f"{gemini}: must not send an instructor name list to Gemini (privacy)")
         for needle in needles:
             if needle not in gbody:
                 known_bad.append(f"{gemini}: body lacks {needle!r}")
@@ -760,8 +858,11 @@ def main(argv):
             known_bad.append(f"{gemini}: old subject hint or .item reference left")
     nm_src = (HERE / "website_src" / "name_match.js").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
     nm_body = "\n".join(ln for ln in nm_src.split("\n") if ln.strip() and not ln.lstrip().startswith("//"))
+    strip_comments = lambda q: "\n".join(ln for ln in q.split("\n") if not ln.lstrip().startswith("--"))  # noqa: E731
+    if strip_comments(src_sql("known_names.sql")) != strip_comments(src_sql("website_known_names.sql")):
+        known_bad.append("known_names.sql and website_known_names.sql must be the same subjects-only query")
     for name, needle in (("Website Decide", "String(rec.known_subject || '')"),
-                         ("reconcile ocr and omr1", "nmKnownInstructor(gText('known_instructor')")):
+                         ("reconcile ocr and omr1", "nmBestInstructor(rawInstructor, instructorCands, ")):
         code = by_name[name]["parameters"].get("jsCode", "")
         i = code.find(NM_START)
         j = code.find(NM_END, i)
@@ -769,20 +870,50 @@ def main(argv):
             known_bad.append(f"{name}: copy of website_src/name_match.js missing or different")
         if needle not in code:
             known_bad.append(f"{name}: does not use the known pick ({needle})")
-    for name in ("Website Reconcile OCR OMR", "Website Decide"):
+    for name in ("Website Reconcile OCR OMR", "Website Decide", "reconcile ocr and omr1"):
         if "known_instructor" in code_of(name):
-            known_bad.append(f"{name}: the website has no known_instructor (no instructor list is sent to Gemini)")
+            known_bad.append(f"{name}: no known_instructor (no instructor list is sent to Gemini)")
     if "known_subject" not in code_of("Website Reconcile OCR OMR"):
         known_bad.append("Website Reconcile OCR OMR does not pass known_subject on")
     if NOT_FOUND_RULE not in dec:
         known_bad.append("Decide: only found / ambiguous without the batch may flag")
-    check(not known_bad, "known names: Known Names lookup (continue on error) right before both main Gemini calls; "
-          "phone prompt lists known instructors/subjects and asks for known_instructor / known_subject (optional); "
-          "website lookup returns subjects only and the website prompt sends no instructor name (privacy) and only "
-          "asks for known_subject, plus optional "
-          "per-field confidence and the optional header_image third part; Decide + phone reconciler use the known "
-          "picks via one copy of website_src/name_match.js; not_found never flags"
+    check(not known_bad, "known names: Known Names lookup (subjects only, no parameters, continue on error) right "
+          "before both main Gemini calls; both prompts send no instructor name (privacy) and only ask for "
+          "known_subject (website: plus optional per-field confidence and the optional header_image third part); "
+          "Decide + phone reconciler use one copy of website_src/name_match.js; not_found never flags"
           + (f": {known_bad}" if known_bad else ""))
+
+    # ---- privacy: no instructor names to any Gemini call; the phone instructor is matched locally
+    priv_bad = []
+    for n in nodes:
+        p = n.get("parameters", {})
+        if not ("generativelanguage.googleapis.com" in str(p.get("url", ""))
+                or n.get("type", "").startswith("@n8n/n8n-nodes-langchain.")):
+            continue
+        ptext = json.dumps(p, ensure_ascii=False)
+        hits = [m for m in INSTRUCTOR_LIST_MARKERS if m in ptext]
+        if hits:
+            priv_bad.append(f"{n['name']}: {hits}")
+    pc = by_name.get(PHONE_CANDIDATES)
+    if not pc:
+        priv_bad.append(f"{PHONE_CANDIDATES} missing")
+    else:
+        if (pc["type"] != "n8n-nodes-base.postgres" or pc["parameters"].get("query") != src_sql("phone_instructor_candidates.sql")
+                or pc["parameters"].get("options", {}).get("queryReplacement") is not None
+                or pc.get("onError") != "continueRegularOutput" or pc.get("alwaysOutputData") is not True):
+            priv_bad.append(f"{PHONE_CANDIDATES}: Postgres node with phone_instructor_candidates.sql, no parameters, "
+                            "continue on error, always output")
+        if targets(conns, "Is not a SAST form?", 1) != [PHONE_CANDIDATES] or inbound(PHONE_CANDIDATES) != [("Is not a SAST form?", 1)]:
+            priv_bad.append(f"wiring 'Is not a SAST form?'[1] -> {PHONE_CANDIDATES} (after the Gemini call)")
+    prec = code_of("reconcile ocr and omr1")
+    for needle in ("$('Phone Instructor Candidates')", "if (instructorMatch.match === 'ambiguous') reasons.push('instructor_ambiguous');",
+                   "const resolvedInstructor = (instructorMatch.match === 'found' && instructorMatch.name) || rawInstructor;"):
+        if needle not in prec:
+            priv_bad.append(f"reconcile ocr and omr1 lacks {needle!r}")
+    check(not priv_bad, "privacy: no Gemini request (main OCR prompts, remark re-checks, remark-AI chains) carries an "
+          "instructor list; the phone instructor is matched locally ('Is not a SAST form?' false -> "
+          f"{PHONE_CANDIDATES} -> Phone Remark Check; nmBestInstructor: found -> database name, ambiguous -> flagged, "
+          "none -> raw reading)" + (f": {priv_bad}" if priv_bad else ""))
 
     # ---- layout safety net: one identical copy of website_src/layout_check.js in both reconcilers,
     # used before the rows are compared; both main Gemini prompts ask for the OPTIONAL column_order
@@ -811,6 +942,162 @@ def main(argv):
     check(not lay_bad, "layout safety net: both reconcilers run one identical copy of website_src/layout_check.js "
           "before comparing rows (layout_mismatch, no python_confident win); both Gemini prompts ask for the "
           "optional column_order" + (f": {lay_bad}" if lay_bad else ""))
+
+    # ---- check-only rule: a row the OMR rejected (omr_debug[].invalid_mark: x, shade, circle, dot)
+    # stays blank in both reconcilers (never gemini_fill); one line in both main Gemini prompts; both
+    # reconcilers are the current website_src sources (a live-export build refreshes them)
+    sys.path.insert(0, str(HERE))
+    from build_website_branch import CHECK_ONLY_LINE, read_js  # noqa: E402
+    co_bad = []
+    for name, src in (("Website Reconcile OCR OMR", "reconcile.js"), ("reconcile ocr and omr1", "phone_reconcile.js")):
+        code = code_of(name)
+        if code != read_js(src):
+            co_bad.append(f"{name}: differs from website_src/{src} (rebuild)")
+        for needle in ("const g = invalidMark ? null : gRead;", "source = 'invalid_mark';"):
+            if needle not in code:
+                co_bad.append(f"{name}: lacks {needle!r}")
+        if "omr_invalid_marks" in code or "INVALID_MARK_LIMIT" in code:
+            co_bad.append(f"{name}: must not flag a review for invalid marks")
+        if not (0 <= code.find("source = 'invalid_mark';") < code.find("source = 'gemini_fill';")):
+            co_bad.append(f"{name}: an invalid_mark row must be decided before the gemini_fill branch")
+    for name in ("ai validation ocr and omr", "Website AI Validation"):
+        if by_name[name]["parameters"].get("jsonBody", "").count(CHECK_ONLY_LINE) != 1:
+            co_bad.append(f"{name}: check-only line missing or repeated")
+    check(not co_bad, "check-only rule: both reconcilers keep an OMR-rejected row (invalid_mark) blank, never "
+          "gemini_fill, never flag a review for them, and match website_src; both Gemini prompts carry "
+          "the one check-only line" + (f": {co_bad}" if co_bad else ""))
+
+    # ---- min-answered rule (teacher, 2026-10-08): fewer than 5 of 20 answered -> discarded.
+    # Both reconcilers count the stored ratings and only auto-discard a reliable scan; Website Flagged
+    # Record is the current flagged_record.js; build flagged record1 stores the row 'discarded'; the
+    # website answer says so; the staff push is skipped. Invalid marks still never flag a review.
+    from build_website_branch import (FLAGGED_FCM_PARAMS, MIN_ANSWERS_BLOCK,  # noqa: E402
+                                      flagged_respond_expression)
+    ma_bad = []
+    for name in ("Website Reconcile OCR OMR", "reconcile ocr and omr1"):
+        code = code_of(name)
+        for needle in ("const MIN_ANSWERED      = 5;",
+                       "const answeredCount = Object.values(scores).filter((s) => s !== null).length;",
+                       "const autoDiscard = tooFewAnswers && scanReliable;",
+                       "if (tooFewAnswers) reasons.push(`too_few_answers_${answeredCount}_of_20`);",
+                       "pythonOk && geminiOk && !layoutMismatch && py.table_found !== false",
+                       "auto_discard"):
+            if needle not in code:
+                ma_bad.append(f"{name}: lacks {needle!r}")
+    if code_of("Website Flagged Record") != read_js("flagged_record.js"):
+        ma_bad.append("Website Flagged Record: differs from website_src/flagged_record.js (rebuild)")
+    if code_of("build flagged record1").count(MIN_ANSWERS_BLOCK) != 1:
+        ma_bad.append("build flagged record1: min-answered block missing or repeated")
+    if by_name[FLAGGED_RESPOND]["parameters"].get("responseBody") != flagged_respond_expression():
+        ma_bad.append(f"{FLAGGED_RESPOND}: not the current website contract expression")
+    if by_name[FLAGGED_FCM]["parameters"].get("options", {}).get("queryReplacement") != FLAGGED_FCM_PARAMS:
+        ma_bad.append(f"{FLAGGED_FCM}: does not skip a discarded form")
+    check(not ma_bad, "min-answered rule: both reconcilers set auto_discard (< 5 of 20 answered on a reliable scan, "
+          "else too_few_answers for review); build flagged record1 stores it 'discarded'; the website answer "
+          "says 'Discarded automatically'; no staff push" + (f": {ma_bad}" if ma_bad else ""))
+
+    # ---- stamp rule (2026-10-16, migration 015): stamp_numbers -> one stamp or a review reason;
+    # a stamp already stored for the term auto-rejects the page (website, race, phone) or answers a
+    # correction with HTTP 409; stamps are written to the raw row and the queue row
+    from build_website_branch import (BUILD_FLAGGED_STAMP_BLOCK, CORR_STAMP_PARAMS, IDENTITY_CHECK_PARAMS,  # noqa: E402
+                                      MARK_PARAMS, MARK_QUERY, PHONE_STAMP_PARAMS, RAW_UPSERT_PARAMS,
+                                      STAMP_PROMPT_ADD, STAMP_TILE_REQUIRED_NEW, STAMP_STRICT_ADD,
+                                      STAMP_TILE_SCHEMA_ADD, stamp_tile_part_expr, stamp_tile_text_expr, read)
+    st_bad = []
+    for name, omr in (("ai validation ocr and omr", "image to ocr and omr python"),
+                      ("Website AI Validation", "Website Python OMR")):
+        gbody = by_name[name]["parameters"].get("jsonBody", "")
+        if gbody.count(STAMP_PROMPT_ADD) != 1 or gbody.count(STAMP_TILE_REQUIRED_NEW) != 1 \
+                or gbody.count('"stamp_numbers": { "type": "ARRAY", "items": { "type": "STRING" } }') != 1:
+            st_bad.append(f"{name}: stamp paragraph / required stamp_numbers missing or repeated")
+        # two readers (2026-10-17): strict rules, tile paragraph + tile sheet as the LAST image (only
+        # when /process sent one), stamp_numbers_page / stamp_reads_tiles; model stays flash-lite
+        part = stamp_tile_part_expr(omr)
+        if any(gbody.count(x) != 1 for x in (STAMP_STRICT_ADD, stamp_tile_text_expr(omr), part, STAMP_TILE_SCHEMA_ADD)) \
+                or gbody.find(part) < gbody.replace(part, "").rfind('"inlineData": {') \
+                or "gemini-3.5-flash-lite" not in str(by_name[name]["parameters"].get("url", "")):
+            st_bad.append(f"{name}: stamp tile sheet / strict rules / tile fields missing, repeated or not last")
+    st_src = (HERE / "website_src" / "stamp.js").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
+    st_body = "\n".join(ln for ln in st_src.split("\n") if ln.strip() and not ln.lstrip().startswith("//"))
+    for name in RECONCILERS:
+        code = code_of(name)
+        i = code.find(ST_START)
+        j = code.find(ST_END, i)
+        if i < 0 or j < 0 or code[code.index("\n", i) + 1:j].rstrip("\n") != st_body:
+            st_bad.append(f"{name}: copy of website_src/stamp.js missing or different")
+        for needle in ("const stamp = stCheckStamp(gemini, geminiOk, py.stamp_candidates);",
+                       "if (stReason(stamp)) reasons.push(stReason(stamp));", "stamp_no:", "stamp_status:",
+                       "stamp_candidates:", "stamp_raw:", "stamp_source:", "stamp_hint:", "stamp_check:"):
+            if needle not in code:
+                st_bad.append(f"{name}: lacks {needle!r}")
+    if "public.sast_stamp_duplicate_of(" not in idsql or "duplicate_stamp_exists" not in idsql \
+            or by_name["Website Identity Check"]["parameters"]["options"].get("queryReplacement") != IDENTITY_CHECK_PARAMS:
+        st_bad.append("Website Identity Check: stamp duplicate ($6) missing")
+    wru = by_name["Website Raw Upsert"]["parameters"]
+    if wru.get("query") != read("website_raw_upsert.sql") or wru["options"].get("queryReplacement") != RAW_UPSERT_PARAMS \
+            or sorted(set(re.findall(r"\$(\d+)", wru["query"])), key=int) != [str(k) for k in range(1, 13)]:
+        st_bad.append("Website Raw Upsert: must call public.save_website_raw_row with 12 parameters (website_raw_upsert.sql)")
+    for needle in ("if (stampDuplicate) {", "auto_reject: stampDuplicate ? 'duplicate_stamp' : null,", "stamp_no: stampNo,",
+                   "if (reused && !stampDuplicate) {", "const stampHint = !stampNo && ", "if (duplicateHint) {"):
+        if needle not in dec:
+            st_bad.append(f"Website Decide lacks {needle!r}")
+    frec_code = code_of("Website Flagged Record")
+    if "inp.reason === 'duplicate_stamp'" not in frec_code or "auto_discard: autoDiscard && !autoReject," not in frec_code:
+        st_bad.append("Website Flagged Record: race path (Raw Upsert reason duplicate_stamp) / priority over auto_discard")
+    if targets(conns, "Website Raw Stored?", 1) != ["Website Flagged Record"]:
+        st_bad.append("Website Raw Stored? false must go to Website Flagged Record (duplicate_student / duplicate_stamp)")
+    bfc = code_of("build flagged record1")
+    if bfc.count(BUILD_FLAGGED_STAMP_BLOCK) != 1 or not (0 <= bfc.find(MIN_ANSWERS_BLOCK) < bfc.find(BUILD_FLAGGED_STAMP_BLOCK)):
+        st_bad.append("build flagged record1: stamp block missing, repeated or before the min-answered block")
+    if "$('Phone Stamp Verdict')" not in bfc:
+        st_bad.append("build flagged record1: does not read Phone Stamp Verdict")
+    if "auto_rejected: (dupStamp ? 'duplicate_stamp' : null)" not in respond_body or "rc.rule === 'duplicate_stamp'" not in respond_body:
+        st_bad.append(f"{FLAGGED_RESPOND}: duplicate_stamp answers (website auto_rejected, phone JSON) missing")
+    psc, psv = by_name.get(PHONE_STAMP_CHECK), by_name.get(PHONE_STAMP_VERDICT)
+    if not psc or psc["type"] != "n8n-nodes-base.postgres" or psc["parameters"].get("query") != read("phone_stamp_check.sql") \
+            or psc["parameters"].get("options", {}).get("queryReplacement") != PHONE_STAMP_PARAMS \
+            or psc.get("onError") != "continueRegularOutput" or psc.get("alwaysOutputData") is not True \
+            or psc.get("credentials", {}).get("postgres", {}).get("name") != "Postgres account":
+        st_bad.append(f"{PHONE_STAMP_CHECK}: Postgres node (phone_stamp_check.sql, Postgres account, continue on error, always output)")
+    if not psv or psv["type"] != "n8n-nodes-base.code" or psv["parameters"].get("jsCode") != read_js("phone_stamp_verdict.js"):
+        st_bad.append(f"{PHONE_STAMP_VERDICT}: Code node with website_src/phone_stamp_verdict.js")
+    if not (targets(conns, "reconcile ocr and omr1", 0) == [PHONE_STAMP_CHECK] and targets(conns, PHONE_STAMP_CHECK, 0) == [PHONE_STAMP_VERDICT]
+            and targets(conns, PHONE_STAMP_VERDICT, 0) == ["If31"] and inbound("If31") == [(PHONE_STAMP_VERDICT, 0)]):
+        st_bad.append("phone wiring must be reconcile ocr and omr1 -> Phone Stamp Check -> Phone Stamp Verdict -> If31")
+    csc, cif, crs = by_name.get(CORR_STAMP_CHECK), by_name.get(CORR_STAMP_IF), by_name.get(CORR_STAMP_RESPOND)
+    if not csc or csc["parameters"].get("query") != read("phone_stamp_check.sql") \
+            or csc["parameters"].get("options", {}).get("queryReplacement") != CORR_STAMP_PARAMS \
+            or csc.get("onError") != "continueRegularOutput" or csc.get("alwaysOutputData") is not True:
+        st_bad.append(f"{CORR_STAMP_CHECK}: Postgres node (phone_stamp_check.sql, continue on error, always output)")
+    # fail safe: a check that could not run on a correction with a stamp also stops (503 stamp_check_failed)
+    if not cif or cif["parameters"]["conditions"]["conditions"][0]["leftValue"] != (
+            "={{ $json.duplicate_stamp_exists === true || ($json.duplicate_stamp_exists !== false "
+            "&& String($('Map target').first().json.stamp_no ?? '') !== '') }}"):
+        st_bad.append(f"{CORR_STAMP_IF}: condition (duplicate, or a failed check on a correction with a stamp)")
+    crs_body = crs["parameters"].get("responseBody", "") if crs else ""
+    if not crs or crs["type"] != "n8n-nodes-base.respondToWebhook" \
+            or crs["parameters"].get("options", {}).get("responseCode") != "={{ $json.duplicate_stamp_exists === true ? 409 : 503 }}" \
+            or "code: 'duplicate_stamp'" not in crs_body or "code: 'stamp_check_failed'" not in crs_body \
+            or conns.get(CORR_STAMP_RESPOND, {}).get("main"):
+        st_bad.append(f"{CORR_STAMP_RESPOND}: HTTP 409 duplicate_stamp / 503 stamp_check_failed with nothing after it")
+    mkp = by_name[CORRECTION_MARK]["parameters"]
+    if mkp.get("query") != MARK_QUERY or mkp.get("options", {}).get("queryReplacement") != MARK_PARAMS:
+        st_bad.append(f"{CORRECTION_MARK}: must also write stamp_no / stamp_source")
+    if "correctionStamp" not in code_of(CORRECTION_MAP) or "? stampColumns(r) : {}" not in code_of("Code in JavaScript") \
+            or 'result["stamp_no"]' not in code_of("Map to Target Format3"):
+        st_bad.append("raw row mapping: Map target / Code in JavaScript / Map to Target Format3 stamp fields")
+    if not {"stamp_no", "stamp_source"} <= {c.get("id") for c in by_name[RAW_UPSERT]["parameters"].get("columns", {}).get("schema", [])}:
+        st_bad.append(f"{RAW_UPSERT}: column schema lacks stamp_no / stamp_source")
+    if "'stamp_unreadable'" not in code_of("Handle Gemini failure"):
+        st_bad.append("Handle Gemini failure: no stamp_unreadable")
+    if "status === 'discarded'" not in by_name[FLAGGED_FCM]["parameters"].get("options", {}).get("queryReplacement", ""):
+        st_bad.append(f"{FLAGGED_FCM}: must skip a discarded (auto-rejected) row")
+    check(not st_bad, "stamp rule: both Gemini prompts ask for stamp_numbers (verbatim paragraph, required); one copy of "
+          "website_src/stamp.js in both reconcilers (" + ", ".join(STAMP_REASONS[:3]) + "); duplicate_stamp auto-reject on "
+          "the website (Identity Check $6 + Raw Upsert race via save_website_raw_row) and the phone (Phone Stamp Check -> "
+          "Phone Stamp Verdict -> If31), stored discarded/rejected after the min-answered block, no push; corrections "
+          "answer 409 duplicate_stamp before Mark Queue Validated1; stamps written to raw and queue rows"
+          + (f": {st_bad}" if st_bad else ""))
 
     # ---- unchanged outside the website front end (vs original)
     if in_path.exists():
@@ -893,7 +1180,8 @@ def main(argv):
           and len(if21) == 1 and if21[0].get("leftValue") == "={{ $json.import_type }}"
           and if21[0].get("operator", {}).get("operation") == "notEmpty"
           and targets(conns, "If21", 0) == ["Instructor message2"] and targets(conns, "If21", 1) == ["If22"]
-          and targets(conns, "Map to Target Format", 0) == ["If19"]
+          and targets(conns, "Map to Target Format", 0) == [SHEET_JOB_CREATE]
+          and targets(conns, SHEET_JOB_CREATE, 0) == ["Sheet Import Response"]
           and not leak,
           "Map to Target Format sets import_type on every sheet row, so sheet rows hit If21's true branch "
           "(Instructor message2, grouped remark AI); phone/website/correction mappers never set it (If22)"
@@ -906,7 +1194,9 @@ def main(argv):
     agg_ok = (rp.get("operation") == "executeQuery" and rp.get("query") == SAST_RECOMPUTE_SQL
               and rp.get("options", {}).get("queryReplacement") == SAST_RECOMPUTE_PARAMS
               and "queryBatching" not in rp.get("options", {})
-              and rn.get("onError") == "continueRegularOutput"
+              and (rn.get("onError") == "continueRegularOutput"   # error output -> sheet job failure (018)
+                   or (rn.get("onError") == "continueErrorOutput"
+                       and targets(conns, SAST_RECOMPUTE, 1) == [SHEET_JOB_DESCRIBE]))
               and rn.get("credentials", {}).get("postgres", {}).get("name") == "Postgres account"
               and targets(conns, RAW_UPSERT_GATE, 0) == [SAST_PAIRS]
               and inbound(SAST_PAIRS) == [(RAW_UPSERT_GATE, 0)]
@@ -1027,11 +1317,35 @@ def main(argv):
 
     # ---- grouped remark AI loop: exactly one feed back per group
     wait_in = inbound(REMARK_LOOP_WAIT)
-    check(wait_in == [(REMARK_LOOP_FEED, 0)] and targets(conns, REMARK_LOOP_WAIT, 0) == ["Loop Over Items8"]
+    wait_expected = sorted([(REMARK_LOOP_FEED, 0), (REMARK_LOOP_FEED, 1), ("Unified AI Analysis1", 1),
+                            ("Parse Unified AI Result1", 1)])
+    check(sorted(wait_in) == wait_expected and targets(conns, REMARK_LOOP_WAIT, 0) == ["Loop Over Items8"]
           and targets(conns, "Branch 3 — Student Remarks2", 0) == [REMARK_LOOP_FEED, "If24"],
-          "Loop Over Items8 is fed back once per group (Wait1 <- only insert data to student remarks2; "
-          "the critical-remark alert branch no longer advances the loop)" + ("" if wait_in == [(REMARK_LOOP_FEED, 0)]
-                                                                          else f": Wait1 <- {wait_in}"))
+          "Loop Over Items8 is fed back once per group (Wait1 <- insert data to student remarks2 (either output), or, when the AI "
+          "call / parse fails, the error output of Unified AI Analysis1 / Parse Unified AI Result1; the "
+          "critical-remark alert branch no longer advances the loop)"
+          + ("" if sorted(wait_in) == wait_expected else f": Wait1 <- {wait_in}"))
+
+    # ---- Gemini free tier (15 requests/min): paced loop, retries, a failure never stops the import
+    wp = by_name[REMARK_LOOP_WAIT]["parameters"]
+    wait_s = float(wp.get("amount") or 0) * {"seconds": 1, "minutes": 60}.get(wp.get("unit"), 0)
+    rl_bad = []
+    if wait_s < 6:
+        rl_bad.append(f"{REMARK_LOOP_WAIT} = {wait_s} s (need >= 6 s, an explicit seconds unit)")
+    for nm in ("Unified AI Analysis1", "Individual AI Analysis1"):
+        nd = by_name[nm]
+        if not (nd.get("retryOnFail") is True and nd.get("maxTries") == 3 and nd.get("waitBetweenTries") == 5000):
+            rl_bad.append(f"{nm}: needs retryOnFail, maxTries 3, waitBetweenTries 5000")
+    for nm, mode in (("Unified AI Analysis1", "continueErrorOutput"), ("Parse Unified AI Result1", "continueErrorOutput"),
+                     ("Get Previous Instructor Analysis1", "continueRegularOutput")):
+        if by_name[nm].get("onError") != mode:
+            rl_bad.append(f"{nm}: onError must be {mode}")
+    for nm in ("Unified AI Analysis1", "Parse Unified AI Result1"):
+        if sorted(targets(conns, nm, 1)) not in ([REMARK_LOOP_WAIT], sorted([REMARK_LOOP_WAIT, SHEET_JOB_DESCRIBE])):
+            rl_bad.append(f"{nm}: error output must go to {REMARK_LOOP_WAIT} (and only the sheet job failure recorder)")
+    check(not rl_bad, "Gemini free tier: grouped remark loop paced (Wait1 >= 6 s, ~10 calls/min), Unified/Individual "
+          "AI retry 3x / 5 s, a failed AI call or parse skips that instructor through Wait1 (the import goes on)"
+          + (f": {rl_bad}" if rl_bad else ""))
 
     # ---- flagged-scan staff push: the queue POST (Prefer: return=minimal) returns no body
     fcm_qr = by_name[FLAGGED_FCM]["parameters"].get("options", {}).get("queryReplacement", "")
@@ -1125,6 +1439,8 @@ def main(argv):
     check(not chain_bad, "corrections: the scan image lookup runs before Map target / Map target1 "
           "(serial, always one row, only an image with data), so a new import error keeps the "
           "original scan image" + (f": {chain_bad}" if chain_bad else ""))
+    from build_website_branch import (CORR_IDS_IF_EXPR, CORR_NOT_FOUND_BODY,  # noqa: E402
+                                      CORRECTION_INSTR_PARAMS_V2, CORRECTION_SUBJ_PARAMS_V2)
     corr_bad = []
     q7 = by_name["get instructor id7"]["parameters"]["query"]
     qr7 = by_name["get instructor id7"]["parameters"]["options"].get("queryReplacement", "")
@@ -1132,18 +1448,18 @@ def main(argv):
                    "hit AS (", "WHERE NOT EXISTS (SELECT 1 FROM hit);", "is_placeholder"):
         if needle not in q7:
             corr_bad.append(f"get instructor id7 lacks {needle!r}")
-    if not (qr7.startswith("={{ [") and f"$('{CORRECTION_HOOK}').first().json.body.instructor " in qr7
-            and ".body.instructor_id" in qr7 and "$json" not in qr7):
-        corr_bad.append("get instructor id7: parameters must be [body.instructor, body.instructor_id] read by webhook name")
+    if qr7 != CORRECTION_INSTR_PARAMS_V2 or "$json" in qr7:
+        corr_bad.append("get instructor id7: parameters must be [instructor_name, instructor_id] of Correction Name Match "
+                        "(else the webhook body, read by name)")
     q6 = by_name["get subject id6"]["parameters"]["query"]
     qr6 = by_name["get subject id6"]["parameters"]["options"].get("queryReplacement", "")
     for needle in ("by_id AS (", "s.id::text = a.want_id", "m AS (SELECT * FROM by_id UNION ALL SELECT * FROM by_code",
                    "WHERE NOT EXISTS (SELECT 1 FROM by_id)"):
         if needle not in q6:
             corr_bad.append(f"get subject id6 lacks {needle!r}")
-    if not (qr6.startswith("={{ [") and "$json.instructor_id ?? null" in qr6 and ".body.subject_id" in qr6
-            and ".body.subject " in qr6):
-        corr_bad.append("get subject id6: parameters must be [instructor_id, body.subject, body.subject_id] as an array")
+    if qr6 != CORRECTION_SUBJ_PARAMS_V2:
+        corr_bad.append("get subject id6: parameters must be [instructor_id, subject_text, subject_id] of Correction Name "
+                        "Match (else the webhook body) as an array")
     mt = by_name[CORRECTION_MAP]["parameters"]["jsCode"]
     if ("cb.correction_source === 'website_review'" not in mt or "current_term_id:        correctedTermId," not in mt
             or "term_id:            correctedTermId" not in mt or mt.count("data.current_term_id") != 1):
@@ -1151,22 +1467,63 @@ def main(argv):
     after = by_name.get(CORRECTION_AFTER, {})
     if after.get("type") != "n8n-nodes-base.code" or "return $('Map target').all()" not in after.get("parameters", {}).get("jsCode", ""):
         corr_bad.append(f"{CORRECTION_AFTER}: must re-emit $('Map target').all()")
-    if not (targets(conns, CORRECTION_MAP, 0) == [CORRECTION_MARK] and targets(conns, CORRECTION_MARK, 0) == [CORRECTION_RESPOND]
+    if not (targets(conns, CORRECTION_MAP, 0) == [CORR_IDS_IF] and targets(conns, CORR_IDS_IF, 0) == [CORR_STAMP_CHECK]
+            and inbound(CORR_STAMP_CHECK) == [(CORR_IDS_IF, 0)] and targets(conns, CORR_STAMP_CHECK, 0) == [CORR_STAMP_IF]
+            and targets(conns, CORR_STAMP_IF, 1) == [CORRECTION_MARK] and targets(conns, CORR_STAMP_IF, 0) == [CORR_STAMP_RESPOND]
+            and targets(conns, CORRECTION_MARK, 0) == [CORRECTION_RESPOND]
             and targets(conns, CORRECTION_RESPOND, 0) == [CORRECTION_AFTER] and targets(conns, CORRECTION_AFTER, 0) == ["If19"]
             and inbound(CORRECTION_AFTER) == [(CORRECTION_RESPOND, 0)]):
-        corr_bad.append("wiring must be Map target -> Mark Queue Validated1 -> Respond to Webhook5 -> After Correction Response -> If19")
+        corr_bad.append("wiring must be Map target -> Correction Ids Found? (true) -> Correction Stamp Check -> Correction Stamp "
+                        "Duplicate? (false) -> Mark Queue Validated1 -> Respond to Webhook5 -> After Correction Response -> If19")
     if "If19" in reach_without(CORRECTION_HOOK, CORRECTION_RESPOND):
         corr_bad.append("If19 reachable from sast-manual-correction1 without passing Respond to Webhook5")
     if responders & reach("If19"):
         corr_bad.append(f"a Respond node is downstream of If19: {sorted(responders & reach('If19'))}")
     # 'Merge' (combine by position) fires once: the simulation follows only its 'build the record1' input
     corr_out = simulate(CORRECTION_HOOK, {"GET TERM BY ID6": [], "If19": [0], "If1": [0]})
-    if not corr_out or any(o != [CORRECTION_RESPOND] for o in corr_out):
+    corr_responders = {CORRECTION_RESPOND, CORR_STAMP_RESPOND, CORR_NOT_FOUND_RESPOND}
+    if (not corr_out or any(len(o) != 1 or o[0] not in corr_responders for o in corr_out)
+            or {o[0] for o in corr_out} != corr_responders):
         corr_bad.append(f"sast-manual-correction responds {sorted({tuple(o) for o in corr_out})}")
+    if "If19" in reach(CORR_STAMP_RESPOND) or "If19" in reach_without(CORRECTION_HOOK, CORRECTION_MARK):
+        corr_bad.append("a duplicate-stamp correction must never reach If19 (nothing saved)")
+    if reach(CORR_NOT_FOUND_RESPOND) != {CORR_NOT_FOUND_RESPOND} or {CORRECTION_MARK, "If19", CORR_STAMP_CHECK} & reach(CORR_NOT_FOUND):
+        corr_bad.append("an unresolved correction must stop at the 422 answer (queue row not validated, no import error)")
+    if CORRECTION_MARK in reach_without(CORRECTION_HOOK, CORR_IDS_IF):
+        corr_bad.append("Mark Queue Validated1 reachable without passing Correction Ids Found?")
+    # the local name match (older app versions send only names); never a Gemini input
+    cc, cm, ci, cn, cr = (by_name.get(n, {}) for n in CORR_MATCH_NODES)
+    if (cc.get("type") != "n8n-nodes-base.postgres" or cc.get("parameters", {}).get("query") != read("correction_candidates.sql")
+            or cc.get("parameters", {}).get("options") or cc.get("onError") != "continueRegularOutput"
+            or cc.get("alwaysOutputData") is not True):
+        corr_bad.append(f"{CORR_CANDIDATES}: Postgres node with correction_candidates.sql, no parameters, continue on error, "
+                        "always output")
+    if cm.get("type") != "n8n-nodes-base.code" or cm.get("parameters", {}).get("jsCode") != read_js("correction_name_match.js") \
+            or cm.get("onError") != "continueRegularOutput":
+        corr_bad.append(f"{CORR_NAME_MATCH}: Code node with correction_name_match.js (continue on error)")
+    if not (targets(conns, "get existing scan image id", 0) == [CORR_CANDIDATES] and targets(conns, CORR_CANDIDATES, 0) == [CORR_NAME_MATCH]
+            and targets(conns, CORR_NAME_MATCH, 0) == ["get instructor id7"] and inbound("get instructor id7") == [(CORR_NAME_MATCH, 0)]):
+        corr_bad.append("wiring must be get existing scan image id -> Correction Candidates -> Correction Name Match -> get "
+                        "instructor id7")
+    if ci.get("type") != "n8n-nodes-base.if" or ci["parameters"]["conditions"]["conditions"][0]["leftValue"] != CORR_IDS_IF_EXPR:
+        corr_bad.append(f"{CORR_IDS_IF}: condition instructor_ID and true_subject_id both set")
+    if cn.get("type") != "n8n-nodes-base.code" or cn.get("parameters", {}).get("jsCode") != read_js("correction_not_found.js"):
+        corr_bad.append(f"{CORR_NOT_FOUND}: Code node with correction_not_found.js")
+    if (cr.get("type") != "n8n-nodes-base.respondToWebhook" or cr.get("parameters", {}).get("responseBody") != CORR_NOT_FOUND_BODY
+            or cr.get("parameters", {}).get("options", {}).get("responseCode") != 422):
+        corr_bad.append(f"{CORR_NOT_FOUND_RESPOND}: HTTP 422 with the Correction Not Found answer")
+    gem_reach = [n["name"] for n in nodes if ("generativelanguage.googleapis.com" in str(n.get("parameters", {}).get("url", ""))
+                                              or n.get("type", "").startswith("@n8n/n8n-nodes-langchain."))
+                 and n["name"] in reach(CORR_CANDIDATES) and n["name"] not in reach("If19")]
+    if gem_reach:
+        corr_bad.append(f"the correction candidates reach a Gemini node outside the shared flow: {gem_reach}")
     check(not corr_bad, "corrections (sast-manual-correction): get instructor id7 / get subject id6 use body.instructor_id / "
           "body.subject_id when valid (else the old name/code lookup; array parameters); Map target credits website_review "
           "approvals to body.term_id; answered by Respond to Webhook5 before the shared flow (-> After Correction Response "
-          f"-> If19), exactly one respond per path ({len(corr_out)} simulated)" + (f": {corr_bad}" if corr_bad else ""))
+          "-> If19) or, for a stamp already stored in the term, by the 409 Correction Duplicate Stamp Response (nothing "
+          "saved), or, when the instructor or subject did not resolve, by the 422 Correction Not Found Response (queue "
+          "row stays pending, no import error; text-only corrections matched locally by Correction Name Match); "
+          f"exactly one respond per path ({len(corr_out)} simulated)" + (f": {corr_bad}" if corr_bad else ""))
 
     sif = by_name.get(SCAN_IMAGE_SAVE_IF, {})
     sconds = sif.get("parameters", {}).get("conditions", {})
@@ -1179,7 +1536,9 @@ def main(argv):
           "(never inserts an empty scan_error_images row)")
 
     # ---- SQL
-    sql_nodes = [n for n in nodes if (n["name"] in website or n["name"] in EDITED_SHARED)
+    sql_nodes = [n for n in nodes if (n["name"] in website or n["name"] in EDITED_SHARED
+                                      or n["name"] in ("Phone Known Names", PHONE_CANDIDATES, PHONE_STAMP_CHECK,
+                                                       CORR_STAMP_CHECK, CORR_CANDIDATES, *SHEET_JOB_NODES))
                  and n["type"] == "n8n-nodes-base.postgres" and n["parameters"].get("operation") == "executeQuery"]
     comment_bad = []
     for n in sql_nodes:
@@ -1189,6 +1548,69 @@ def main(argv):
                 comment_bad.append(n["name"])
         if "/*" in q:
             comment_bad.append(n["name"] + " (block comment)")
+    # Google Sheet import: answered once, before the Gemini remark loop; errors before that answer with 422
+    hook_sheet = next((n for n in nodes if n["name"] == "Google LINK from phone1"), {})
+    sheet_resp, sheet_err = "Sheet Import Response", "Sheet Import Error Response"
+    sheet_bad = []
+    if hook_sheet.get("parameters", {}).get("responseMode") != "responseNode":
+        sheet_bad.append("Google LINK from phone1 is not responseNode")
+    if targets(conns, "Map to Target Format", 0) != [SHEET_JOB_CREATE] or targets(conns, SHEET_JOB_CREATE, 0) != [sheet_resp] \
+            or targets(conns, sheet_resp, 0) != ["After Sheet Response"] \
+            or targets(conns, "After Sheet Response", 0) != ["If19", SHEET_JOB_SUMMARY]:
+        sheet_bad.append("Map to Target Format -> Create Sheet Import Job -> Sheet Import Response -> After Sheet Response "
+                         "-> If19 (+ Sheet Import Summary) broken")
+    sheet_reach = reach("Google LINK from phone1")
+    if {"Wait1", "Unified AI Analysis1", "Individual AI Analysis1"} & reach("Google LINK from phone1", skip={sheet_resp}):
+        sheet_bad.append("a Gemini remark node is reachable without passing Sheet Import Response")
+    if responders & reach("If19"):
+        sheet_bad.append("a Respond node is downstream of If19")
+    if len([r for r in responders if r in sheet_reach]) != 2 or sheet_resp not in sheet_reach or sheet_err not in sheet_reach:
+        sheet_bad.append(f"sheet webhook reaches unexpected responders: {sorted(responders & sheet_reach)}")
+    for src in ("Get row(s) in sheet1", "Normalize Sheet Rows"):
+        if targets(conns, src, 1) != [sheet_err]:
+            sheet_bad.append(f"{src} error output does not go to {sheet_err}")
+    check(not sheet_bad, "Google Sheet webhook: answered once by Sheet Import Response before the Gemini loop, "
+          "read errors answered by Sheet Import Error Response" + (f": {sheet_bad}" if sheet_bad else ""))
+    # Google Sheet import job (migration 018): the app polls sheet_import_jobs until the flow really ends
+    job_bad = []
+    if (wf.get("settings") or {}).get("executionOrder") != "v1":
+        job_bad.append("settings.executionOrder is not v1 (the done marker relies on depth-first, top-first order)")
+    if (wf.get("settings") or {}).get("errorWorkflow"):
+        job_bad.append("an error workflow is set, so the own Import Job Error Trigger never runs")
+    missing_job = [n for n in SHEET_JOB_NODES if n not in by_name]
+    if missing_job:
+        job_bad.append(f"missing nodes {missing_job}")
+    else:
+        for nm in (SHEET_JOB_CREATE, SHEET_JOB_DONE, SHEET_JOB_FAILED, SHEET_JOB_STOPPED):
+            nd = by_name[nm]
+            if nd["type"] != "n8n-nodes-base.postgres" or nd.get("onError") != "continueRegularOutput":
+                job_bad.append(f"{nm}: must be a Postgres node with onError continueRegularOutput")
+            if nm != SHEET_JOB_STOPPED and not nd.get("executeOnce"):
+                job_bad.append(f"{nm}: executeOnce")
+            if "sheet_import_jobs" not in nd["parameters"].get("query", ""):
+                job_bad.append(f"{nm}: does not write sheet_import_jobs")
+        if by_name[SHEET_JOB_TRIGGER]["type"] != "n8n-nodes-base.errorTrigger":
+            job_bad.append(f"{SHEET_JOB_TRIGGER} is not an Error Trigger")
+        if "$execution.id" not in json.dumps(by_name[SHEET_JOB_CREATE]["parameters"]):
+            job_bad.append(f"{SHEET_JOB_CREATE} does not store $execution.id")
+        body = by_name[sheet_resp]["parameters"].get("responseBody", "")
+        if "job_id" not in body or "'processing'" not in body:
+            job_bad.append(f"{sheet_resp} does not answer job_id / status processing")
+        if by_name[SHEET_JOB_SUMMARY]["position"][1] <= by_name["If19"]["position"][1]:
+            job_bad.append(f"{SHEET_JOB_SUMMARY} is not below If19 on the canvas (it would run before the flow ends)")
+        if by_name[SHEET_JOB_DESCRIBE]["position"][1] >= by_name[REMARK_LOOP_WAIT]["position"][1]:
+            job_bad.append(f"{SHEET_JOB_DESCRIBE} is not above Wait1 (the failure would be recorded after the loop)")
+        for s, i in SHEET_JOB_FAIL_SOURCES:
+            if SHEET_JOB_DESCRIBE not in targets(conns, s, i):
+                job_bad.append(f"{s}[{i}] does not go to {SHEET_JOB_DESCRIBE}")
+            if i == 1 and by_name[s].get("onError") != "continueErrorOutput":
+                job_bad.append(f"{s}: onError must be continueErrorOutput")
+        if SHEET_JOB_CREATE in (reach("If19") | reach(SHEET_JOB_SUMMARY)) or responders & reach(SHEET_JOB_DESCRIBE):
+            job_bad.append("job nodes wired into the wrong place")
+    check(not job_bad, "Google Sheet import job: Create Sheet Import Job (processing, execution id) before the early "
+          "answer (job_id); Sheet Import Summary -> Mark Import Job Done below If19 (runs after the whole flow); "
+          "error outputs after the answer -> Describe Import Failure -> Mark Import Job Failed (Wait1 feeds kept); "
+          "own Error Trigger -> Mark Import Job Stopped" + (f": {job_bad}" if job_bad else ""))
     check(not comment_bad, "no $n placeholders inside SQL comments" + (f": {comment_bad}" if comment_bad else ""))
     try:
         import pglast  # type: ignore
@@ -1207,7 +1629,10 @@ def main(argv):
     node_bin = shutil.which("node")
     if node_bin:
         snippets = []
-        for name in sorted(website | {RAW_UPSERT_GATE, CORRECTION_AFTER, *EDITED_SHARED, *PHONE_REMARK_NODES}):
+        for name in sorted(website | {RAW_UPSERT_GATE, CORRECTION_AFTER, *EDITED_SHARED, *PHONE_REMARK_NODES,
+                                      PHONE_STAMP_VERDICT, CORR_STAMP_IF, CORR_STAMP_RESPOND, *CORR_MATCH_NODES,
+                                      *SHEET_JOB_NODES,
+                                      "Sheet Import Response"} & set(by_name)):
             n = by_name[name]
             if n["type"] == "n8n-nodes-base.code":
                 snippets.append({"where": f"{name} (jsCode)", "kind": "code", "src": n["parameters"]["jsCode"]})

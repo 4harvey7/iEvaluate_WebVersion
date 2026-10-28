@@ -14,7 +14,9 @@
 // exactly like the n8n Postgres node does, and runs it. It runs twice: once with
 // uuid id columns in sast_all_raw_data_survey and once with text id columns.
 // The schema gets migrations/013_sast_null_aware_means.sql (public.recompute_sast, rating CHECKs),
-// which the recompute nodes call; it is also tested directly (blank answers left out of the means).
+// which the recompute nodes call; it is also tested directly (blank answers left out of the means),
+// then migrations/014_sast_min_answered.sql (a form with fewer than 5 of 20 answered is not counted)
+// and migrations/015_stamp_no.sql (the numbering-machine stamp: one form per stamp and term).
 // It also runs the optional clean-up migrations/004_mask_existing_profanity.sql on synthetic
 // rows (preview, apply, student_remarks duplicates, idempotency) and checks that its SQL filter
 // masks exactly like the n8n JS filter (profanity.js) on a large synthetic corpus.
@@ -103,7 +105,10 @@ function schemaSql(rawIdType) {
     user_id uuid, term_id text, table_found boolean, grid_source text, partial_data jsonb, n8n_ocr_image text,
     status text DEFAULT 'pending', validated_data jsonb, validated_by uuid, validated_at timestamptz,
     review_reasons text[], omr_comparison jsonb, validation_status text,
-    scan_image_id uuid REFERENCES public.scan_error_images(id), batch_id uuid, created_at timestamptz DEFAULT now());
+    scan_image_id uuid REFERENCES public.scan_error_images(id), batch_id uuid, created_at timestamptz DEFAULT now(),
+    -- migration 005 (website review); n8n writes the last two for a form discarded by the min-answered rule
+    review_action text CHECK (review_action IS NULL OR review_action IN ('approved', 'rerouted', 'rejected')),
+    review_correction jsonb);
   CREATE TABLE public.import_errors (id bigserial PRIMARY KEY, created_at timestamptz DEFAULT now(), error_type text,
     source text, status text DEFAULT 'pending', raw_instructor_name text, raw_subject_name text, raw_student_id text,
     raw_term_id text, task_id text, scan_image_id uuid REFERENCES public.scan_error_images(id), raw_data jsonb,
@@ -142,6 +147,10 @@ function schemaSql(rawIdType) {
 
 // ------------------------------------------------------------------ migration 013 (null-aware SAST means)
 const MIG013 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '013_sast_null_aware_means.sql'), 'utf8');
+// migration 014 (min-answered rule: sast_answers skips a form with fewer than 5 of 20 answered)
+const MIG014 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '014_sast_min_answered.sql'), 'utf8');
+// migration 015 (stamp rule: stamp columns, unique (term_id, stamp_no), save_website_raw_row, sast_stamp_duplicate_of)
+const MIG015 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '015_stamp_no.sql'), 'utf8');
 
 // ------------------------------------------------------------------ sexual-word filter / migration 004
 const MIG_PATH = path.join(__dirname, '..', '..', 'migrations', '004_mask_existing_profanity.sql');
@@ -325,7 +334,7 @@ function gemResp(fields = {}, ratingOver = {}) {
   const ratings = {};
   for (let i = 0; i < 10; i++) { ratings[`m${i + 1}`] = LETTERS[i % 5]; ratings[`p${i + 1}`] = LETTERS[(i + 10) % 5]; }
   const g = { instructor: 'AY/Semester: L U', subject: 'Mà essor', ay_semester: '2026 1st', remarks: 'Good', date: '09/27/26',
-    student_id: '2021-7777', document_check: { is_sast_form: true }, scan_quality: { poor_quality: false, issues: [] },
+    student_id: '2021-7777', stamp_numbers: ['0100005'], document_check: { is_sast_form: true }, scan_quality: { poor_quality: false, issues: [] },
     ratings: { ...ratings, ...ratingOver }, ...fields };
   return { candidates: [{ content: { parts: [{ text: JSON.stringify(g) }] } }] };
 }
@@ -346,12 +355,12 @@ async function suite(rawIdType) {
   const t = [];
   const test = (name, fn) => t.push({ name: `[raw ids ${rawIdType}] ${name}`, fn });
 
-  test('batch check: exactly 5 parameters (batch ids, term, student id, task_id); no OCR name/subject', async () => {
+  test('batch check: 6 parameters (batch ids, term, student id, task_id, the stamp); no OCR name/subject', async () => {
     const vals = evalReplacement(node('Website Identity Check'), { ocr_instructor: 'X', ocr_subject: 'Y', student_id: ' 1 ' },
       { 'Website Prepare Scan': { instructor_id: ID.juan, subject_id: ID.it101, term_id: null, task_id: 'web:p' } });
-    assert.deepStrictEqual(vals, [ID.juan, ID.it101, null, '1', 'web:p']);
+    assert.deepStrictEqual(vals, [ID.juan, ID.it101, null, '1', 'web:p', '']);
     const q = node('Website Identity Check').parameters.query;
-    for (const gone of ['similarity', '$6', 'instructor_status', 'subject_status']) assert.ok(!q.includes(gone), gone);
+    for (const gone of ['similarity', '$7', 'instructor_status', 'subject_status']) assert.ok(!q.includes(gone), gone);
   });
   test('batch check: batch names/codes + resolved term, whatever the form says (batch-only; the form is Form Match\'s job)', async () => {
     const first = await identity('Dr. Juan A. Dela Cruz, MIT', 'IT 101');
@@ -729,6 +738,52 @@ async function suite(rawIdType) {
       has_function_privilege('public', 'public.sast_answers(uuid, uuid)', 'EXECUTE') AS a`);
     assert.deepStrictEqual(acl, { r: false, a: false });
   });
+  // ---- migration 014: a form with fewer than 5 of the 20 items answered is not counted
+  test('014: a form with 4 answered items is left out (means, *_count, total_responses); 5 answered counts; the raw row stays', async () => {
+    await mariaForm(ID.it101, 'D1', { ...all(QM, 4), ...all(QP, 4) });
+    await mariaForm(ID.it101, 'D2', { m1: 1, m2: 1, p1: 1, p2: 1 });   // 4 answered: not counted
+    let r = await recompute();
+    let m = await mgmt(ID.it101);
+    assert.deepStrictEqual([m.m1_mean, m.m1_count, m.total_responses].map(Number), [4, 1, 1]);
+    assert.deepStrictEqual([Number((await perf(ID.it101)).p1_mean), r.total_responses], [4, 1]);
+    const q1 = await db.one(`SELECT mean_score, response_count FROM public.overall_question_means
+      WHERE instructor_id = $1 AND term_id = $2 AND category = 'Management' AND question_number = 1`, [ID.maria, ID.term2]);
+    assert.deepStrictEqual([Number(q1.mean_score), q1.response_count], [4, 1]);
+    await mariaForm(ID.it101, 'D3', { m1: 2, m2: 2, m3: 2, p1: 2, p2: 2 });   // exactly 5: counted
+    r = await recompute();
+    m = await mgmt(ID.it101);
+    assert.deepStrictEqual([m.m1_mean, m.m1_count, m.m3_count, m.total_responses].map(Number), [3, 2, 2, 2]);
+    assert.strictEqual(Number((await perf(ID.it101)).p3_count), 1);
+    assert.strictEqual(r.total_responses, 2);
+    const raw = await db.one(`SELECT count(*)::int AS n FROM public.sast_all_raw_data_survey WHERE "instructor_ID"::text = $1`, [ID.maria]);
+    assert.strictEqual(raw.n, 3, 'nothing is deleted from the raw table');
+    await cleanMaria();
+  });
+  test('014: an instructor + term whose only form has < 5 answers has no results', async () => {
+    await mariaForm(ID.it101, 'E1', { m1: 5, m2: 5, m3: 5, p1: 5 });
+    const r = await recompute();
+    assert.deepStrictEqual([r.total_responses, r.combined_score_mean], [0, null]);
+    assert.strictEqual(await mgmt(ID.it101), null);
+    assert.strictEqual(await perf(ID.it101), null);
+    const o = await db.one('SELECT count(*)::int AS n FROM public.overall_total_survey WHERE instructor_id = $1', [ID.maria]);
+    assert.strictEqual(o.n, 0);
+    await cleanMaria();
+  });
+  test('014: the backfill recomputes a pair that has a < 5 form; re-running the migration is safe', async () => {
+    await mariaForm(ID.it101, 'F1', { ...all(QM, 5), ...all(QP, 5) });
+    await mariaForm(ID.it101, 'F2', { m1: 1, p1: 1 });
+    await recompute();
+    // stale aggregates, as stored before 014 (the 2-answer form counted)
+    await db.none('UPDATE public.management_results SET total_responses = 2 WHERE instructor_id = $1', [ID.maria]);
+    await db.none('UPDATE public.overall_total_survey SET total_responses = 2 WHERE instructor_id = $1', [ID.maria]);
+    await db.multi(MIG014);
+    assert.strictEqual(Number((await mgmt(ID.it101)).total_responses), 1);
+    const o = await db.one('SELECT total_responses FROM public.overall_total_survey WHERE instructor_id = $1 AND term_id = $2', [ID.maria, ID.term2]);
+    assert.strictEqual(Number(o.total_responses), 1);
+    const acl = await db.one(`SELECT has_function_privilege('public', 'public.sast_answers(uuid, uuid)', 'EXECUTE') AS a`);
+    assert.strictEqual(acl.a, false);
+    await cleanMaria();
+  });
   test('flagged: build flagged record1 (website record) only uses real failed_scan_queue columns', async () => {
     const webRec = {
       _source: 'website', task_id: 'web:f1', user_id: ID.staff, term_id: ID.term, batch_id: ID.batch,
@@ -793,6 +848,25 @@ async function suite(rawIdType) {
     assert.ok(!('identity_check' in row.partial_data));
     assert.strictEqual(row.omr_comparison.agreement_percent, 25);
     assert.strictEqual(row.omr_comparison.comparisons.length, 20);
+  });
+  test('website end to end: 4 of 20 answered -> queue row inserted already discarded (min-answered rule), nothing in the raw table', async () => {
+    // Python and Gemini both read rows 0..15 blank: 4 answered on a reliable scan
+    const blank16 = Object.fromEntries(QS.slice(0, 16).map((q) => [q, 'blank']));
+    const gem = gemResp({ instructor: 'Dr. Juan A. Dela Cruz, MIT', subject: 'IT 101' }, blank16);
+    const { ctx, rec, d } = await websiteDecide('web:e2e-few', gem, pyResp({}, { blankRows: 16 }));
+    assert.strictEqual(rec.auto_discard, true);
+    assert.strictEqual(d.decision, 'flagged');
+    assert.deepStrictEqual(d.review_reasons, ['too_few_answers_4_of_20']);
+    const [wrec] = await runCode('Website Flagged Record', [d], { 'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': rec });
+    const [record] = await runCode('build flagged record1', [{}], { 'Website Flagged Record': wrec, 'Save scan error image': [{ id: null }] });
+    const row = await insertFlagged(record);
+    assert.strictEqual(row.status, 'discarded');
+    assert.strictEqual(row.review_action, 'rejected');
+    assert.strictEqual(row.review_correction.auto, true);
+    assert.strictEqual(row.review_correction.reviewed_by_name, 'Automatic rule');
+    assert.deepStrictEqual(row.review_reasons, ['too_few_answers_4_of_20']);
+    const raw = await db.one('SELECT count(*)::int AS n FROM public.sast_all_raw_data_survey WHERE task_id = $1', ['web:e2e-few']);
+    assert.strictEqual(raw.n, 0);
   });
   test('website end to end: garbage OCR instructor/subject -> not found, NOT flagged, credited to the batch', async () => {
     const { d, fm } = await websiteDecide('web:e2e-garbage', gemResp({ student_id: '2021-8888' }));   // 'AY/Semester: L U' / 'Mà essor'
@@ -1138,18 +1212,22 @@ async function suite(rawIdType) {
       assert.deepStrictEqual(d.partial_data.instructor_candidates, ref.partial_data.instructor_candidates);
       assert.ok(!('known_instructor' in d.partial_data));
       assert.strictEqual(d.partial_data.subject_match_confidence, 0.95);
-      // the known lists for the prompt. Phone: creditable instructors + placeholders, sorted, plus
-      // subjects. Website: subjects only -- no instructor names are looked up or sent to Gemini.
+      // the known lists for the prompt: subjects only on BOTH branches -- no instructor names are
+      // looked up for or sent to Gemini (privacy).
       const [kw] = await runNode('Website Known Names', {}, { 'Website Prepare Scan': batch });
       const [kp] = await runNode('Phone Known Names', {}, {});
       assert.deepStrictEqual(Object.keys(kw).sort(), ['known_names_version', 'subject_list', 'subjects']);
+      assert.deepStrictEqual(Object.keys(kp).sort(), ['known_names_version', 'subject_list', 'subjects']);
       assert.deepStrictEqual(kw.subjects, kp.subjects, 'same subject list on both branches');
       assert.strictEqual(kw.subject_list, kp.subject_list);
-      assert.deepStrictEqual(kp.instructor_names, ['Ana Dela Cruz', 'Banjiee Caruana', 'Carlo Mendoza', 'Evangeline Caruana', 'Juan Carlos Santos',
-        'Juan Dela Cruz', 'Maria Santos', 'Nora Villanueva', 'Pedro Reyes', 'Rodz Harvey d Licayan', 'Ronald Kinggg licayan']);
-      assert.ok(kp.instructor_list.startsWith('Ana Dela Cruz; Banjiee Caruana; '));
-      assert.ok(!/Rosa|Liza|Sam Staff/.test(kp.instructor_list), 'pending / SAO accounts are not listed');
-      assert.ok(!kp.instructor_names.some((n) => JSON.stringify(kw).includes(n)), 'no instructor name in the website lookup');
+      // phone: the creditable instructors for the reconciler's LOCAL match (after the Gemini call),
+      // same people as 'get instructor id6': approved + DEPARTMENT_HEAD/FULL-TIME/PART-TIME, sorted
+      const [pc] = await runNode('Phone Instructor Candidates', {}, {});
+      assert.strictEqual(pc.candidates_version, 1);
+      assert.deepStrictEqual(pc.instructor_names, ['Ana Dela Cruz', 'Banjiee Caruana', 'Carlo Mendoza', 'Evangeline Caruana', 'Juan Carlos Santos',
+        'Juan Dela Cruz', 'Maria Santos', 'Pedro Reyes', 'Rodz Harvey d Licayan', 'Ronald Kinggg licayan']);
+      assert.ok(!/Rosa|Liza|Sam Staff|Nora/.test(pc.instructor_names.join(';')), 'pending / SAO / placeholder accounts are not listed');
+      assert.ok(!pc.instructor_names.some((n) => JSON.stringify([kw, kp]).includes(n)), 'no instructor name in either Known Names lookup');
       assert.deepStrictEqual(kw.subjects.map((x) => x.code), ['ASP 101', 'DDMGT-3', 'GE 104', 'IT 101', 'IT 102', 'PC121']);
       assert.ok(kw.subject_list.includes('PC121 = Discreet Math'));
     } finally {
@@ -1287,6 +1365,198 @@ async function suite(rawIdType) {
     await db.none(`DELETE FROM public.failed_scan_queue WHERE task_id = 'web:fix-1'`);
     await db.none('DELETE FROM public.instructor_subjects');
   });
+  // ---------------------------------------------------------------- stamp rule (migration 015)
+  const STAMP_TASK = `web:${ID.batch}:0123456789abcdef`;
+  const stampItem = (over = {}) => decideItem({ stamp_no: '0100005', stamp_source: 'gemini', ...over });
+  const rawUpsert = async (d) => (await runNode('Website Raw Upsert', {}, { 'Website Decide': d }))[0];
+  const stampRow = (task) => db.one(`SELECT id, stamp_no, stamp_source, student_id, "Remarks_and_Suggestions" AS rem
+    FROM public.sast_all_raw_data_survey WHERE task_id = $1`, [task]);
+  const cleanStamps = () => db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE task_id LIKE 'web:%' AND task_id <> ALL($1)`,
+    [['web:t1', 'web:t3', 'web:t4', 'web:t5']]);
+  test('015: save_website_raw_row -- stamp saved; same term -> duplicate_stamp + DUP; other term saved; NULL stamps many times', async () => {
+    const first = await rawUpsert(stampItem({ task_id: STAMP_TASK, student_id: 'ST-1' }));
+    assert.deepStrictEqual(first, { saved: true, reason: null, duplicate_of: null });
+    const row = await stampRow(STAMP_TASK);
+    assert.deepStrictEqual([row.stamp_no, row.stamp_source], ['0100005', 'gemini']);
+    // another page (other student) with the same stamp in the same term -> not stored, DUP returned
+    const dup = await rawUpsert(stampItem({ task_id: 'web:st-2', student_id: 'ST-2' }));
+    assert.strictEqual(dup.saved, false);
+    assert.strictEqual(dup.reason, 'duplicate_stamp');
+    assert.deepStrictEqual(dup.duplicate_of, { raw_id: Number(row.id), task_id: STAMP_TASK, batch_id: ID.batch,
+      submitted_date: '2026-09-26', instructor_id: ID.juan, subject_id: ID.it101, term_id: ID.term, stamp_no: '0100005' });
+    assert.strictEqual((await db.one(`SELECT count(*)::int AS n FROM public.sast_all_raw_data_survey WHERE task_id = 'web:st-2'`)).n, 0);
+    // the same stamp in another term is another form
+    assert.strictEqual((await rawUpsert(stampItem({ task_id: 'web:st-3', student_id: 'ST-3', term_id: ID.term2 }))).saved, true);
+    // no stamp: never compared (NULL many times); an invalid stamp is stored as no stamp
+    for (const [task, stamp] of [['web:st-4', null], ['web:st-5', null], ['web:st-6', ''], ['web:st-7', 'abc12']]) {
+      assert.strictEqual((await rawUpsert(stampItem({ task_id: task, student_id: `S-${task}`, stamp_no: stamp }))).saved, true, task);
+      assert.deepStrictEqual(Object.values(await stampRow(task)).slice(1, 3), [null, null], task);
+    }
+    // resend of the same page (same task_id, same stamp) updates its own row
+    const again = await rawUpsert(stampItem({ task_id: STAMP_TASK, student_id: 'ST-1', remark: 'resent' }));
+    assert.strictEqual(again.saved, true);
+    assert.strictEqual((await stampRow(STAMP_TASK)).rem, 'resent');
+    // duplicate_student unchanged: same student key, another page -> nothing overwritten
+    const ds = await rawUpsert(stampItem({ task_id: 'web:st-8', student_id: 'ST-1', stamp_no: '0200006', remark: 'other' }));
+    assert.deepStrictEqual(ds, { saved: false, reason: 'duplicate_student', duplicate_of: null });
+    assert.deepStrictEqual([(await stampRow(STAMP_TASK)).rem, (await stampRow(STAMP_TASK)).stamp_no], ['resent', '0100005']);
+    // any other error (here a rating CHECK) is raised, never turned into duplicate_stamp
+    await assert.rejects(rawUpsert(stampItem({ task_id: 'web:st-9', student_id: 'ST-9', stamp_no: '0300007',
+      ratings: { ...decideItem().ratings, m1: 6 } })), /check constraint/);
+    await cleanStamps();
+  });
+  test('015: two concurrent inserts with the same term + stamp (two connections) -> exactly one saved, the other duplicate_stamp', async () => {
+    const q = (d) => {
+      const n = node('Website Raw Upsert');
+      return pgp.helpers.concat([{ query: n.parameters.query, values: evalReplacement(n, {}, { 'Website Decide': d }) }]);
+    };
+    let inserted;
+    const firstDone = new Promise((r) => { inserted = r; });
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const p1 = db.tx(async (t) => { const r = await t.one(q(stampItem({ task_id: 'web:race-1', student_id: 'R-1' }))); inserted(); await gate; return r; });
+    await firstDone;
+    let p2Finished = false;
+    const p2 = db.tx(async (t) => t.one(q(stampItem({ task_id: 'web:race-2', student_id: 'R-2' })))).then((r) => { p2Finished = true; return r; });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(p2Finished, false, 'the second insert waits for the first transaction');
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.strictEqual(r1.saved, true);
+    assert.strictEqual(r2.saved, false);
+    assert.strictEqual(r2.reason, 'duplicate_stamp');
+    assert.strictEqual(r2.duplicate_of.task_id, 'web:race-1');
+    assert.strictEqual((await db.one(`SELECT count(*)::int AS n FROM public.sast_all_raw_data_survey
+      WHERE stamp_no = '0100005' AND term_id::text = $1`, [ID.term])).n, 1);
+    await cleanStamps();
+  });
+  test('015: Website Identity Check $6 -> duplicate_stamp_exists / duplicate_stamp_of (own page, no stamp, other term never)', async () => {
+    await rawUpsert(stampItem({ task_id: STAMP_TASK, student_id: 'ST-1' }));
+    const ok = { stamp_status: 'ok', stamp_no: '0100005', student_id: 'X-1' };
+    const hit = await identity('Juan Dela Cruz', 'IT 101', { task_id: 'web:other' }, ok);
+    assert.strictEqual(hit.duplicate_stamp_exists, true);
+    assert.strictEqual(hit.duplicate_stamp_of.task_id, STAMP_TASK);
+    assert.strictEqual(hit.duplicate_stamp_of.batch_id, ID.batch);
+    assert.strictEqual(hit.duplicate_stamp_of.stamp_no, '0100005');
+    assert.strictEqual(hit.duplicate_student_exists, false);
+    for (const [label, batch, page] of [
+      ['own page', { task_id: STAMP_TASK }, ok],
+      ['no stamp read', { task_id: 'web:other' }, { ...ok, stamp_status: 'multiple', stamp_no: null }],
+      ['other term', { task_id: 'web:other', term_id: ID.term2 }, ok],
+      ['other stamp', { task_id: 'web:other' }, { ...ok, stamp_no: '0100006' }],
+    ]) {
+      const r = await identity('Juan Dela Cruz', 'IT 101', batch, page);
+      assert.strictEqual(r.duplicate_stamp_exists, false, label);
+      assert.strictEqual(r.duplicate_stamp_of, null, label);
+    }
+    // the term falls back to the current term like the rest of the check
+    assert.strictEqual((await identity('J', 'IT 101', { task_id: 'web:other', term_id: null }, ok)).duplicate_stamp_exists, true);
+    // end to end: Decide auto-rejects, the queue row is stored discarded with the stamp, no staff push
+    const ctx = { batch_id: ID.batch, instructor_id: ID.juan, subject_id: ID.it101, term_id: ID.term, station_id: ID.batch,
+      staff_id: ID.staff, filename: 'p.jpg', task_id: 'web:e2e-dup', image_base64: 'QUJD' };
+    const [rec] = await runCode('Website Reconcile OCR OMR', [gemResp({ stamp_numbers: ['0100005'] })],
+      { 'Website Python OMR': pyResp(), 'Website AI Validation': gemResp({ stamp_numbers: ['0100005'] }) });
+    const [idRow] = await runNode('Website Identity Check', rec, { 'Website Prepare Scan': ctx });
+    const [fm] = await runNode('Website Form Match', idRow, { 'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': rec });
+    const [d] = await runCode('Website Decide', [fm], { 'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': rec,
+      'Website Identity Check': idRow });
+    assert.strictEqual(d.auto_reject, 'duplicate_stamp');
+    assert.strictEqual(d.review_reasons[0], 'duplicate_stamp');
+    const [w] = await runCode('Website Flagged Record', [d], { 'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': rec });
+    const img = await db.one('INSERT INTO public.scan_error_images (task_id, image_base64) VALUES ($1, $2) RETURNING id', [ctx.task_id, 'QUJD']);
+    const [record] = await runCode('build flagged record1', [{}], { 'Website Flagged Record': w, 'Save scan error image': [{ id: img.id }] });
+    const row = await insertFlagged(record);
+    assert.deepStrictEqual([row.status, row.review_action, row.stamp_no, row.stamp_source], ['discarded', 'rejected', '0100005', 'gemini']);
+    assert.strictEqual(row.review_correction.rule, 'duplicate_stamp');
+    assert.strictEqual(row.partial_data.duplicate_of.task_id, STAMP_TASK);
+    assert.deepStrictEqual(await runNode('Get staff FCM for flagged scan', {}, { 'build flagged record1': record }), [],
+      'no staff push for an auto-rejected form');
+    await db.none(`DELETE FROM public.failed_scan_queue WHERE task_id = 'web:e2e-dup'`);
+    await cleanStamps();
+  });
+  test('015: phone_stamp_check.sql (Phone Stamp Check / Correction Stamp Check): current-term fallback, own task, one row', async () => {
+    await rawUpsert(stampItem({ task_id: STAMP_TASK, student_id: 'ST-1' }));
+    const phone = async (rec) => runNode('Phone Stamp Check', {}, { 'reconcile ocr and omr1': rec });
+    let r = await phone({ stamp_status: 'ok', stamp_no: '0100005', task_id: 'phone-77' });
+    assert.strictEqual(r.length, 1);
+    assert.strictEqual(r[0].duplicate_stamp_exists, true, "'' term = system_settings.current_term_id (phone rows' term)");
+    assert.strictEqual(r[0].duplicate_stamp_of.raw_id > 0, true);
+    assert.strictEqual(r[0].stamp_term_id, ID.term);
+    for (const rec of [{ stamp_status: 'missing', stamp_no: null, task_id: 'phone-77' },
+      { stamp_status: 'ok', stamp_no: '0100005', task_id: STAMP_TASK },
+      { stamp_status: 'ok', stamp_no: '0999999', task_id: 'phone-77' }]) {
+      r = await phone(rec);
+      assert.deepStrictEqual([r.length, r[0].duplicate_stamp_exists, r[0].duplicate_stamp_of], [1, false, null], JSON.stringify(rec));
+    }
+    // corrections: the correction's own term (website_review = the page term)
+    const corr = async (m) => runNode('Correction Stamp Check', m, {});
+    assert.strictEqual((await corr({ current_term_id: ID.term, stamp_no: '0100005', task_id: 'phone-77' }))[0].duplicate_stamp_exists, true);
+    assert.strictEqual((await corr({ current_term_id: ID.term2, stamp_no: '0100005', task_id: 'phone-77' }))[0].duplicate_stamp_exists, false);
+    assert.strictEqual((await corr({ current_term_id: ID.term, stamp_no: '0100005', task_id: STAMP_TASK }))[0].duplicate_stamp_exists, false,
+      'the same task_id (re-approval of the stored page) is not a duplicate');
+    assert.strictEqual((await corr({ current_term_id: ID.term, stamp_no: null, task_id: null }))[0].duplicate_stamp_exists, false);
+    // a correction without task_id: every stored row with the stamp counts
+    assert.strictEqual((await corr({ current_term_id: ID.term, stamp_no: '0100005', task_id: null }))[0].duplicate_stamp_exists, true);
+    await cleanStamps();
+  });
+  test('015: corrections store the stamp in the raw row and the queue row (Mark Queue Validated1)', async () => {
+    const fsq = await db.one(`INSERT INTO public.failed_scan_queue (task_id, status, term_id, stamp_no, stamp_source)
+      VALUES ('phone-st-1', 'pending', $1, '0100009', 'gemini') RETURNING id`, [ID.term]);
+    const hook = { body: { failed_scan_id: fsq.id, stamp_no: '0100010', stamp_source: 'override' } };
+    const mapped = { stamp_no: '0100010', stamp_source: 'override' };
+    await runNode('Mark Queue Validated1', {}, { 'sast-manual-correction1': hook, 'Map target': mapped });
+    let q = await db.one('SELECT status, stamp_no, stamp_source FROM public.failed_scan_queue WHERE id = $1', [fsq.id]);
+    assert.deepStrictEqual(q, { status: 'validated', stamp_no: '0100010', stamp_source: 'override' });
+    // an older client without the stamp_no key leaves the queue stamp as it was
+    await runNode('Mark Queue Validated1', {}, { 'sast-manual-correction1': { body: { failed_scan_id: fsq.id } },
+      'Map target': { stamp_no: null, stamp_source: null } });
+    q = await db.one('SELECT stamp_no, stamp_source FROM public.failed_scan_queue WHERE id = $1', [fsq.id]);
+    assert.deepStrictEqual(q, { stamp_no: '0100010', stamp_source: 'override' });
+    // "no stamp" sent explicitly clears it
+    await runNode('Mark Queue Validated1', {}, { 'sast-manual-correction1': { body: { failed_scan_id: fsq.id, stamp_no: null } },
+      'Map target': { stamp_no: null, stamp_source: null } });
+    q = await db.one('SELECT stamp_no, stamp_source FROM public.failed_scan_queue WHERE id = $1', [fsq.id]);
+    assert.deepStrictEqual(q, { stamp_no: null, stamp_source: null });
+    // the raw row (shared upsert) gets the corrected stamp
+    const [row] = await runCode('Code in JavaScript', [{ instructor_ID: ID.maria, true_subject_id: ID.ge104, current_term_id: ID.term,
+      'Student ID': 'P-ST', M1: 4, P1: 4, Date: '2026-10-16', task_id: 'phone-st-1', stamp_no: '0100010', stamp_source: 'override' }],
+    { 'sast-manual-correction1': { body: { user_id: ID.staff } } });
+    const stored = await sharedRawUpsert(row);
+    assert.deepStrictEqual([stored.stamp_no, stored.stamp_source], ['0100010', 'override']);
+    // the unique index stops a second form with that stamp in the term on the shared path too
+    const [row2] = await runCode('Code in JavaScript', [{ instructor_ID: ID.maria, true_subject_id: ID.ge104, current_term_id: ID.term,
+      'Student ID': 'P-ST2', M1: 4, task_id: 'phone-st-2', stamp_no: '0100010', stamp_source: 'staff' }],
+    { 'sast-manual-correction1': { body: { user_id: ID.staff } } });
+    await assert.rejects(sharedRawUpsert(row2), /sast_raw_term_stamp_uniq/);
+    await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE "instructor_ID"::text = $1`, [ID.maria]);
+    await db.none(`DELETE FROM public.failed_scan_queue WHERE task_id = 'phone-st-1'`);
+  });
+  test('015: CHECKs (raw + queue), queue index not unique, privileges, re-running the migration is safe', async () => {
+    await assert.rejects(db.none(`INSERT INTO public.sast_all_raw_data_survey (task_id, stamp_no) VALUES ('web:bad', '12')`),
+      /sast_raw_stamp_no_format/);
+    await assert.rejects(db.none(`INSERT INTO public.sast_all_raw_data_survey (task_id, stamp_no, stamp_source)
+      VALUES ('web:bad', '0100005', 'robot')`), /sast_raw_stamp_source_check/);
+    await assert.rejects(db.none(`INSERT INTO public.failed_scan_queue (task_id, stamp_no) VALUES ('q-bad', '1234567890123')`),
+      /failed_scan_queue_stamp_no_format/);
+    await db.none(`INSERT INTO public.failed_scan_queue (task_id, term_id, stamp_no, stamp_source) VALUES
+      ('q-a', $1, '0100005', 'gemini'), ('q-b', $1, '0100005', 'gemini')`, [ID.term]);
+    await db.multi(MIG015);
+    await db.multi(MIG015);
+    const idx = await db.any(`SELECT indexname, indexdef FROM pg_indexes WHERE indexname IN
+      ('sast_raw_term_stamp_uniq', 'failed_scan_queue_term_stamp_idx') ORDER BY 1`);
+    assert.strictEqual(idx.length, 2);
+    assert.match(idx[1].indexdef, /UNIQUE INDEX sast_raw_term_stamp_uniq .*\(term_id, stamp_no\) WHERE \(stamp_no IS NOT NULL\)/);
+    assert.ok(!/UNIQUE/.test(idx[0].indexdef));
+    const cons = await db.one(`SELECT count(*)::int AS n FROM pg_constraint WHERE conname LIKE '%stamp%'`);
+    assert.strictEqual(cons.n, 4);
+    for (const f of ['public.save_website_raw_row(text, text, text, text, text, text, text, text, text, jsonb, text, text)',
+      'public.sast_stamp_duplicate_of(text, text, text)']) {
+      const acl = await db.one(`SELECT has_function_privilege('anon', $1, 'EXECUTE') AS anon,
+        has_function_privilege('service_role', $1, 'EXECUTE') AS svc`, [f]);
+      assert.deepStrictEqual(acl, { anon: false, svc: true }, f);
+    }
+    await db.none(`DELETE FROM public.failed_scan_queue WHERE task_id IN ('q-a', 'q-b')`);
+  });
   return t;
 }
 
@@ -1309,6 +1579,8 @@ async function suite(rawIdType) {
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN CREATE ROLE service_role NOLOGIN; END IF;
       END $$`);
       await db.multi(MIG013);
+      await db.multi(MIG014);
+      await db.multi(MIG015);
       for (const tc of await suite(rawIdType)) {
         total++;
         try {
