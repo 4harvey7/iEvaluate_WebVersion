@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SAST Mark Labeler</title>
+<style>
+:root{
+  --graphite:#2A2A28; --graphite-soft:#6B6558;
+  --red:#B23A2E; --red-d:#8C2C22;
+  --card:#FBF9F3; --ok:#3E6B4F; --pencil:#D9A62E; --line:#D9D2BE; --paper:#F2EEE3;
+  --warn-bg:#FBE7DF;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;
+  --serif:Georgia,"Times New Roman",serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;color:var(--graphite);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:repeating-linear-gradient(#F2EEE3 0 27px,#D9D2BE 27px 28px);background-color:#F2EEE3;overflow-x:hidden}
+.wrap{max-width:1180px;margin:0 auto;padding:14px 12px 80px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:6px 0 14px}
+h1{font:700 30px/1.1 var(--serif);margin:0}
+h1 span{color:var(--red)}
+.stamp{font:700 11px/1.2 var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--red);
+  border:2px solid var(--red);border-radius:4px;padding:5px 8px;transform:rotate(-4deg);background:rgba(251,249,243,.7)}
+.sub{font:12px var(--mono);color:var(--graphite-soft);flex-basis:100%;margin:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:16px;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+.card h2{font:700 20px var(--serif);margin:0 0 12px;display:flex;align-items:center;gap:10px}
+.step{flex:none;width:30px;height:30px;border-radius:50%;background:var(--graphite);color:#fff;display:inline-flex;align-items:center;justify-content:center;font:700 16px var(--serif)}
+.meta{font:12px var(--mono);color:var(--graphite-soft)}
+.btn{font:600 14px system-ui,sans-serif;min-height:40px;padding:8px 14px;border-radius:6px;border:1.5px solid var(--graphite);background:#fff;color:var(--graphite);cursor:pointer;touch-action:manipulation;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.btn:hover{background:#f4efe2}
+.btn.primary{background:var(--red);border-color:var(--red-d);color:#fff}
+.btn.primary:hover{background:var(--red-d)}
+.btn.ok{background:var(--ok);border-color:#2d5039;color:#fff}
+.btn.ghost{border-color:var(--line)}
+.btn.danger{border-color:var(--red);color:var(--red)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.small{min-height:34px;padding:4px 10px;font-size:13px}
+.btnrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+details.help{border:1px dashed var(--graphite-soft);border-radius:6px;padding:8px 12px;margin-bottom:16px;background:rgba(251,249,243,.85)}
+details.help summary{cursor:pointer;font:700 14px var(--serif);min-height:30px;display:flex;align-items:center}
+details.help ul{margin:6px 0 2px;padding-left:20px}
+.drop{border:2px dashed var(--graphite-soft);border-radius:8px;padding:14px;text-align:center;margin-bottom:10px;color:var(--graphite-soft);font:13px var(--mono)}
+.drop.over{border-color:var(--red);background:var(--warn-bg)}
+.drop .btnrow{justify-content:center;margin-bottom:8px}
+.queue{display:flex;gap:8px;overflow-x:auto;padding:4px 0 6px}
+.thumb{flex:none;width:84px;border:2px solid var(--line);border-radius:6px;background:#fff;position:relative;cursor:pointer;overflow:hidden}
+.thumb.sel{border-color:var(--red)}
+.thumb img{width:100%;height:64px;object-fit:cover;display:block}
+.thumb .nm{font:10px var(--mono);padding:2px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.thumb .x{position:absolute;top:0;right:0;width:26px;height:26px;border:0;background:rgba(42,42,40,.75);color:#fff;font-size:15px;cursor:pointer;border-radius:0 0 0 6px}
+.work{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+.preview{position:sticky;top:8px}
+.pv{border:1px solid var(--line);background:#fff;border-radius:6px;overflow:auto;max-height:78vh;min-height:160px;display:flex;align-items:flex-start;justify-content:center}
+.pv img{display:block}
+.pv.fit img{max-width:100%;height:auto}
+.pv.full{display:block}
+.pv.full img{max-width:none;width:auto}
+.pv .empty{padding:50px 10px;color:var(--graphite-soft);font:13px var(--mono);align-self:center;text-align:center}
+.pvbar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.field{margin-bottom:12px}
+.field>label,.field>.lab{display:block;font:700 12px var(--mono);text-transform:uppercase;letter-spacing:.05em;color:var(--graphite-soft);margin-bottom:5px}
+.field .req{color:var(--red)}
+input[type=text],textarea{width:100%;font:15px system-ui,sans-serif;padding:9px 10px;border:1.5px solid var(--graphite-soft);border-radius:6px;background:#fff;color:var(--graphite);min-height:40px}
+textarea{min-height:60px;resize:vertical}
+.choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
+.choice{min-height:48px;font:600 15px system-ui,sans-serif;border:2px solid var(--graphite-soft);background:#fff;color:var(--graphite);border-radius:8px;cursor:pointer;padding:6px 8px;touch-action:manipulation;line-height:1.15}
+.choice small{display:block;font:11px var(--mono);color:var(--graphite-soft);font-weight:400}
+.choice.on{background:var(--graphite);border-color:var(--graphite);color:#fff}
+.choice.on small{color:#ddd}
+.qf{background:#FFF7DD;border:1px solid var(--pencil);border-radius:6px;padding:8px;margin-bottom:10px}
+.qf .lab{font:700 12px var(--mono);margin-bottom:6px}
+.qf .btnrow .btn{padding:4px 10px}
+.sect{font:700 15px var(--serif);margin:12px 0 4px;padding-bottom:3px;border-bottom:2px solid var(--graphite)}
+.row{border:1px solid var(--line);border-left:5px solid var(--line);border-radius:6px;background:#fff;padding:6px 8px;margin-bottom:6px}
+.row.done{border-left-color:var(--ok)}
+.row.warn{background:var(--warn-bg);border-color:var(--red);border-left-color:var(--red)}
+.rtop{display:flex;gap:8px;align-items:flex-start;margin-bottom:5px}
+.rn{flex:none;font:700 12px var(--mono);background:var(--graphite);color:#fff;border-radius:10px;min-width:24px;height:20px;line-height:20px;text-align:center;margin-top:1px}
+.rl{font-size:13.5px;min-width:0;flex:1}
+.rwarn{display:none;font:11px var(--mono);color:var(--red-d)}
+.row.warn .rwarn{display:block}
+.bubbles{display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap}
+.bub{width:38px;height:38px;border-radius:50%;border:2px solid var(--graphite-soft);background:#fff;font:700 12px var(--mono);color:var(--graphite);cursor:pointer;padding:0;touch-action:manipulation}
+.bub.on{background:var(--red);border-color:var(--red-d);color:#fff}
+.bub.none.on{background:var(--graphite-soft);border-color:var(--graphite)}
+.bub.dim{opacity:.35}
+.chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(58px,1fr));gap:5px}
+.chip{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;min-height:42px;padding:3px 2px;border:1.5px solid var(--line);border-radius:6px;background:#FBF9F3;cursor:pointer;font:600 10.5px var(--mono);color:var(--graphite);touch-action:manipulation}
+.chip svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.chip svg .f{fill:currentColor;stroke:none}
+.chip.on{background:var(--graphite);border-color:var(--graphite);color:#fff}
+.chip.on.good{background:var(--ok);border-color:var(--ok)}
+.savebar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px;position:sticky;bottom:0;background:var(--card);padding:8px 0;border-top:1px solid var(--line)}
+.count{font:700 14px var(--mono)}
+.count.full{color:var(--ok)}
+.hint{font:11px var(--mono);color:var(--graphite-soft);flex-basis:100%}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:8px;margin-bottom:12px}
+.stat{border:1px solid var(--line);background:#fff;border-radius:6px;padding:6px 8px}
+.stat b{display:block;font:700 22px var(--serif)}
+.stat span{font:11px var(--mono);color:var(--graphite-soft);text-transform:uppercase}
+.stat.lowmark b{color:var(--red)}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:#fff;margin-bottom:12px;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:13px}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{font:700 11px var(--mono);text-transform:uppercase;background:#F2EEE3}
+td.id{font:12px var(--mono)}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:var(--graphite);color:#fff;padding:10px 16px;border-radius:8px;font:13px var(--mono);max-width:90vw;z-index:50;opacity:0;pointer-events:none;transition:opacity .2s;text-align:center}
+#toast.show{opacity:1}
+#toast.warnt{background:var(--red-d)}
+.cvwrap{position:relative;height:min(68vh,640px);min-height:260px;background:#333;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.cvwrap canvas#cv{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+#mag{position:absolute;top:8px;width:150px;height:150px;border:2px solid var(--red);border-radius:6px;pointer-events:none;background:#222}
+.cprompt{font:700 14px var(--serif);margin:6px 0}
+.cprompt .pg{color:var(--red)} .cprompt .tb{color:var(--ok)}
+.cut{display:flex;align-items:center;gap:8px;margin:8px 0;font:600 14px system-ui,sans-serif}
+.cut input{width:20px;height:20px}
+@media (max-width:880px){
+  .work{grid-template-columns:minmax(0,1fr)}
+  .preview{position:static}
+  .pv{max-height:60vh}
+}
+@media (max-width:600px){
+  .wrap{padding:10px 8px 80px}
+  h1{font-size:25px}
+  .card{padding:10px}
+  .rl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row{padding:5px 6px}
+  .bub{width:40px;height:40px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>SAST Mark <span>Labeler</span></h1>
+  <div class="stamp">checks &amp; slashes only &#10003;</div>
+  <p class="sub">Label real paper SAST forms &middot; photos and scans &middot; works offline &middot; nothing is uploaded anywhere</p>
+</header>
+
+<details class="help">
+  <summary>How to label</summary>
+  <ul>
+    <li>Label what is ACTUALLY on the paper, not what was intended.</li>
+    <li>If a row has two marks, pick the main one, choose "other", and write a note.</li>
+    <li>An erased or crossed-out mark counts as "other".</li>
+    <li>Photograph the whole form flat, in good light, with no fingers covering it.</li>
+  </ul>
+</details>
+
+<section class="card" id="loadcard">
+  <h2><span class="step">1</span>Load photos</h2>
+  <div class="drop" id="drop">
+    <div class="btnrow">
+      <label class="btn primary" for="fileIn">Choose photos / scans</label>
+      <label class="btn" for="camIn">Take photo</label>
+    </div>
+    <input type="file" id="fileIn" accept="image/*" multiple hidden>
+    <input type="file" id="camIn" accept="image/*" capture="environment" hidden>
+    or drag &amp; drop image files here
+  </div>
+  <div class="meta" id="qmeta"></div>
+  <div class="queue" id="queue"></div>
+</section>
+
+<section class="card" id="cornercard">
+  <h2><span class="step">2</span>Corners <span class="meta">(optional: for the table-finder test)</span></h2>
+  <div class="pvbar">
+    <span class="meta" id="cnmeta">No image</span>
+    <div class="btnrow">
+      <button class="btn small" id="czOut" type="button" title="Zoom out">&minus;</button>
+      <button class="btn small" id="czIn" type="button" title="Zoom in">+</button>
+      <button class="btn small" id="czFit" type="button">Fit</button>
+      <button class="btn small" id="cUndo" type="button">Undo last point</button>
+      <button class="btn small danger" id="cReset" type="button">Reset corners</button>
+    </div>
+  </div>
+  <div class="cprompt" id="cprompt"></div>
+  <div class="cvwrap" id="cvwrap"><canvas id="cv"></canvas><canvas id="mag" width="150" height="150" hidden></canvas></div>
+  <div class="meta" style="margin-top:4px">Click the 4 PAGE corners, then the 4 TABLE corners (outer border of the 20&times;5 rating table), in order: top-left, top-right, bottom-right, bottom-left. Scroll wheel or pinch to zoom, drag to pan. A click outside the photo snaps to the image edge.</div>
+  <label class="cut"><input type="checkbox" id="cutOff"> Page edge cut off (a page corner is outside the photo)</label>
+  <div class="meta" id="clist"></div>
+  <div class="savebar">
+    <button class="btn ok" id="saveBtn2" type="button" disabled>Save &amp; next</button>
+    <span class="hint" id="hint2">Rows are optional if all 8 corners are placed.</span>
+  </div>
+</section>
+
+<section class="card" id="formcard">
+  <h2><span class="step">3</span>Label the current sheet</h2>
+  <div class="work">
+    <div class="preview">
+      <div class="pvbar">
+        <span class="meta" id="pvmeta">No image</span>
+        <button class="btn small" id="zoomBtn" type="button">Zoom: fit</button>
+      </div>
+      <div class="pv fit" id="pv"><div class="empty">Load a photo above.</div></div>
+      <div class="meta" style="margin-top:4px">Pinch to zoom, or tap Zoom for 100% and scroll.</div>
+    </div>
+    <div>
+      <div class="field"><label for="labeler">Your name</label>
+        <input type="text" id="labeler" placeholder="e.g. Juan Dela Cruz" autocomplete="name"></div>
+      <div class="field"><div class="lab">Paper size <span class="req">*</span></div>
+        <div class="choices" id="c_paper"></div></div>
+      <div class="field"><div class="lab">Capture <span class="req">*</span></div>
+        <div class="choices" id="c_capture"></div></div>
+      <div class="field"><div class="lab">Pen <span class="req">*</span></div>
+        <div class="choices" id="c_pen"></div></div>
+      <div class="field"><label for="notes">Notes (optional)</label>
+        <textarea id="notes" placeholder="Smudges, torn corner, two marks in a row..."></textarea></div>
+
+      <div class="qf"><div class="lab">Set ALL rows' mark to:</div>
+        <div class="btnrow" id="qf"></div></div>
+      <div class="btnrow" style="margin-bottom:6px">
+        <button class="btn small" id="copyPrev" type="button">Copy labels from previous entry</button>
+      </div>
+      <div id="rows"></div>
+
+      <div class="savebar">
+        <span class="count" id="count">0/20 rows done</span>
+        <button class="btn ok" id="saveBtn" type="button" disabled>Save &amp; next</button>
+        <button class="btn ghost" id="cancelEdit" type="button" hidden>Cancel edit</button>
+        <span class="hint" id="hint"></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="card" id="dataset">
+  <h2><span class="step">4</span>Dataset</h2>
+  <div class="stats" id="stats"></div>
+  <div class="tablewrap"><table>
+    <thead><tr><th>id</th><th>capture</th><th>paper</th><th>pen</th><th>rows done</th><th>marks</th><th>corners</th><th></th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table></div>
+  <div class="btnrow">
+    <button class="btn primary" id="dlBtn" type="button" disabled>Download dataset (.zip)</button>
+    <button class="btn danger" id="clearBtn" type="button" disabled>Clear entire dataset</button>
+  </div>
+  <p class="meta" id="dbnote"></p>
+</section>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+/*CORE-START*/
+const GEN = "sast-mark-labeler v1";
+const SEC_M = "Management (I)", SEC_P = "Teaching Performance (II)";
+const MGMT = [
+  "Gives reasonable course / subject assignments",
+  "Earns appreciation and kind attention from the students",
+  "Gives orientation about the subject and how students are evaluated",
+  "Gives tests and/or projects within the objectives of the course",
+  "Shows deep interest and concern in assisting the students",
+  "Manifests sympathetic insight into students' feelings",
+  "Checks and records test papers / term papers",
+  "Is on time and regular in meeting the class",
+  "Apportions fair subject / course assignments",
+  "Sustains the attention of the class for the whole period"
+];
+const PERF = [
+  "Presents lesson clearly, methodically, and substantially",
+  "Motivates the students to learn",
+  "Facilitates learning with appropriate educational methods and techniques",
+  "Shows mastery of the lesson",
+  "Is ready for the class",
+  "Inspires students' self-reliance in their quest for knowledge",
+  "Knows when students have difficulty and finds ways to make it easy",
+  "Integrates values into the lesson",
+  "Speaks the language of instruction (English or Filipino) clearly and fluently",
+  "Delivers thought-provoking questions"
+];
+const ROWS = MGMT.map((l,i)=>({key:"m"+(i+1),section:SEC_M,row_no:i+1,label:l}))
+  .concat(PERF.map((l,i)=>({key:"p"+(i+1),section:SEC_P,row_no:i+1,label:l})));
+const COLUMNS = ["O","VS","S","F","US","none"];
+const MARKS = ["check","slash","backslash","x","shade","circle","dot","other","blank"];
+const PAPERS = [["short","Short","8.5 x 11"],["long","Long","8.5 x 13"],["a4","A4",""],["legal","Legal",""]];
+const CAPTURES = [["scanner","Scanner",""],["phone_photo","Phone photo",""]];
+const PENS = [["ballpen","Ballpen",""],["pencil","Pencil",""],["sign_pen","Sign pen",""],["marker","Marker",""]];
+
+function slugify(s){
+  s = String(s||"").normalize("NFKD").replace(/[̀-ͯ]/g,"").toLowerCase()
+    .replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"");
+  return s || "anon";
+}
+function pad(n,w){ return String(n).padStart(w||2,"0"); }
+function dateStamp(d){ return d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate()); }
+function timeStamp(d){ return dateStamp(d)+"-"+pad(d.getHours())+pad(d.getMinutes())+pad(d.getSeconds()); }
+function csvEscape(v){
+  const s = (v===null||v===undefined) ? "" : String(v);
+  return /[",\r\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+}
+const CORNER_NAMES = ["tl","tr","br","bl"];
+const CSV_HEAD_BASE = ["id","image","labeler","paper_type","capture","pen","key","section","row_no","column","mark","notes"];
+const CSV_CORNER_HEAD = ["width","height","page_cut_off"]
+  .concat(["page","table"].reduce((a,g)=>a.concat(CORNER_NAMES.reduce((b,c)=>b.concat([g+"_"+c+"_x",g+"_"+c+"_y"]),[])),[]));
+const CSV_HEAD = CSV_HEAD_BASE.concat(CSV_CORNER_HEAD);
+function cornerCells(e){
+  const out = [(e.width==null?"":e.width),(e.height==null?"":e.height),e.page_cut_off?"true":"false"];
+  for(const g of [e.page_corners||[], e.table_corners||[]])
+    for(let i=0;i<4;i++){ const p = g[i]; out.push(p?p[0]:"", p?p[1]:""); }
+  return out;
+}
+function buildCsv(entries){
+  const lines = [CSV_HEAD.join(",")];
+  for(const e of entries){
+    const cc = cornerCells(e);
+    const rows = e.rows.length ? e.rows : [{key:"",section:"",row_no:"",column:"",mark:""}];
+    for(const r of rows){
+      lines.push([e.id,e.image,e.labeler,e.paper_type,e.capture,e.pen,r.key,r.section,r.row_no,r.column,r.mark,e.notes].concat(cc).map(csvEscape).join(","));
+    }
+  }
+  return lines.join("\r\n")+"\r\n";
+}
+function buildJson(entries){
+  return JSON.stringify(entries.map(e=>({
+    id:e.id, image:e.image, original_filename:e.original_filename, labeler:e.labeler,
+    paper_type:e.paper_type, capture:e.capture, pen:e.pen, notes:e.notes||"",
+    gen:GEN, labeled_at:e.labeled_at,
+    width:(e.width==null?null:e.width), height:(e.height==null?null:e.height),
+    page_corners:e.page_corners||[], table_corners:e.table_corners||[], page_cut_off:!!e.page_cut_off,
+    rows:e.rows.map(r=>({key:r.key,section:r.section,row_no:r.row_no,column:r.column,mark:r.mark}))
+  })),null,2);
+}
+function markSummary(rows){
+  const sym = {check:"✓",slash:"/",backslash:"\\",x:"x",shade:"shade",circle:"circle",dot:"dot",other:"other",blank:"blank"};
+  const c = {};
+  for(const r of rows) c[r.mark]=(c[r.mark]||0)+1;
+  return MARKS.filter(m=>c[m]).map(m=>sym[m]+c[m]).join(" ");
+}
+
+/* Minimal ZIP writer: STORE only, CRC32, parts kept as Blobs */
+const CRC_TABLE = (function(){
+  const t = new Uint32Array(256);
+  for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++) c = (c&1) ? (0xEDB88320^(c>>>1)) : (c>>>1); t[n]=c>>>0; }
+  return t;
+})();
+function crc32(u8){
+  let c = 0xFFFFFFFF;
+  for(let i=0;i<u8.length;i++) c = CRC_TABLE[(c^u8[i])&255]^(c>>>8);
+  return (c^0xFFFFFFFF)>>>0;
+}
+async function makeZip(files, when){
+  const enc = new TextEncoder();
+  const d = when || new Date();
+  const dosTime = (d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1);
+  const dosDate = (Math.max(d.getFullYear()-1980,0)<<9)|((d.getMonth()+1)<<5)|d.getDate();
+  const parts = [], central = [];
+  let offset = 0;
+  if(files.length>65535) throw new Error("Too many files for ZIP (no zip64)");
+  for(const f of files){
+    const nameB = enc.encode(f.name);
+    const blob = (f.data instanceof Blob) ? f.data : new Blob([typeof f.data==="string" ? enc.encode(f.data) : f.data]);
+    const crc = crc32(new Uint8Array(await blob.arrayBuffer()));
+    const size = blob.size;
+    if(size>=0xFFFFFFFF || offset+size>=0xFFFFFFFF) throw new Error("Dataset too large for a single ZIP (4 GB limit). Download part of it, then clear.");
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true); lh.setUint16(6,0x0800,true); lh.setUint16(8,0,true);
+    lh.setUint16(10,dosTime,true); lh.setUint16(12,dosDate,true); lh.setUint32(14,crc,true);
+    lh.setUint32(18,size,true); lh.setUint32(22,size,true); lh.setUint16(26,nameB.length,true); lh.setUint16(28,0,true);
+    parts.push(lh.buffer, nameB, blob);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true); ch.setUint16(8,0x0800,true);
+    ch.setUint16(10,0,true); ch.setUint16(12,dosTime,true); ch.setUint16(14,dosDate,true); ch.setUint32(16,crc,true);
+    ch.setUint32(20,size,true); ch.setUint32(24,size,true); ch.setUint16(28,nameB.length,true);
+    ch.setUint16(30,0,true); ch.setUint16(32,0,true); ch.setUint16(34,0,true); ch.setUint16(36,0,true);
+    ch.setUint32(38,0,true); ch.setUint32(42,offset,true);
+    central.push(ch.buffer, nameB);
+    offset += 30 + nameB.length + size;
+  }
+  let cdSize = 0; for(const p of central) cdSize += (p.byteLength!==undefined ? p.byteLength : p.length);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0,0x06054b50,true); end.setUint16(4,0,true); end.setUint16(6,0,true);
+  end.setUint16(8,files.length,true); end.setUint16(10,files.length,true);
+  end.setUint32(12,cdSize,true); end.setUint32(16,offset,true); end.setUint16(20,0,true);
+  return new Blob(parts.concat(central,[end.buffer]),{type:"application/zip"});
+}
+/*CORE-END*/
+
+/* ---------- state ---------- */
+const $ = id => document.getElementById(id);
+const IMG_EXT = ["jpg","jpeg","png","webp","heic","heif","gif","bmp","tif","tiff"];
+let queue = [], entries = [], cur = null, F = null, fit = true, seq = 0;
+const drafts = new Map(), urls = new Map();
+let db = null, warned = false;
+
+function lsGet(k){ try{ return localStorage.getItem(k)||""; }catch(e){ return ""; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+let sticky = { paper_type: lsGet("sast_paper"), pen: lsGet("sast_pen") };
+
+let toastT;
+function toast(msg, ms, warn){
+  const t = $("toast"); t.textContent = msg; t.className = "show"+(warn?" warnt":"");
+  clearTimeout(toastT); toastT = setTimeout(()=>{ t.className = ""; }, ms||2600);
+}
+
+/* ---------- IndexedDB (best-effort mirror; memory is authoritative) ---------- */
+function dbFail(){
+  db = null;
+  if(!warned){ warned = true; toast("Browser storage unavailable. Work is kept in memory only: download before closing!", 7000, true); }
+  renderNote();
+}
+function openDB(){
+  return new Promise(res=>{
+    try{
+      const r = indexedDB.open("sast-mark-labeler",1);
+      r.onupgradeneeded = ()=>{ const d=r.result; d.createObjectStore("entries",{keyPath:"id"}); d.createObjectStore("queue",{keyPath:"qid"}); };
+      r.onsuccess = ()=>res(r.result);
+      r.onerror = ()=>res(null);
+      r.onblocked = ()=>res(null);
+    }catch(e){ res(null); }
+  });
+}
+function tx(store, mode, fn){
+  return new Promise((resolve,reject)=>{
+    try{
+      const t = db.transaction(store,mode); const req = fn(t.objectStore(store));
+      t.oncomplete = ()=>resolve(req ? req.result : undefined);
+      t.onerror = ()=>reject(t.error); t.onabort = ()=>reject(t.error);
+    }catch(e){ reject(e); }
+  });
+}
+async function dbPut(store,val){ if(!db) return; try{ await tx(store,"readwrite",s=>s.put(val)); }catch(e){ dbFail(); } }
+async function dbDel(store,key){ if(!db) return; try{ await tx(store,"readwrite",s=>s.delete(key)); }catch(e){ dbFail(); } }
+async function dbClear(store){ if(!db) return; try{ await tx(store,"readwrite",s=>s.clear()); }catch(e){ dbFail(); } }
+async function dbAll(store){ if(!db) return []; try{ return await tx(store,"readonly",s=>s.getAll()) || []; }catch(e){ dbFail(); return []; } }
+function renderNote(){
+  $("dbnote").textContent = db ? "Saved in this browser (IndexedDB). Still download the zip regularly." : "WARNING: browser storage is not available. Everything is in memory and is lost on refresh.";
+}
+
+/* ---------- forms ---------- */
+function newForm(){
+  const rows = {};
+  for(const r of ROWS) rows[r.key] = {column:"none", mark:""};
+  return {paper_type:sticky.paper_type||"", capture:"", pen:sticky.pen||"", notes:"", rows, page:[], table:[], cut:false};
+}
+function formFromEntry(e){
+  const rows = {};
+  for(const r of e.rows) rows[r.key] = {column:r.column, mark:r.mark};
+  return {paper_type:e.paper_type, capture:e.capture, pen:e.pen, notes:e.notes||"", rows,
+    page:(e.page_corners||[]).map(p=>p.slice()), table:(e.table_corners||[]).map(p=>p.slice()), cut:!!e.page_cut_off};
+}
+function cornersComplete(){ return F.page.length===4 && F.table.length===4; }
+function doneCount(){ return ROWS.filter(r=>F.rows[r.key].mark).length; }
+function canSave(){ return !!(cur && F.paper_type && F.capture && F.pen && (doneCount()===ROWS.length || cornersComplete())); }
+
+/* ---------- selection ---------- */
+const tkey = t => t.kind+":"+t.id;
+function findTarget(t){
+  if(!t) return null;
+  return t.kind==="queue" ? queue.find(q=>q.qid===t.id) : entries.find(e=>e.id===t.id);
+}
+function selectTarget(t){
+  if(cur && findTarget(cur)) drafts.set(tkey(cur),F);
+  cur = t;
+  if(!t) F = newForm();
+  else if(drafts.has(tkey(t))) F = drafts.get(tkey(t));
+  else if(t.kind==="entry") F = formFromEntry(findTarget(t));
+  else F = newForm();
+  renderAll();
+}
+function urlFor(key, blob){
+  if(!urls.has(key)) urls.set(key, URL.createObjectURL(blob));
+  return urls.get(key);
+}
+function dropUrl(key){ if(urls.has(key)){ URL.revokeObjectURL(urls.get(key)); urls.delete(key); } }
+
+/* ---------- adding images ---------- */
+function extOf(name, type){
+  const m = /\.([A-Za-z0-9]{1,5})$/.exec(name||"");
+  if(m) return m[1].toLowerCase();
+  const t = (type||"").toLowerCase();
+  if(t.indexOf("jpeg")>=0) return "jpg";
+  const mm = /^image\/([a-z0-9]+)/.exec(t);
+  return mm ? mm[1] : "jpg";
+}
+let orderCtr = 0;
+async function addFiles(list){
+  const files = Array.from(list||[]).filter(f=>(f.type&&f.type.indexOf("image/")===0) || IMG_EXT.indexOf(extOf(f.name,f.type))>=0);
+  if(!files.length){ toast("No image files found.", 2500, true); return; }
+  const added = [];
+  for(const f of files){
+    const item = {qid:"q"+Date.now().toString(36)+Math.random().toString(36).slice(2,7), name:f.name||("photo-"+Date.now()+".jpg"), type:f.type||"", blob:f, order:Date.now()*1000+(orderCtr++)%1000};
+    queue.push(item); added.push(item);
+  }
+  if(!cur) selectTarget({kind:"queue",id:added[0].qid}); else renderAll();
+  toast(added.length+" image"+(added.length>1?"s":"")+" added");
+  for(const it of added) await dbPut("queue",it);
+}
+
+/* ---------- rendering ---------- */
+const ICON = {
+  check:'<path d="M3 11l4.5 4.5L17 5"/>',
+  slash:'<path d="M5 17L15 3"/>',
+  backslash:'<path d="M5 3l10 14"/>',
+  x:'<path d="M4 4l12 12M16 4L4 16"/>',
+  shade:'<rect class="f" x="4" y="4" width="12" height="12" rx="2"/>',
+  circle:'<circle cx="10" cy="10" r="6.5"/>',
+  dot:'<circle class="f" cx="10" cy="10" r="3"/>',
+  other:'<path d="M3 12c2-6 4-6 5 0s3 6 5 0 2-3 4-2"/>',
+  blank:'<rect x="4" y="4" width="12" height="12" rx="2" stroke-dasharray="2.5 2.5"/>'
+};
+const svg = m => '<svg viewBox="0 0 20 20" aria-hidden="true">'+ICON[m]+'</svg>';
+const LABEL = {check:"check",slash:"slash",backslash:"backsl.",x:"x",shade:"shade",circle:"circle",dot:"dot",other:"other",blank:"blank"};
+
+function buildStatic(){
+  const mk = (id,key,list)=>{ $(id).innerHTML = list.map(([v,t,s])=>'<button type="button" class="choice" data-set="'+key+'" data-val="'+v+'">'+t+(s?'<small>'+s+'</small>':'')+'</button>').join(""); };
+  mk("c_paper","paper_type",PAPERS); mk("c_capture","capture",CAPTURES); mk("c_pen","pen",PENS);
+  $("qf").innerHTML = ["check","slash","x","shade","circle","dot"].map(m=>'<button type="button" class="btn small" data-qf="'+m+'">'+svg(m).replace('<svg','<svg width="16" height="16" style="stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round"')+m+'</button>').join("");
+  let html = "", last = "";
+  for(const r of ROWS){
+    if(r.section!==last){ last = r.section; html += '<div class="sect">'+r.section+'</div>'; }
+    const bubs = COLUMNS.map(c=>'<button type="button" class="bub'+(c==="none"?" none":"")+'" data-key="'+r.key+'" data-col="'+c+'" aria-label="column '+c+'">'+(c==="none"?"—":c)+'</button>').join("");
+    const chips = MARKS.map(m=>'<button type="button" class="chip'+(m==="check"||m==="slash"?" good":"")+'" data-key="'+r.key+'" data-mark="'+m+'">'+svg(m)+LABEL[m]+'</button>').join("");
+    html += '<div class="row" data-row="'+r.key+'"><div class="rtop"><span class="rn">'+r.row_no+'</span><span class="rl" title="'+r.label.replace(/"/g,"&quot;")+'">'+r.label.replace(/</g,"&lt;")+'</span></div>'
+      +'<div class="rwarn">Mark set but column is "none". Pick a column or choose blank.</div>'
+      +'<div class="bubbles">'+bubs+'</div><div class="chips">'+chips+'</div></div>';
+  }
+  $("rows").innerHTML = html;
+}
+
+function paintForm(){
+  document.querySelectorAll("#formcard [data-set]").forEach(b=>b.classList.toggle("on", F[b.dataset.set]===b.dataset.val));
+  document.querySelectorAll("#rows .row").forEach(el=>{
+    const k = el.dataset.row, v = F.rows[k];
+    el.classList.toggle("done", !!v.mark);
+    el.classList.toggle("warn", !!v.mark && v.mark!=="blank" && v.column==="none");
+    el.querySelectorAll(".bub").forEach(b=>{ b.classList.toggle("on", b.dataset.col===v.column); b.classList.toggle("dim", v.mark==="blank"); });
+    el.querySelectorAll(".chip").forEach(b=>b.classList.toggle("on", b.dataset.mark===v.mark));
+  });
+  if($("notes").value!==F.notes) $("notes").value = F.notes;
+  const n = doneCount();
+  $("count").textContent = n+"/20 rows done"; $("count").classList.toggle("full", n===20);
+  $("saveBtn").disabled = !canSave(); $("saveBtn2").disabled = !canSave();
+  const editing = cur && cur.kind==="entry";
+  $("saveBtn").textContent = editing ? "Update entry" : "Save & next"; $("saveBtn2").textContent = $("saveBtn").textContent;
+  $("cancelEdit").hidden = !editing;
+  const miss = [];
+  if(!cur) miss.push("load and select an image");
+  if(!F.paper_type) miss.push("paper size");
+  if(!F.capture) miss.push("capture");
+  if(!F.pen) miss.push("pen");
+  if(n<20 && !cornersComplete()) miss.push((20-n)+" row(s), or all 8 corners");
+  const warnN = ROWS.filter(r=>{const v=F.rows[r.key]; return v.mark && v.mark!=="blank" && v.column==="none";}).length;
+  $("hint").textContent = (miss.length ? "Still needed: "+miss.join(", ")+". " : "")+(warnN ? warnN+" row(s) have a mark but no column." : "");
+  $("copyPrev").disabled = !entries.length || !cur;
+  $("hint2").textContent = $("hint").textContent;
+}
+
+function renderQueue(){
+  const q = $("queue"); q.innerHTML = "";
+  $("qmeta").textContent = queue.length ? queue.length+" waiting to be labeled" : "No images waiting. Load some above.";
+  for(const it of queue){
+    const d = document.createElement("div"); d.className = "thumb"+(cur&&cur.kind==="queue"&&cur.id===it.qid?" sel":"");
+    const im = document.createElement("img"); im.src = urlFor(it.qid,it.blob); im.loading = "lazy"; im.decoding = "async"; im.alt = "";
+    const nm = document.createElement("div"); nm.className = "nm"; nm.textContent = it.name;
+    const x = document.createElement("button"); x.type = "button"; x.className = "x"; x.textContent = "×"; x.title = "Remove from queue";
+    x.addEventListener("click", ev=>{ ev.stopPropagation(); removeQueue(it.qid); });
+    d.addEventListener("click", ()=>selectTarget({kind:"queue",id:it.qid}));
+    d.append(im,nm,x); q.appendChild(d);
+  }
+}
+
+function renderPreview(){
+  const pv = $("pv"), item = findTarget(cur);
+  pv.className = "pv "+(fit?"fit":"full");
+  $("zoomBtn").textContent = "Zoom: "+(fit?"fit":"100%");
+  if(!item){ pv.innerHTML = '<div class="empty">Load a photo above.</div>'; $("pvmeta").textContent = "No image"; return; }
+  const key = cur.kind==="queue" ? item.qid : item.id;
+  const name = cur.kind==="queue" ? item.name : item.original_filename;
+  const im = document.createElement("img"); im.src = urlFor(key,item.blob); im.alt = "Sheet to label";
+  pv.innerHTML = ""; pv.appendChild(im);
+  $("pvmeta").textContent = (cur.kind==="entry" ? "EDITING "+item.id : name)+" · "+Math.round(item.blob.size/1024)+" KB";
+}
+
+function renderDataset(){
+  const tb = $("tbody"); tb.innerHTML = "";
+  const sorted = entries.slice().sort((a,b)=>a.labeled_at<b.labeled_at?1:-1);
+  for(const e of sorted){
+    const tr = document.createElement("tr");
+    const cell = (t,cls)=>{ const td=document.createElement("td"); if(cls) td.className=cls; td.textContent=t; tr.appendChild(td); return td; };
+    cell(e.id,"id"); cell(e.capture); cell(e.paper_type); cell(e.pen);
+    cell(e.rows.filter(r=>r.mark).length+"/20"); cell(markSummary(e.rows));
+    cell((e.page_corners||[]).length+(e.table_corners||[]).length ? (e.page_corners||[]).length+"+"+(e.table_corners||[]).length+(e.page_cut_off?" cut":"") : "-");
+    const td = document.createElement("td");
+    const ed = document.createElement("button"); ed.type="button"; ed.className="btn small"; ed.textContent="Edit";
+    ed.addEventListener("click", ()=>{ selectTarget({kind:"entry",id:e.id}); $("formcard").scrollIntoView({behavior:"smooth"}); });
+    const rm = document.createElement("button"); rm.type="button"; rm.className="btn small danger"; rm.textContent="Remove"; rm.style.marginLeft="6px";
+    rm.addEventListener("click", ()=>removeEntry(e.id));
+    td.append(ed,rm); tr.appendChild(td); tb.appendChild(tr);
+  }
+  if(!entries.length){ const tr=document.createElement("tr"); const td=document.createElement("td"); td.colSpan=8; td.className="meta"; td.textContent="No entries yet."; tr.appendChild(td); tb.appendChild(tr); }
+  const cnt = {}; MARKS.forEach(m=>cnt[m]=0);
+  let sc=0, ph=0;
+  for(const e of entries){ if(e.capture==="scanner") sc++; else if(e.capture==="phone_photo") ph++; for(const r of e.rows) if(cnt[r.mark]!==undefined) cnt[r.mark]++; }
+  const names = {check:"checks",slash:"slashes",backslash:"backslashes",x:"x",shade:"shade",circle:"circle",dot:"dot",other:"other",blank:"blank"};
+  const wc = entries.filter(e=>(e.page_corners||[]).length===4 && (e.table_corners||[]).length===4).length;
+  const st = [["Total sheets",entries.length],["Scanner",sc],["Phone photo",ph],["With corners",wc]];
+  let html = st.map(([l,v])=>'<div class="stat"><b>'+v+'</b><span>'+l+'</span></div>').join("");
+  html += MARKS.map(m=>'<div class="stat"><b>'+cnt[m]+'</b><span>'+names[m]+'</span></div>').join("");
+  $("stats").innerHTML = html;
+  $("dlBtn").disabled = !entries.length; $("clearBtn").disabled = !entries.length;
+}
+
+function renderAll(){ renderQueue(); renderPreview(); paintForm(); renderDataset(); renderCorners(); }
+
+/* ---------- actions ---------- */
+async function removeQueue(qid){
+  const i = queue.findIndex(q=>q.qid===qid); if(i<0) return;
+  const wasCur = cur && cur.kind==="queue" && cur.id===qid;
+  queue.splice(i,1); drafts.delete("queue:"+qid); dropUrl(qid);
+  await dbDel("queue",qid);
+  if(wasCur){ cur = null; selectTarget(queue[Math.min(i,queue.length-1)] ? {kind:"queue",id:queue[Math.min(i,queue.length-1)].qid} : null); }
+  else renderAll();
+}
+async function removeEntry(id){
+  if(!confirm("Remove entry "+id+" and its image from the dataset?")) return;
+  const i = entries.findIndex(e=>e.id===id); if(i<0) return;
+  const wasCur = cur && cur.kind==="entry" && cur.id===id;
+  entries.splice(i,1); drafts.delete("entry:"+id); dropUrl(id);
+  await dbDel("entries",id);
+  if(wasCur){ cur = null; selectTarget(queue[0] ? {kind:"queue",id:queue[0].qid} : null); } else renderAll();
+}
+function nextSeq(){
+  for(const e of entries){ const m = /_(\d+)$/.exec(e.id); if(m) seq = Math.max(seq, +m[1]); }
+  return ++seq;
+}
+async function save(){
+  if(!canSave()) return;
+  const item = findTarget(cur); if(!item) return;
+  const now = new Date();
+  const dims = await dimsOf(item, cur.kind==="queue" ? item.qid : item.id);
+  if(!canSave() || findTarget(cur)!==item) return;
+  const rows = ROWS.filter(r=>doneCount()===ROWS.length || F.rows[r.key].mark)
+    .map(r=>({key:r.key,section:r.section,row_no:r.row_no,column:F.rows[r.key].column,mark:F.rows[r.key].mark}));
+  const cor = {width:dims[0], height:dims[1], page_corners:F.page.map(p=>p.slice()), table_corners:F.table.map(p=>p.slice()), page_cut_off:!!F.cut};
+  sticky.paper_type = F.paper_type; sticky.pen = F.pen; lsSet("sast_paper",F.paper_type); lsSet("sast_pen",F.pen);
+  let entry, next = null;
+  if(cur.kind==="queue"){
+    const labeler = $("labeler").value.trim();
+    const id = slugify(labeler)+"_"+timeStamp(now)+"_"+nextSeq();
+    const ext = extOf(item.name, item.type);
+    entry = {id, image:id+"."+ext, ext, original_filename:item.name, labeler, paper_type:F.paper_type, capture:F.capture, pen:F.pen,
+      notes:F.notes.trim(), labeled_at:now.toISOString(), rows, blob:item.blob, type:item.type};
+    Object.assign(entry, cor);
+    const idx = queue.findIndex(q=>q.qid===item.qid);
+    entries.push(entry); queue.splice(idx,1);
+    drafts.delete("queue:"+item.qid);
+    if(urls.has(item.qid)){ urls.set(id, urls.get(item.qid)); urls.delete(item.qid); }
+    const nq = queue[Math.min(idx,queue.length-1)];
+    next = nq ? {kind:"queue",id:nq.qid} : null;
+    cur = null;
+    await dbPut("entries",entry); await dbDel("queue",item.qid);
+    toast("Saved "+id);
+  }else{
+    entry = item;
+    Object.assign(entry,{paper_type:F.paper_type,capture:F.capture,pen:F.pen,notes:F.notes.trim(),labeled_at:now.toISOString(),rows},cor);
+    drafts.delete("entry:"+entry.id);
+    cur = null;
+    next = queue[0] ? {kind:"queue",id:queue[0].qid} : null;
+    await dbPut("entries",entry);
+    toast("Updated "+entry.id);
+  }
+  selectTarget(next);
+}
+function copyPrev(){
+  if(!entries.length){ toast("No previous entry yet."); return; }
+  const prev = entries.reduce((a,b)=>a.labeled_at>=b.labeled_at?a:b);
+  const keepCapture = F.capture, kp = F.page, kt = F.table, kc = F.cut;
+  F = formFromEntry(prev); F.capture = keepCapture; F.page = kp; F.table = kt; F.cut = kc;
+  if(cur) drafts.set(tkey(cur),F);
+  paintForm(); toast("Copied labels from "+prev.id+" (capture not copied)", 3200);
+}
+async function downloadZip(){
+  if(!entries.length) return;
+  const btn = $("dlBtn"); btn.disabled = true; btn.textContent = "Building zip...";
+  try{
+    const sorted = entries.slice().sort((a,b)=>a.id<b.id?-1:1);
+    const files = sorted.map(e=>({name:"images/"+e.image, data:e.blob}));
+    files.push({name:"labels.json", data:buildJson(sorted)});
+    files.push({name:"labels.csv", data:buildCsv(sorted)});
+    const zip = await makeZip(files);
+    const a = document.createElement("a"), u = URL.createObjectURL(zip);
+    a.href = u; a.download = "sast_marks_"+slugify($("labeler").value)+"_"+dateStamp(new Date())+".zip";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(u), 60000);
+    toast("Zip ready: "+sorted.length+" sheet(s)");
+  }catch(e){ toast("Zip failed: "+(e&&e.message||e), 6000, true); }
+  btn.textContent = "Download dataset (.zip)"; btn.disabled = !entries.length;
+}
+async function clearAll(){
+  if(!entries.length) return;
+  if(!confirm("Delete ALL "+entries.length+" labeled sheets and their images from this browser? Download the zip first. This cannot be undone.")) return;
+  for(const e of entries){ drafts.delete("entry:"+e.id); dropUrl(e.id); }
+  const editing = cur && cur.kind==="entry";
+  entries = []; seq = 0;
+  await dbClear("entries");
+  if(editing){ cur = null; selectTarget(queue[0] ? {kind:"queue",id:queue[0].qid} : null); } else renderAll();
+  toast("Dataset cleared");
+}
+
+/* ---------- events ---------- */
+function setMark(k,m){ const r = F.rows[k]; r.mark = m; if(m==="blank") r.column = "none"; }
+document.addEventListener("click", ev=>{
+  const t = ev.target.closest("button"); if(!t) return;
+  if(t.dataset.set && t.closest("#formcard")){ F[t.dataset.set] = t.dataset.val; if(t.dataset.set==="paper_type"){ sticky.paper_type=t.dataset.val; lsSet("sast_paper",t.dataset.val);} if(t.dataset.set==="pen"){ sticky.pen=t.dataset.val; lsSet("sast_pen",t.dataset.val);} paintForm(); }
+  else if(t.dataset.qf){ for(const r of ROWS) setMark(r.key,t.dataset.qf); paintForm(); }
+  else if(t.dataset.mark && t.dataset.key){ setMark(t.dataset.key,t.dataset.mark); paintForm(); }
+  else if(t.dataset.col && t.dataset.key){
+    const r = F.rows[t.dataset.key];
+    if(r.mark==="blank"){ toast('A blank row has no column. Change the mark first.'); return; }
+    r.column = t.dataset.col; paintForm();
+  }
+});
+$("fileIn").addEventListener("change", e=>{ addFiles(e.target.files); e.target.value = ""; });
+$("camIn").addEventListener("change", e=>{ addFiles(e.target.files); e.target.value = ""; });
+$("notes").addEventListener("input", e=>{ F.notes = e.target.value; });
+$("labeler").addEventListener("input", e=>lsSet("sast_labeler", e.target.value));
+$("zoomBtn").addEventListener("click", ()=>{ fit = !fit; renderPreview(); });
+$("saveBtn").addEventListener("click", save);
+$("saveBtn2").addEventListener("click", save);
+$("copyPrev").addEventListener("click", copyPrev);
+$("cancelEdit").addEventListener("click", ()=>{ if(cur){ drafts.delete(tkey(cur)); } cur = null; selectTarget(queue[0] ? {kind:"queue",id:queue[0].qid} : null); });
+$("dlBtn").addEventListener("click", downloadZip);
+$("clearBtn").addEventListener("click", clearAll);
+["dragenter","dragover"].forEach(n=>document.addEventListener(n, e=>{ e.preventDefault(); $("drop").classList.add("over"); }));
+["dragleave","drop"].forEach(n=>document.addEventListener(n, e=>{ e.preventDefault(); if(n==="drop" || e.target===document.documentElement || !e.relatedTarget) $("drop").classList.remove("over"); }));
+document.addEventListener("drop", e=>{ if(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
+
+/* ---------- corners ---------- */
+const CN_LONG = ["top-left","top-right","bottom-right","bottom-left"];
+const cv = {key:null, img:null, w:0, h:0, s:1, tx:0, ty:0, fitS:1, viewSet:false};
+const ptrs = new Map();
+let ptrState = null;
+
+function dimsOf(item, key){
+  if(cv.key===key && cv.img) return Promise.resolve([cv.w,cv.h]);
+  return new Promise(res=>{
+    const im = new Image();
+    im.onload = ()=>res([im.naturalWidth, im.naturalHeight]);
+    im.onerror = ()=>res([null,null]);
+    im.src = urlFor(key, item.blob);
+  });
+}
+function fitView(){
+  const wrap = $("cvwrap"), W = wrap.clientWidth, H = wrap.clientHeight;
+  if(!cv.img || !W || !H) return;
+  cv.fitS = Math.min(W/cv.w, H/cv.h);
+  cv.s = cv.fitS; cv.tx = (W-cv.w*cv.s)/2; cv.ty = (H-cv.h*cv.s)/2; cv.viewSet = true;
+}
+function renderCorners(){
+  const item = findTarget(cur);
+  const key = item ? (cur.kind==="queue" ? item.qid : item.id) : null;
+  if(key!==cv.key){
+    cv.key = key; cv.img = null; cv.viewSet = false; ptrs.clear(); ptrState = null; $("mag").hidden = true;
+    if(item){
+      const im = new Image();
+      im.onload = ()=>{ if(cv.key!==key) return; cv.img = im; cv.w = im.naturalWidth; cv.h = im.naturalHeight; fitView(); drawCorners(); updateCornerUI(); };
+      im.src = urlFor(key, item.blob);
+    }
+  }
+  drawCorners(); updateCornerUI();
+}
+function updateCornerUI(){
+  const n = F.page.length + F.table.length;
+  $("cnmeta").textContent = cv.img ? cv.w+" x "+cv.h+" px · "+n+"/8 points" : (cv.key ? "Loading..." : "No image");
+  const p = $("cprompt");
+  if(!cv.key) p.textContent = "Load and select a photo to place corners.";
+  else if(n<4) p.innerHTML = 'Click <span class="pg">PAGE '+CN_LONG[n]+'</span> corner ('+(n+1)+'/8)';
+  else if(n<8) p.innerHTML = 'Click <span class="tb">TABLE '+CN_LONG[n-4]+'</span> corner ('+(n+1)+'/8)';
+  else p.textContent = "All 8 corners placed. Undo or reset to change.";
+  $("cutOff").checked = !!F.cut;
+  const f = a=>a.map((q,i)=>(i+1)+":("+Math.round(q[0])+","+Math.round(q[1])+")").join(" ");
+  $("clist").textContent = (F.page.length ? "page "+f(F.page) : "")+(F.table.length ? "  |  table "+f(F.table) : "");
+  $("cUndo").disabled = !n; $("cReset").disabled = !n && !F.cut;
+}
+function drawCorners(){
+  const wrap = $("cvwrap"), c = $("cv"), W = wrap.clientWidth, H = wrap.clientHeight;
+  if(!W || !H) return;
+  if(c.width!==W || c.height!==H){ c.width = W; c.height = H; if(!cv.viewSet) fitView(); }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle = "#333"; ctx.fillRect(0,0,W,H);
+  if(!cv.img) return;
+  ctx.imageSmoothingEnabled = cv.s<3;
+  ctx.setTransform(cv.s,0,0,cv.s,cv.tx,cv.ty); ctx.drawImage(cv.img,0,0);
+  ctx.setTransform(1,0,0,1,0,0);
+  const groups = [[F.page,"#E0483A"],[F.table,"#2FA86A"]];
+  for(const [pts,col] of groups){
+    if(!pts.length) continue;
+    const sp = pts.map(q=>[q[0]*cv.s+cv.tx, q[1]*cv.s+cv.ty]);
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath();
+    sp.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));
+    if(sp.length===4) ctx.closePath();
+    ctx.stroke();
+    ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    sp.forEach((q,i)=>{
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(q[0],q[1],9,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = "#fff"; ctx.fillText(String(i+1), q[0], q[1]+0.5);
+    });
+  }
+}
+function showMag(px,py){
+  if(!cv.img) return;
+  const m = $("mag"), mc = m.getContext("2d"), W = $("cvwrap").clientWidth;
+  const ix = (px-cv.tx)/cv.s, iy = (py-cv.ty)/cv.s, z = Math.max(4, cv.s*3), hw = 75/z;
+  mc.imageSmoothingEnabled = false; mc.fillStyle = "#222"; mc.fillRect(0,0,150,150);
+  mc.drawImage(cv.img, ix-hw, iy-hw, 2*hw, 2*hw, 0, 0, 150, 150);
+  mc.strokeStyle = "#E0483A"; mc.lineWidth = 1;
+  mc.beginPath(); mc.moveTo(75,0); mc.lineTo(75,150); mc.moveTo(0,75); mc.lineTo(150,75); mc.stroke();
+  m.style.left = px>W/2 ? "8px" : "auto"; m.style.right = px>W/2 ? "auto" : "8px";
+  m.hidden = false;
+}
+function zoomAt(px,py,f){
+  if(!cv.img) return;
+  const ns = Math.min(40, Math.max(cv.fitS*0.5, cv.s*f));
+  cv.tx = px-(px-cv.tx)*ns/cv.s; cv.ty = py-(py-cv.ty)*ns/cv.s; cv.s = ns; drawCorners();
+}
+function placeCorner(px,py){
+  if(!cv.img) return;
+  const n = F.page.length + F.table.length;
+  if(n>=8){ toast("All 8 corners placed. Use Undo or Reset to change.", 2800); return; }
+  let x = (px-cv.tx)/cv.s, y = (py-cv.ty)/cv.s;
+  const out = x<-1 || y<-1 || x>cv.w+1 || y>cv.h+1;
+  x = Math.round(Math.min(cv.w,Math.max(0,x))*100)/100; y = Math.round(Math.min(cv.h,Math.max(0,y))*100)/100;
+  const isPage = n<4;
+  (isPage ? F.page : F.table).push([x,y]);
+  if(out && isPage){ F.cut = true; toast("Click was outside the photo: snapped to the edge, 'page edge cut off' ticked.", 3500); }
+  drawCorners(); updateCornerUI(); paintForm();
+}
+function cornerUndo(){
+  if(F.table.length) F.table.pop(); else if(F.page.length) F.page.pop(); else return;
+  drawCorners(); updateCornerUI(); paintForm();
+}
+function cornerReset(){
+  F.page = []; F.table = []; F.cut = false;
+  drawCorners(); updateCornerUI(); paintForm();
+}
+(function initCorners(){
+  const c = $("cv");
+  const pos = e => { const r = c.getBoundingClientRect(); return [e.clientX-r.left, e.clientY-r.top]; };
+  c.addEventListener("pointerdown", e=>{
+    if(!cv.img) return;
+    try{ c.setPointerCapture(e.pointerId); }catch(err){}
+    const [x,y] = pos(e); ptrs.set(e.pointerId,{x,y});
+    if(ptrs.size===1) ptrState = {sx:x, sy:y, ox:cv.tx, oy:cv.ty, moved:false, pinched:false};
+    else if(ptrs.size===2 && ptrState){
+      const [a,b] = Array.from(ptrs.values());
+      ptrState.pinched = true; ptrState.d = Math.hypot(a.x-b.x,a.y-b.y)||1; ptrState.s0 = cv.s;
+      const mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+      ptrState.ix = (mx-cv.tx)/cv.s; ptrState.iy = (my-cv.ty)/cv.s;
+    }
+  });
+  c.addEventListener("pointermove", e=>{
+    if(!cv.img) return;
+    const [x,y] = pos(e);
+    if(ptrs.has(e.pointerId)) ptrs.set(e.pointerId,{x,y});
+    if(ptrState && ptrs.size===2){
+      const [a,b] = Array.from(ptrs.values());
+      const d = Math.hypot(a.x-b.x,a.y-b.y)||1, mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+      cv.s = Math.min(40, Math.max(cv.fitS*0.5, ptrState.s0*d/ptrState.d));
+      cv.tx = mx-ptrState.ix*cv.s; cv.ty = my-ptrState.iy*cv.s; drawCorners(); return;
+    }
+    if(ptrState && ptrs.size===1){
+      if(!ptrState.moved && Math.hypot(x-ptrState.sx,y-ptrState.sy)>6) ptrState.moved = true;
+      if(ptrState.moved){ cv.tx = ptrState.ox+(x-ptrState.sx); cv.ty = ptrState.oy+(y-ptrState.sy); drawCorners(); }
+    }
+    showMag(x,y);
+  });
+  const up = e=>{
+    const [x,y] = pos(e);
+    const had = ptrs.delete(e.pointerId);
+    if(had && ptrState && !ptrState.moved && !ptrState.pinched && e.type==="pointerup") placeCorner(x,y);
+    if(!ptrs.size){ ptrState = null; if(e.pointerType!=="mouse") $("mag").hidden = true; }
+  };
+  c.addEventListener("pointerup", up);
+  c.addEventListener("pointercancel", up);
+  c.addEventListener("pointerleave", e=>{ if(e.pointerType==="mouse") $("mag").hidden = true; });
+  c.addEventListener("wheel", e=>{ if(!cv.img) return; e.preventDefault(); const [x,y] = pos(e); zoomAt(x,y,e.deltaY<0?1.25:0.8); showMag(x,y); }, {passive:false});
+  const mid = f => ()=>{ const w=$("cvwrap"); zoomAt(w.clientWidth/2, w.clientHeight/2, f); };
+  $("czIn").addEventListener("click", mid(1.5));
+  $("czOut").addEventListener("click", mid(1/1.5));
+  $("czFit").addEventListener("click", ()=>{ fitView(); drawCorners(); });
+  $("cUndo").addEventListener("click", cornerUndo);
+  $("cReset").addEventListener("click", cornerReset);
+  $("cutOff").addEventListener("change", e=>{ F.cut = e.target.checked; updateCornerUI(); });
+  window.addEventListener("resize", ()=>{ cv.viewSet = false; fitView(); drawCorners(); });
+})();
+
+/* ---------- init ---------- */
+(async function init(){
+  buildStatic();
+  $("labeler").value = lsGet("sast_labeler");
+  F = newForm();
+  renderAll();
+  db = await openDB();
+  if(!db){ dbFail(); }
+  else{
+    renderNote();
+    const q = await dbAll("queue"), e = await dbAll("entries");
+    queue = q.sort((a,b)=>a.order-b.order);
+    entries = e.filter(x=>x && x.rows && x.blob);
+    for(const x of entries){ const m=/_(\d+)$/.exec(x.id); if(m) seq=Math.max(seq,+m[1]); }
+    if(queue.length){ selectTarget({kind:"queue",id:queue[0].qid}); } else renderAll();
+    if(queue.length||entries.length) toast("Restored "+entries.length+" saved sheet(s) and "+queue.length+" waiting image(s)");
+  }
+  renderNote();
+})();
+</script>
+</body>
+</html>

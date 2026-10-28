@@ -164,8 +164,12 @@ npm run dev
    **new station key**; the previous laptop for that station stops working.
 2. Extract All, open the `ScanWatcher` folder, double-click `INSTALL`. It
    finds or installs Python, installs the requirements, copies everything to
-   `%LOCALAPPDATA%\ScanWatcher`, creates `C:\Scans`, sets up auto-start and
-   starts the watcher. The window turns green and says "ALL DONE".
+   `%LOCALAPPDATA%\ScanWatcher`, creates `C:\Scans`, adds **Start Scan Watcher** / **Stop Scan Watcher**
+   shortcuts (desktop and Start menu) and starts the watcher once. From
+   version 2.5.0 the watcher does **not** start at log-on: users double-click
+   Start Scan Watcher before scanning (running INSTALL again on an older
+   laptop removes its old auto-start; IT can still enable auto-start with
+   `install_task.bat`). The window turns green and says "ALL DONE".
 3. The Scanner setup page light turns green ("Online"). Point the scanner
    software at `C:\Scans` (or change the folder on the website; the laptop
    switches within ~30 seconds).
