@@ -503,6 +503,14 @@ def duplicate_from_raw(raw: dict) -> dict:
     }) or {}
 
 
+def duplicate_from_eval_response(row: dict) -> dict:
+    """DUP object from an eval_responses row (an imported SET / supervisor form)."""
+    return clean_duplicate_of({
+        "task_id": row.get("task_id"), "instructor_id": row.get("instructor_id"),
+        "subject_id": row.get("subject_id"), "term_id": row.get("term_id"), "stamp_no": row.get("stamp_no"),
+    }) or {}
+
+
 def enrich_duplicate(dup: dict | None, names: dict | None = None, dup_ctx: dict | None = None) -> dict | None:
     """DUP + what the page shows: instructor name, subject code and, for a page
     scanned on the website, the batch item that opens it in the page viewer."""

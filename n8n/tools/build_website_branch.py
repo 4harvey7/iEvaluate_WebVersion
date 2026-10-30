@@ -1172,6 +1172,11 @@ SHEET_ERROR_BODY = (
     "  const raw = $json.error;\n"
     "  const text = String((raw && (raw.message || raw.description)) || raw || '');\n"
     "  let message = 'The sheet could not be read: ' + (text || 'unknown error');\n"
+    "  const wrongForm = text.match(/This sheet looks like the [^\\[\\]]*? choose [^.\\[\\]]*\\./);\n"
+    "  if (wrongForm) {\n"
+    "    message = wrongForm[0];\n"
+    "    return { status: 'error', code: 'wrong_form_type', error: message, message: message };\n"
+    "  }\n"
     "  if (/403|permission|forbidden|not have access/i.test(text)) {\n"
     "    message = 'Google denied access to the sheet. Share the sheet with the service account email as Viewer, then import again.';\n"
     "  } else if (/404|not found/i.test(text)) {\n"
@@ -1288,7 +1293,8 @@ SHEET_JOB_CREATE_PARAMS = (
 SHEET_JOB_FAILED_PARAMS = "={{ [ String($execution.id || ''), String($json.failed_node || ''), String($json.message || '') ] }}"
 SHEET_JOB_DONE_PARAMS = ("={{ [ $json.job_id, $json.rows, $json.matched, $json.unmatched, $json.imported_count, "
                          "$json.error_count, $json.ai_groups, $json.ai_failed, $json.has_problems ? true : false, "
-                         "String($json.first_failed_node || ''), String($json.message || '') ] }}")
+                         "String($json.first_failed_node || ''), String($json.message || ''), "
+                         "JSON.stringify($json.details || {}), String($json.term_id || '') ] }}")
 SHEET_JOB_STOPPED_PARAMS = (
     "={{ (() => {\n"
     "  const ex = $json.execution || {};\n"
@@ -1432,6 +1438,255 @@ def apply_sheet_import_jobs(out) -> list[str]:
     connect(SHEET_JOB_TRIGGER, 0, SHEET_JOB_STOPPED)
 
     done += _sheet_job_order(by_name)
+    return done
+
+
+# ---------------------------------------------------------------- Google Sheet: new 15-item forms (2026-10-30)
+# The import request may carry form_type 'SET-15' (student) or 'SUP-15' (supervisor); missing / anything
+# else = the old SAST sheet, which runs exactly as before. 'clean data1' passes it on, 'Normalize Sheet
+# Rows' reads the 15 item columns, 'Map to Target Format' carries them, and a new IF after If19's matched
+# output sends only those rows to 'Save New Form Row' (public.save_eval_response, migration 019) instead of
+# the SAST raw upsert. Unmatched rows take the unchanged If19 error path (import_errors). No Gemini remark
+# loop for the new forms (comments are masked like SAST remarks). 'Sheet Import Summary' counts the result.
+SHEET_CLEAN = "clean data1"
+SHEET_NEWFORM_IF = "Sheet New Form?"
+SHEET_NEWFORM_SAVE = "Save New Form Row"
+SHEET_SET_AI = "SET Comments for AI"
+SHEET_NEWFORM_SAVE_PARAMS = (
+    "={{ (() => {\n"
+    "  const j = $json;\n"
+    "  const b = ($('Google LINK from phone1').first().json || {}).body || {};\n"
+    "  const m = String(b.link || '').match(/\\/d\\/([^/?#]+)/);\n"
+    "  let job = '';\n"
+    "  try { job = String($('Create Sheet Import Job').first().json.id || ''); } catch (e) { job = ''; }\n"
+    "  const uid = String(b.user_id || '');\n"
+    "  return [String(j.instrument || ''), String(j.instructor_ID || ''), String(j.true_subject_id || ''),\n"
+    "    String(j.current_term_id || ''), JSON.stringify(j.answers || {}), String(j['Remarks & Suggestions'] || ''),\n"
+    "    String(j.stamp_no || ''), String(j.supervisor || ''),\n"
+    "    'sheet:' + (m ? m[1] : '') + ':' + String(j.current_term_id || '') + ':' + String(j.sheet_row || ''),\n"
+    "    job, String(j.sheet_row_no || j.sheet_row || ''), " + _UUID_RE_JS + ".test(uid) ? uid : '',\n"
+    "    JSON.stringify(j.details || {})];\n"
+    "})() }}")
+
+
+def apply_sheet_new_forms(out) -> list[str]:
+    """Idempotent (full build and live export; after apply_sheet_import_jobs). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (SHEET_CLEAN, SHEET_MAP, SHEET_IF19, IMPORT_ERROR_FORMAT, SHEET_JOB_SUMMARY):
+        if name not in by_name:
+            raise SystemExit(f"apply_sheet_new_forms: no node named {name!r}")
+    conns = out["connections"]
+    done = []
+
+    clean = by_name[SHEET_CLEAN]["parameters"]
+    if "instrument:" not in clean["jsCode"]:
+        clean["jsCode"] = replace_once(
+            clean["jsCode"], "      import_type: payload.type,\n",
+            "      import_type: payload.type,\n"
+            "      instrument: payload.form_type || payload.instrument || '',   // 'SET-15' / 'SUP-15'; blank = SAST sheet\n",
+            SHEET_CLEAN)
+        done.append(f"{SHEET_CLEAN}: passes form_type on")
+
+    mp = by_name[SHEET_MAP]["parameters"]
+    if 'data["Instrument"]' not in mp["jsCode"]:
+        mp["jsCode"] = replace_once(
+            mp["jsCode"], '  result["import_type"] = webhookData.type || "google_sheet";\n',
+            '  result["import_type"] = webhookData.type || "google_sheet";\n'
+            '  // new 15-item forms (SET-15 / SUP-15): answers by item, stamp, supervisor; the student id stays empty\n'
+            '  if (data["Instrument"]) {\n'
+            '    result["instrument"] = data["Instrument"];\n'
+            '    result["answers"] = data["Answers"] || {};\n'
+            '    result["stamp_no"] = data["Stamp No"] || "";\n'
+            '    result["supervisor"] = data["Supervisor"] || "";\n'
+            '    result["sheet_row"] = i + 1;\n'
+            '  }\n', SHEET_MAP)
+        done.append(f"{SHEET_MAP}: carries instrument, answers, stamp, supervisor")
+    if 'result["details"]' not in mp["jsCode"]:
+        # migration 020: section, program level/year, date, rank, designation, student id (SET, SAO only)
+        mp["jsCode"] = replace_once(
+            mp["jsCode"], '    result["supervisor"] = data["Supervisor"] || "";\n',
+            '    result["supervisor"] = data["Supervisor"] || "";\n'
+            '    result["details"] = data["Details"] || {};\n', SHEET_MAP)
+        done.append(f"{SHEET_MAP}: carries the form details (migration 020)")
+    if 'result["sheet_row_no"]' not in mp["jsCode"]:
+        # migration 021 messages: the Google Sheets row number (Normalize Sheet Rows 'Sheet Row'), every row
+        mp["jsCode"] = replace_once(
+            mp["jsCode"], '  // new 15-item forms (SET-15 / SUP-15): answers by item, stamp, supervisor; the student id stays empty\n',
+            '  // the row number in Google Sheets (header = row 1), for the import messages\n'
+            '  result["sheet_row_no"] = data["Sheet Row"] || i + 2;\n'
+            '  // new 15-item forms (SET-15 / SUP-15): answers by item, stamp, supervisor; the student id stays empty\n',
+            SHEET_MAP)
+        done.append(f"{SHEET_MAP}: carries the sheet row number")
+
+    fe = by_name[IMPORT_ERROR_FORMAT]["parameters"]
+    if "j.instrument ?" not in fe["jsCode"]:
+        fe["jsCode"] = replace_once(
+            fe["jsCode"], "        review_note: j.review_note ?? null,\n",
+            "        review_note: j.review_note ?? null,\n"
+            "        ...(j.instrument ? { instrument: j.instrument, answers: j.answers, stamp_no: j.stamp_no, "
+            "supervisor: j.supervisor } : {}),\n", IMPORT_ERROR_FORMAT)
+        done.append(f"{IMPORT_ERROR_FORMAT}: keeps the new-form answers in raw_data")
+
+    if0 = by_name[SHEET_IF19]["position"]
+    if SHEET_NEWFORM_IF not in by_name:
+        n = if_node(SHEET_NEWFORM_IF, [if0[0] + 112, if0[1] - 224],
+                    "={{ $json.instrument === 'SET-15' || $json.instrument === 'SUP-15' }}",
+                    "5e7a0c11-0000-4a0a-9a10-000000000019")
+        out["nodes"].append(n)
+        by_name[SHEET_NEWFORM_IF] = n
+        done.append(f"{SHEET_NEWFORM_IF}: new node")
+    sql = read("sheet_new_form_save.sql")
+    n = by_name.get(SHEET_NEWFORM_SAVE)
+    if n is None:
+        pos = by_name[SHEET_NEWFORM_IF]["position"]
+        n = pg_node(SHEET_NEWFORM_SAVE, [pos[0] + 224, pos[1]], sql, SHEET_NEWFORM_SAVE_PARAMS, "continueRegularOutput")
+        out["nodes"].append(n)
+        by_name[SHEET_NEWFORM_SAVE] = n
+        done.append(f"{SHEET_NEWFORM_SAVE}: new node")
+    elif n["parameters"].get("query") != sql or n["parameters"]["options"].get("queryReplacement") != SHEET_NEWFORM_SAVE_PARAMS:
+        n["parameters"]["query"] = sql
+        n["parameters"]["options"] = {"queryReplacement": SHEET_NEWFORM_SAVE_PARAMS}
+        done.append(f"{SHEET_NEWFORM_SAVE}: refreshed")
+
+    t0 = targets_of(conns, SHEET_IF19, 0)
+    if t0 == ["If1"]:
+        conns[SHEET_IF19]["main"][0] = [{"node": SHEET_NEWFORM_IF, "type": "main", "index": 0}]
+        add_connection(conns, SHEET_NEWFORM_IF, 1, "If1", 0)
+        done.append(f"{SHEET_IF19}[0] -> {SHEET_NEWFORM_IF} -> (false) If1")
+    elif t0 != [SHEET_NEWFORM_IF]:
+        raise SystemExit(f"{SHEET_IF19}: unexpected connections; the input changed")
+    add_connection(conns, SHEET_NEWFORM_IF, 0, SHEET_NEWFORM_SAVE, 0)
+    return done
+
+
+IMPORT_FIX_WEBHOOK = "import-error-correction1"
+IMPORT_FIX_GUARD_IF = "Import Fix New Form?"
+IMPORT_FIX_GUARD_RESPOND = "Respond new_form_not_fixable"
+IMPORT_FIX_NEWFORM_NOTE = (
+    "This row is from the Student Evaluation of Teachers (SET) / Supervisor's Evaluation of Faculty import. "
+    "Fix the instructor or subject name in the Google Sheet and import the sheet again; "
+    "the same rows are replaced, not duplicated.")
+
+
+def apply_import_fix_new_form_guard(out) -> list[str]:
+    """Idempotent. 'import-error-correction' only understands the old 20-item SAST form (it writes M1..P10 to
+    sast_all_raw_data_survey). A SET-15 / SUP-15 row (raw_data.instrument) answers 422 and saves nothing."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    if IMPORT_FIX_WEBHOOK not in by_name:
+        raise SystemExit(f"apply_import_fix_new_form_guard: no node named {IMPORT_FIX_WEBHOOK!r}")
+    conns = out["connections"]
+    done = []
+    if IMPORT_FIX_GUARD_IF not in by_name:
+        pos = by_name[IMPORT_FIX_WEBHOOK]["position"]
+        out["nodes"].append(if_node(
+            IMPORT_FIX_GUARD_IF, [pos[0] + 224, pos[1] - 112],
+            "={{ ['SET-15', 'SUP-15'].includes((($json.body || {}).raw_data || {}).instrument) }}",
+            "5e7a0c11-0000-4a0a-9a10-000000000020"))
+        done.append(f"{IMPORT_FIX_GUARD_IF}: new node")
+    if IMPORT_FIX_GUARD_RESPOND not in by_name:
+        pos = by_name[IMPORT_FIX_WEBHOOK]["position"]
+        body = json.dumps({"success": False, "code": "new_form_not_fixable", "message": IMPORT_FIX_NEWFORM_NOTE})
+        out["nodes"].append({
+            "parameters": {"respondWith": "json", "responseBody": "=" + body,
+                           "options": {"responseCode": 422}},
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1.5,
+            "position": [pos[0] + 448, pos[1] - 224],
+            "id": nid(IMPORT_FIX_GUARD_RESPOND),
+            "name": IMPORT_FIX_GUARD_RESPOND,
+        })
+        done.append(f"{IMPORT_FIX_GUARD_RESPOND}: new node")
+    t0 = targets_of(conns, IMPORT_FIX_WEBHOOK, 0)
+    if t0 == ["get existing scan image id1"]:
+        conns[IMPORT_FIX_WEBHOOK]["main"][0] = [{"node": IMPORT_FIX_GUARD_IF, "type": "main", "index": 0}]
+        add_connection(conns, IMPORT_FIX_GUARD_IF, 0, IMPORT_FIX_GUARD_RESPOND, 0)
+        add_connection(conns, IMPORT_FIX_GUARD_IF, 1, "get existing scan image id1", 0)
+        done.append(f"{IMPORT_FIX_WEBHOOK} -> {IMPORT_FIX_GUARD_IF} (true: 422, false: unchanged path)")
+    elif t0 != [IMPORT_FIX_GUARD_IF]:
+        raise SystemExit(f"{IMPORT_FIX_WEBHOOK}: unexpected connections; the input changed")
+    return done
+
+
+def apply_sheet_set_ai(out) -> list[str]:
+    """Idempotent (after apply_sheet_new_forms). Saved + counted + new SET-15 comments, all at once, into the
+    old remark AI loop: Save New Form Row -> SET Comments for AI -> Instructor message2."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (SHEET_NEWFORM_SAVE, "Instructor message2"):
+        if name not in by_name:
+            raise SystemExit(f"apply_sheet_set_ai: no node named {name!r}")
+    conns = out["connections"]
+    done = []
+    src = read_js("sheet_set_comments.js")
+    n = by_name.get(SHEET_SET_AI)
+    if n is None:
+        pos = by_name[SHEET_NEWFORM_SAVE]["position"]
+        n = code_node(SHEET_SET_AI, [pos[0] + 224, pos[1]], "sheet_set_comments.js")
+        out["nodes"].append(n)
+        done.append(f"{SHEET_SET_AI}: new node")
+    elif n["parameters"]["jsCode"] != src:
+        n["parameters"]["jsCode"] = src
+        done.append(f"{SHEET_SET_AI}: refreshed")
+    t = targets_of(conns, SHEET_NEWFORM_SAVE, 0)
+    if t not in ([], [SHEET_SET_AI], [SHEET_SET_AI, SHEET_SET_LOW]):
+        raise SystemExit(f"{SHEET_NEWFORM_SAVE}: unexpected connections; the input changed")
+    add_connection(conns, SHEET_NEWFORM_SAVE, 0, SHEET_SET_AI, 0)
+    add_connection(conns, SHEET_SET_AI, 0, "Instructor message2", 0)
+    return done
+
+
+# SET-15 low-score push (2026-10-30): the old SAST path pushes through If28 when recompute_sast gives a
+# combined mean < 3. A SET-15 import never reaches recompute_sast, so 'SET Low Score Push' (once, after every row is
+# saved) passes each instructor whose POOLED SET-15 overall_pct for the term is < 60 (= mean < 3.0 on 1..5) to the
+# same If28, which gets a second OR condition for those items. Once per instructor per import; ids and the score
+# only (no student id, name or comment).
+SHEET_SET_LOW = "SET Low Score Push"
+SET_LOW_COND_ID = "5e7a0c11-0000-4a0a-9a10-000000000021"
+SET_LOW_COND_EXPR = ("={{ $json.set_low_score === true && $json.overall_pct !== null && $json.overall_pct !== undefined "
+                     "&& $json.overall_pct !== '' && Number($json.overall_pct) < 60 }}")
+
+
+def apply_sheet_set_low_score(out) -> list[str]:
+    """Idempotent (after apply_sheet_set_ai). Save New Form Row -> SET Low Score Push -> If28 (+ OR condition)."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    for name in (SHEET_NEWFORM_SAVE, SHEET_SET_AI, SAST_ALERT_IF):
+        if name not in by_name:
+            raise SystemExit(f"apply_sheet_set_low_score: no node named {name!r}")
+    conns = out["connections"]
+    done = []
+    src = read_js("sheet_set_low_score.js")
+    n = by_name.get(SHEET_SET_LOW)
+    if n is None:
+        pos = by_name[SHEET_NEWFORM_SAVE]["position"]
+        n = code_node(SHEET_SET_LOW, [pos[0] + 224, pos[1] - 176], "sheet_set_low_score.js")
+        out["nodes"].append(n)
+        done.append(f"{SHEET_SET_LOW}: new node")
+    elif n["parameters"]["jsCode"] != src:
+        n["parameters"]["jsCode"] = src
+        done.append(f"{SHEET_SET_LOW}: refreshed")
+    if targets_of(conns, SHEET_NEWFORM_SAVE, 0) not in ([SHEET_SET_AI], [SHEET_SET_AI, SHEET_SET_LOW]):
+        raise SystemExit(f"{SHEET_NEWFORM_SAVE}: unexpected connections; the input changed")
+    if SHEET_SET_LOW not in targets_of(conns, SHEET_NEWFORM_SAVE, 0):
+        add_connection(conns, SHEET_NEWFORM_SAVE, 0, SHEET_SET_LOW, 0)
+        done.append(f"{SHEET_NEWFORM_SAVE} -> {SHEET_SET_LOW}")
+    if SAST_ALERT_IF not in targets_of(conns, SHEET_SET_LOW, 0):
+        add_connection(conns, SHEET_SET_LOW, 0, SAST_ALERT_IF, 0)
+        done.append(f"{SHEET_SET_LOW} -> {SAST_ALERT_IF}")
+    cond = by_name[SAST_ALERT_IF]["parameters"]["conditions"]
+    if cond.get("combinator") != "or":
+        raise SystemExit(f"{SAST_ALERT_IF}: combinator is not 'or'; the input changed")
+    lst = cond["conditions"]
+    if not lst or "$json.combined_score_mean" not in str(lst[0].get("leftValue", "")):
+        raise SystemExit(f"{SAST_ALERT_IF}: first condition is not the SAST mean; the input changed")
+    want = {"id": SET_LOW_COND_ID, "leftValue": SET_LOW_COND_EXPR, "rightValue": "",
+            "operator": {"type": "boolean", "operation": "true", "singleValue": True}}
+    have = [c for c in lst if c.get("id") == SET_LOW_COND_ID]
+    if not have:
+        lst.append(want)
+        done.append(f"{SAST_ALERT_IF}: + OR SET-15 pooled overall_pct < 60")
+    elif have[0] != want:
+        have[0].clear()
+        have[0].update(want)
+        done.append(f"{SAST_ALERT_IF}: SET-15 condition refreshed")
     return done
 
 
@@ -3743,6 +3998,10 @@ def live_main(argv):
     pacing = apply_gemini_rate_limit(out)
     early = apply_sheet_early_response(out)
     jobs = apply_sheet_import_jobs(out)
+    newforms = apply_sheet_new_forms(out)
+    apply_sheet_set_ai(out)
+    newforms += apply_sheet_set_low_score(out)
+    apply_import_fix_new_form_guard(out)
     corr_match = apply_correction_name_match(out)
     crosscheck = apply_ocr_crosscheck(out)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -3767,6 +4026,7 @@ def live_main(argv):
     print("gemini rate limit: " + ("; ".join(pacing) if pacing else "already applied"))
     print("sheet early response: " + ("; ".join(early) if early else "already applied"))
     print("sheet import jobs: " + ("; ".join(jobs) if jobs else "already applied"))
+    print("sheet new forms: " + ("; ".join(newforms) if newforms else "already applied"))
     print("correction name match: " + ("; ".join(corr_match) if corr_match else "already applied"))
     print("ocr cross-check: " + ("; ".join(crosscheck) if crosscheck else "already applied"))
     return 0
@@ -3883,6 +4143,10 @@ def main(argv):
 
     # 5f. sheet import job (migration 018): the app polls sheet_import_jobs until the flow really ends
     apply_sheet_import_jobs(out)
+    apply_sheet_new_forms(out)
+    apply_sheet_set_ai(out)
+    apply_sheet_set_low_score(out)         # SET-15: pooled overall < 60 % -> the If28 low-score push
+    apply_import_fix_new_form_guard(out)   # SET-15 / SUP-15 import errors cannot be fixed via the old path
 
     # 6. secrets -> credentials
     swapped = swap_supabase_credentials(out["nodes"])

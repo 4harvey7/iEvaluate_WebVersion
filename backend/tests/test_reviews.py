@@ -1030,6 +1030,25 @@ def test_approve_duplicate_stamp_is_refused_before_sending(env):
     assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100005")).status_code == 200
 
 
+def test_approve_stamp_used_by_imported_eval_form_is_refused(env):
+    db, n8n, client = env()
+    add_stamp_rows(db)
+    db.tables["sast_all_raw_data_survey"].clear()
+    db.row("failed_scan_queue", Q1)["term_id"] = None  # the batch's term is used
+    db.tables["eval_responses"] = [
+        {"id": "e1", "task_id": "sheet:job1:1", "instructor_id": JUAN, "subject_id": IT101, "term_id": TERM,
+         "stamp_no": "0100005"}]
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100005"))
+    assert r.status_code == 409, r.text
+    d = r.json()["detail"]
+    assert d["code"] == "duplicate_stamp" and d["duplicate_of"]["task_id"] == "sheet:job1:1"
+    assert d["duplicate_of"]["instructor_name"] == "Juan Dela Cruz"
+    assert n8n.calls == []
+    # The same stamp in another term is not a duplicate.
+    db.tables["eval_responses"][0]["term_id"] = "c0000000-0000-0000-0000-0000000000ff"
+    assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(stamp_no="0100005")).status_code == 200
+
+
 def test_approve_n8n_answers_duplicate_stamp(env):
     answer = {"success": False, "code": "duplicate_stamp", "message": "Stamp already saved.", "duplicate_of": dict(STAMP_DUP)}
     db, n8n, client = env(n8n=FakeN8n(status=409, body=answer))

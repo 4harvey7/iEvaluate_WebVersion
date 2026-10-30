@@ -95,6 +95,7 @@ AGG_CHAIN_HEADS = ["Management Node1", "Performance1"]   # original export only 
 SAST_PAIRS = "Code in JavaScript8"
 SAST_RECOMPUTE = "update to overall total2"
 SAST_ALERT_IF = "If28"
+SET_LOW_PUSH = "SET Low Score Push"
 SAST_RECOMPUTE_SQL = "SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);\n"
 SAST_RECOMPUTE_PARAMS = "={{ [$json.instructor_id, $json.term_id] }}"
 SAST_DEAD_NODES = [
@@ -157,6 +158,7 @@ EDITED_SHARED = {  # node -> parameter paths allowed to change
     # interpretation summary: the single-scan path also gets previous_remarks (remark + tone only)
     "Get Existing AI Suggestion1": [("query",)],
     "Prepare Existing AI1": [("jsCode",)],
+    "If28": [("conditions",)],   # + OR SET-15 pooled overall_pct < 60 (SET Low Score Push, 2026-10-30)
 }
 PHONE_REMARK_NODES = ["Phone Remark Check", "Phone Remark Needs Check?", "Phone Verify Remark Words"]
 # nodes that must carry the sexual-word filter (identical copies of website_src/profanity.js)
@@ -247,6 +249,8 @@ FLAGGED_FCM = "Get staff FCM for flagged scan"
 PG_QUERY_BATCHING = {"single", "transaction", "independently"}   # n8n Postgres v2 option values
 # (edges of the removed SAST_DEAD_NODES are left out of both sides of the comparison)
 EXPECTED_REMOVED_EDGES = {("Get row(s) in sheet1", "main", 0, "get instructor id5", 0),  # sheet header matching
+                          ("If19", "main", 0, "If1", 0),   # new 15-item forms: If19 -> Sheet New Form? -> If1
+                          ("import-error-correction1", "main", 0, "get existing scan image id1", 0),   # now behind Import Fix New Form?
                           ("Map to Target Format", "main", 0, "If19", 0),   # sheet webhook answers early
                           ("If14", "main", 1, RAW_LOOP, 0), (RAW_LOOP, "main", 1, RAW_UPSERT, 0),
                           # Loop Over Items8 is fed back once per group (alert branch no longer feeds Wait1)
@@ -296,6 +300,16 @@ EXPECTED_ADDED_EDGES = {("Unified AI Analysis1", "main", 1, REMARK_LOOP_WAIT, 0)
                         (REMARK_LOOP_FEED, "main", 1, REMARK_LOOP_WAIT, 0),   # a failed insert still advances the loop
                         *((s, "main", i, SHEET_JOB_DESCRIBE, 0) for s, i in SHEET_JOB_FAIL_SOURCES),
                         ("After Sheet Response", "main", 0, "If19", 0),
+                        ("If19", "main", 0, "Sheet New Form?", 0),   # new 15-item forms (SET-15 / SUP-15)
+                        ("Sheet New Form?", "main", 0, "Save New Form Row", 0),
+                        ("Sheet New Form?", "main", 1, "If1", 0),
+                        ("Save New Form Row", "main", 0, "SET Comments for AI", 0),   # SET comments -> remark AI
+                        ("SET Comments for AI", "main", 0, "Instructor message2", 0),
+                        ("Save New Form Row", "main", 0, "SET Low Score Push", 0),   # SET-15 pooled < 60 % -> If28
+                        ("SET Low Score Push", "main", 0, SAST_ALERT_IF, 0),
+                        ("import-error-correction1", "main", 0, "Import Fix New Form?", 0),   # SET-15 / SUP-15 -> 422
+                        ("Import Fix New Form?", "main", 0, "Respond new_form_not_fixable", 0),
+                        ("Import Fix New Form?", "main", 1, "get existing scan image id1", 0),
                         ("Get row(s) in sheet1", "main", 1, "Sheet Import Error Response", 0),
                         ("Normalize Sheet Rows", "main", 1, "Sheet Import Error Response", 0),
                         ("image to ocr and omr python", "main", 0, "Phone Known Names", 0),
@@ -419,7 +433,9 @@ def main(argv):
     check(handoff_ok, "clean pages: Website Raw Upsert -> Raw Stored? -> Success Response -> Website Respond Saved "
                       "-> Website Map to Target Format -> If19; flagged: Website Flagged Record -> Save scan error image")
     check(targets(conns, "Map to Target Format3", 0) == ["If19"]
-          and targets(conns, "If19", 0) == ["If1"], "website and phone share the same If19 -> If1 entry")
+          and targets(conns, "If19", 0) == ["Sheet New Form?"]
+          and targets(conns, "Sheet New Form?", 1) == ["If1"],
+          "website and phone share the same If19 -> (Sheet New Form? false) If1 entry")
 
     # ---- removed nodes and references
     still = [r for r in REMOVED_NODES if r in by_name or r in text]
@@ -1203,7 +1219,7 @@ def main(argv):
               and targets(conns, SAST_PAIRS, 0) == [SAST_RECOMPUTE]
               and inbound(SAST_RECOMPUTE) == [(SAST_PAIRS, 0)]
               and targets(conns, SAST_RECOMPUTE, 0) == [SAST_ALERT_IF]
-              and inbound(SAST_ALERT_IF) == [(SAST_RECOMPUTE, 0)]
+              and inbound(SAST_ALERT_IF) in ([(SAST_RECOMPUTE, 0)], sorted([(SAST_RECOMPUTE, 0), (SET_LOW_PUSH, 0)]))
               and "$('If1').all()" in by_name.get(SAST_PAIRS, {}).get("parameters", {}).get("jsCode", "")
               and "$json.combined_score_mean" in json.dumps(by_name.get(SAST_ALERT_IF, {}).get("parameters", {}))
               and not dead_left)
@@ -1231,6 +1247,23 @@ def main(argv):
     check(shape28 and all(_if28(v) == e for v, e in cases28),
           "If28: true only for a real number < 3 (boolean expression guards NULL/''/undefined; "
           "NULL/'' false, '2.99' true, 3 and 4.5 false)")
+
+    # ---- SET-15 low-score push: once per instructor per import, through the same If28 (second OR condition)
+    conds28 = if28.get("parameters", {}).get("conditions", {})
+    set_c = [c for c in (conds28.get("conditions") or [])[1:] if "set_low_score" in str(c.get("leftValue", ""))]
+    set_expr = str(set_c[0].get("leftValue", "")) if set_c else ""
+    low_code = by_name.get(SET_LOW_PUSH, {}).get("parameters", {}).get("jsCode", "")
+    set_low_ok = (len(set_c) == 1 and conds28.get("combinator") == "or"
+                  and "$json.set_low_score === true" in set_expr and "Number($json.overall_pct) < 60" in set_expr
+                  and set_c[0].get("operator") == {"type": "boolean", "operation": "true", "singleValue": True}
+                  and targets(conns, "Save New Form Row", 0) == ["SET Comments for AI", SET_LOW_PUSH]
+                  and targets(conns, SET_LOW_PUSH, 0) == [SAST_ALERT_IF]
+                  and inbound(SET_LOW_PUSH) == [("Save New Form Row", 0)]
+                  and by_name.get(SET_LOW_PUSH, {}).get("parameters", {}).get("mode", "runOnceForAllItems") == "runOnceForAllItems"
+                  and "'SET-15'" in low_code and "LOW_PCT = 60" in low_code
+                  and not re.search(r"student_id|Student ID|Remarks|first_name|last_name", low_code))
+    check(set_low_ok, "SET-15 low-score push: Save New Form Row -> SET Low Score Push (once for all rows: one item per "
+          "instructor whose pooled SET-15 overall_pct < 60, no student id / name / comment) -> If28 (second OR condition)")
 
     # ---- blank ratings stay NULL (CHECK 1..5): rating() copies + no 'missing rating -> 0'
     r_src = (HERE / "website_src" / "rating.js").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"

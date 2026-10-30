@@ -2165,7 +2165,8 @@ test('Aggregates: Raw Upsert Done -> Code in JavaScript8 -> recompute_sast -> If
   assert.deepStrictEqual(outs('Raw Upsert Done'), ['Code in JavaScript8']);
   assert.deepStrictEqual(outs('Code in JavaScript8'), ['update to overall total2']);
   assert.deepStrictEqual(outs('update to overall total2'), ['If28']);
-  assert.deepStrictEqual(ins('If28'), ['update to overall total2[0]']);
+  // the SAST recompute and (2026-10-30) the SET-15 low-score push, which runs once per import
+  assert.deepStrictEqual(ins('If28'), ['SET Low Score Push[0]', 'update to overall total2[0]']);
   assert.deepStrictEqual(ins('update to overall total2'), ['Code in JavaScript8[0]']);
   const n = wf.nodes.find((x) => x.name === 'update to overall total2');
   assert.strictEqual(n.parameters.query.trim(), 'SELECT * FROM public.recompute_sast($1::uuid, $2::uuid);');
@@ -2315,7 +2316,9 @@ test('Correction chain: image lookup runs before Map target (webhook -> lookup -
   assert.deepStrictEqual(out('get existing scan image id'), ['Correction Candidates']);
   assert.deepStrictEqual(out('Correction Candidates'), ['Correction Name Match']);
   assert.deepStrictEqual(out('Correction Name Match'), ['get instructor id7']);
-  assert.deepStrictEqual(out('import-error-correction1'), ['get existing scan image id1']);
+  assert.deepStrictEqual(out('import-error-correction1'), ['Import Fix New Form?']);   // guard: SET-15 / SUP-15 -> 422
+  assert.deepStrictEqual(out('Import Fix New Form?'), ['Respond new_form_not_fixable']);
+  assert.deepStrictEqual(((wf.connections['Import Fix New Form?'] || {}).main || [])[1].map((c) => c.node), ['get existing scan image id1']);
   assert.deepStrictEqual(out('get existing scan image id1'), ['get instructor id9']);
   for (const n of ['get instructor id7', 'get instructor id9']) {
     const qr = wf.nodes.find((x) => x.name === n).parameters.options.queryReplacement;
@@ -4147,8 +4150,11 @@ test('Sheet import job: the job row gets the execution id and only a uuid reques
   assert.strictEqual(sv[1], 'Group feedback by instructor1');
   assert.ok(/stopped at step "Group feedback by instructor1": Cannot read properties of undefined/.test(sv[2]), sv[2]);
   const done = wf.nodes.find((n) => n.name === 'Mark Import Job Done').parameters.options.queryReplacement;
-  const dv = evalExpr(done, { $json: { job_id: JOB_ID, rows: 5, matched: 4, unmatched: 1, imported_count: 4, error_count: 1, ai_groups: 2, ai_failed: 0, has_problems: false, first_failed_node: null, message: 'm' } });
-  assert.deepStrictEqual(dv, [JOB_ID, 5, 4, 1, 4, 1, 2, 0, false, '', 'm']);
+  const dv = evalExpr(done, { $json: { job_id: JOB_ID, rows: 5, matched: 4, unmatched: 1, imported_count: 4, error_count: 1, ai_groups: 2, ai_failed: 0, has_problems: false, first_failed_node: null, message: 'm',
+    details: { form_type: 'SET-15', rows: 5 }, term_id: TERM } });
+  assert.deepStrictEqual(dv, [JOB_ID, 5, 4, 1, 4, 1, 2, 0, false, '', 'm', '{"form_type":"SET-15","rows":5}', TERM]);
+  const dv0 = evalExpr(done, { $json: { job_id: JOB_ID, rows: 0, message: 'm' } });
+  assert.deepStrictEqual(dv0.slice(11), ['{}', ''], 'no details: {} keeps the column (the SQL checks for {})');
 });
 
 test('Sheet import job: wiring and execution order (done marker last, Wait1 feeds kept, no AI involved)', () => {
@@ -4185,6 +4191,424 @@ test('Sheet import job: wiring and execution order (done marker last, Wait1 feed
   }
   assert.strictEqual(byName['Import Job Error Trigger'].type, 'n8n-nodes-base.errorTrigger');
   assert.ok(!wf.settings.errorWorkflow, 'no other error workflow (the own Error Trigger runs)');
+});
+
+// ---- Google Sheet import of the new 15-item forms (SET-15 student, SUP-15 supervisor)
+async function normNew(rows, instrument) {
+  const nodes = instrument === undefined ? {} : { 'clean data1': { instrument } };
+  return (await run('Normalize Sheet Rows', undefined, nodes, rows)).map((x) => x.json);
+}
+const SET_BASE = { 'Instructor/Professor': 'Ana Reyes', 'Subject Taught': 'MOBAPP 330', Comments: 'Good teacher', 'Stamp No': '0100005' };
+test('New forms: Q1..Q15, 1..15 and Item 1..Item 15 headers all give the same answers; blank stays null', async () => {
+  const mk = (head) => {
+    const r = { ...SET_BASE };
+    for (let i = 1; i <= 15; i++) r[head(i)] = i === 4 ? '' : (i % 5) + 1;
+    return r;
+  };
+  const expected = {};
+  for (let i = 1; i <= 15; i++) expected[String(i)] = i === 4 ? null : (i % 5) + 1;
+  for (const head of [(i) => 'Q' + i, (i) => String(i), (i) => 'Item ' + i, (i) => i + '. text of the item']) {
+    const [r] = await normNew([mk(head)], 'SET-15');
+    assert.strictEqual(r.Instrument, 'SET-15');
+    assert.deepStrictEqual(r.Answers, expected, head(1));
+    assert.strictEqual(r['Stamp No'], '0100005');
+    assert.strictEqual(r['Remarks & Suggestions'], 'Good teacher');
+    assert.strictEqual(r['Instructor/Professor'], 'Ana Reyes');
+    assert.strictEqual(r.M1, null);
+  }
+});
+test('New forms: the student id never goes into the Student ID field (only Details, SET-15); invalid values reach the database unchanged to be refused', async () => {
+  const [r] = await normNew([{ ...SET_BASE, 'Student ID': '2021-0001', Q1: 6, Q2: 'x', Q3: 0, Q4: '5' }], 'SET-15');
+  assert.strictEqual(r['Student ID'], '');
+  assert.strictEqual(r.Details.student_id, '2021-0001');
+  assert.deepStrictEqual([r.Answers['1'], r.Answers['2'], r.Answers['3'], r.Answers['4'], r.Answers['5']], [6, 'x', 0, '5', null]);
+  assert.strictEqual(Object.keys(r.Answers).length, 15, 'items 1..15 only');
+});
+test('New forms: Details = student id (SET only), section, program level/year, ISO date, rank and designation (SUP only)', async () => {
+  const set = { ...SET_BASE, 'ID Number': 7000001, Section: ' A1 ', 'Program Level': 'Undergraduate', 'Program Year': '3rd', Date: '10/30/2026', Q1: 5 };
+  const [a] = await normNew([set], 'SET-15');
+  assert.deepStrictEqual(a.Details, { student_id: '7000001', section: 'A1', program_level: 'Undergraduate', program_year: '3rd',
+    submitted_date: '2026-10-30', academic_rank: '', designation: '' });
+  const sup = { ...SET_BASE, 'Supervisor Email': 'c@x.ph', 'Student ID': 'S9', Section: 'B', 'Academic Rank': 'Assistant Professor II',
+    'Supervisor Designation': 'Department Head', Date: 46325, Q1: 5 };
+  const [s] = await normNew([sup], 'SUP-15');
+  assert.strictEqual(s.Details.student_id, '', 'no student id on a supervisor form');
+  assert.deepStrictEqual([s.Details.academic_rank, s.Details.designation, s.Details.section, s.Details.submitted_date],
+    ['Assistant Professor II', 'Department Head', 'B', '2026-10-30']);
+  assert.strictEqual(s.Supervisor, 'c@x.ph', 'a designation column is not the supervisor name');
+  for (const [d, iso] of [['2026-10-30', '2026-10-30'], ['Oct 30, 2026', '2026-10-30'], ['13/45/2026', ''], ['soon', ''], ['', '']]) {
+    assert.strictEqual((await normNew([{ ...SET_BASE, Date: d, Q1: 5 }], 'SET-15'))[0].Details.submitted_date, iso, d);
+  }
+  const old = (await normNew([{ 'Student ID': 'S1', 'Instructor/Professor': 'Ana Reyes', Section: 'A', M1: 5 }]))[0];
+  assert.ok(!('Details' in old), 'the old SAST sheet gets no Details');
+});
+test('New forms: SUP-15 supervisor = email column if there is one, else the name column', async () => {
+  const [a] = await normNew([{ ...SET_BASE, Supervisor: 'Dr. Cruz', 'Supervisor Email': 'cruz@ctu.edu.ph', Q1: 5 }], 'SUP-15');
+  assert.strictEqual(a.Supervisor, 'cruz@ctu.edu.ph');
+  const [b] = await normNew([{ ...SET_BASE, 'Supervisor Name': 'Dr. Cruz', Q1: 5 }], 'SUP-15');
+  assert.strictEqual(b.Supervisor, 'Dr. Cruz');
+  const [c] = await normNew([{ ...SET_BASE, Q1: 5 }], 'SUP-15');
+  assert.strictEqual(c.Supervisor, '');
+});
+test('New forms: the old SAST sheet is unchanged (no form_type, SAST-20, or an unknown value)', async () => {
+  const row = { 'Student ID': 'S1', 'Instructor/Professor': 'Ana Reyes', 'Subject Taught': 'MOBAPP 330', M1: 5, P10: 4, Q1: 3, 'Remarks & Suggestions': 'ok' };
+  const old = (await normNew([row]))[0];
+  for (const inst of ['', 'SAST-20', 'bogus']) {
+    const r = (await normNew([row], inst))[0];
+    assert.deepStrictEqual(r, old, inst);
+  }
+  assert.ok(!('Instrument' in old) && old['Student ID'] === 'S1' && old.M1 === 5 && old.P10 === 4);
+});
+test('New forms: Map to Target Format carries answers, stamp, supervisor and a row number; masks comments; SAST rows get none', async () => {
+  const sheet = { 'Student ID': '', 'Instructor/Professor': 'Ana Reyes', 'Subject Taught': 'MOBAPP 330', Instrument: 'SUP-15',
+    Answers: { 1: 5 }, 'Stamp No': '0100005', Supervisor: 'cruz@ctu.edu.ph', 'Remarks & Suggestions': 'Buang ka, bilat',
+    Details: { section: 'A' } };
+  const nodes = {
+    'Google LINK from phone1': { body: { semester: '1st', academic_year: '2026', type: 'google_form_import', term_id: TERM } },
+    'Normalize Sheet Rows': { __items: [sheet, { ...sheet, Instrument: undefined, Answers: undefined }] },
+    'get instructor id5': { __items: [{ instructor_id: INSTR }, { instructor_id: INSTR }] },
+    'get subject id7': { __items: [{ subject_id: SUBJ }, { subject_id: SUBJ }] },
+    'GET TERM BY ID1': { __items: [{ current_term_id: TERM }, { current_term_id: TERM }] },
+  };
+  const out = (await run('Map to Target Format', {}, nodes)).map((x) => x.json);
+  assert.strictEqual(out[0].instrument, 'SUP-15');
+  assert.deepStrictEqual(out[0].answers, { 1: 5 });
+  assert.deepStrictEqual([out[0].stamp_no, out[0].supervisor, out[0].sheet_row], ['0100005', 'cruz@ctu.edu.ph', 1]);
+  assert.strictEqual(out[0]['Remarks & Suggestions'], 'Buang ka, *****');
+  assert.deepStrictEqual(out[0].details, { section: 'A' });
+  assert.ok(!('instrument' in out[1]) && !('answers' in out[1]) && !('details' in out[1]), 'old rows get no new keys');
+});
+test('Import-error fix: SET-15 / SUP-15 rows answer 422 and never reach the old SAST correction path', () => {
+  const tgt = (n, i) => ((wf.connections[n] || {}).main[i] || []).map((c) => c.node);
+  assert.deepStrictEqual(tgt('import-error-correction1', 0), ['Import Fix New Form?']);
+  assert.deepStrictEqual(tgt('Import Fix New Form?', 0), ['Respond new_form_not_fixable']);
+  assert.deepStrictEqual(tgt('Import Fix New Form?', 1), ['get existing scan image id1']);
+  const ifn = wf.nodes.find((n) => n.name === 'Import Fix New Form?');
+  const expr = ifn.parameters.conditions.conditions[0].leftValue.replace(/^=\{\{/, '').replace(/\}\}$/, '');
+  const check = (instrument) => new Function('$json', 'return ' + expr)({ body: { raw_data: { instrument } } });
+  assert.strictEqual(check('SET-15'), true);
+  assert.strictEqual(check('SUP-15'), true);
+  assert.strictEqual(check(undefined), false, 'old SAST rows keep the old path');
+  assert.strictEqual(new Function('$json', 'return ' + expr)({ body: {} }), false);
+  const res = wf.nodes.find((n) => n.name === 'Respond new_form_not_fixable');
+  assert.strictEqual(res.parameters.options.responseCode, 422);
+  const body = JSON.parse(res.parameters.responseBody.replace(/^=/, ''));
+  assert.deepStrictEqual([body.success, body.code], [false, 'new_form_not_fixable']);
+  assert.ok(/Fix the instructor or subject name in the Google Sheet/.test(body.message));
+});
+
+test('New forms: wiring (If19 -> Sheet New Form? -> Save / If1), the save SQL, and the row parameters', () => {
+  const tgt = (n, i) => ((wf.connections[n] || {}).main[i] || []).map((c) => c.node);
+  assert.deepStrictEqual(tgt('If19', 0), ['Sheet New Form?']);
+  assert.deepStrictEqual(tgt('Sheet New Form?', 0), ['Save New Form Row']);
+  assert.deepStrictEqual(tgt('Sheet New Form?', 1), ['If1']);
+  assert.deepStrictEqual(tgt('If19', 1), ['is data from google link?'], 'unmatched rows keep the old error path');
+  const save = wf.nodes.find((n) => n.name === 'Save New Form Row');
+  assert.strictEqual(save.onError, 'continueRegularOutput');
+  const q = save.parameters.query;
+  assert.ok(/save_eval_response\(/.test(q) && /'sheet'/.test(q) && /supervisor_not_found/.test(q) && /DEPARTMENT_HEAD/.test(q));
+  assert.ok(/NULLIF\(\$13, ''\)::jsonb/.test(q) && !/student_id/i.test(q.replace(/^--.*$/gm, '')), 'details are passed on as one json parameter');
+  const expr = save.parameters.options.queryReplacement.replace(/^=\{\{/, '').replace(/\}\}$/, '');
+  const row = { instrument: 'SUP-15', instructor_ID: INSTR, true_subject_id: SUBJ, current_term_id: TERM, answers: { 1: 5, 2: null },
+    'Remarks & Suggestions': 'fine', stamp_no: '', supervisor: 'cruz@ctu.edu.ph', sheet_row: 3,
+    details: { section: 'A', academic_rank: 'Instructor I' } };
+  const mock = (ref) => ({ first: () => ({ json: ref === 'Google LINK from phone1'
+    ? { body: { link: 'https://docs.google.com/spreadsheets/d/SHEETID123/edit#gid=0', user_id: JOB_ID } } : { id: JOB_ID } }) });
+  const p = new Function('$', '$json', 'return ' + expr)(mock, row);
+  assert.strictEqual(p.length, 13);
+  assert.deepStrictEqual([p[0], p[4], p[7], p[8], p[9], p[10], p[11], p[12]],
+    ['SUP-15', '{"1":5,"2":null}', 'cruz@ctu.edu.ph', `sheet:SHEETID123:${TERM}:3`, JOB_ID, '3', JOB_ID,
+      '{"section":"A","academic_rank":"Instructor I"}']);
+  assert.strictEqual(new Function('$', '$json', 'return ' + expr)(mock, { ...row, details: undefined })[12], '{}');
+  assert.ok(/instrument: payload\.form_type/.test(codeOf('clean data1')));
+});
+test('New forms: the job summary counts saved, left-out and failed rows with reasons in plain words', async () => {
+  const res = (r, n) => ({ result: r, row_no: n });
+  const nodes = sheetJobNodes({
+    'Map to Target Format': { items: [1, 2, 3, 4, 5, 6].map(() => ({ instructor_ID: INSTR, true_subject_id: SUBJ })) },
+    'Save New Form Row': { items: [res({ saved: true, counted: true }, 1), res({ saved: true, counted: false }, 2),
+      res({ saved: false, reason: 'invalid_rating', item_no: 3 }, 3), res({ saved: false, reason: 'supervisor_not_found' }, 4),
+      { error: 'boom', row_no: 5 }, res({ saved: false, reason: 'duplicate_student' }, 6)] },
+  });
+  for (const k of ['Code in JavaScript', 'Insert or update rows in a table1', 'Insert import_errors1', 'Group feedback by instructor1',
+    'Unified AI Analysis1', 'Parse Unified AI Result1', 'insert data to student remarks2', 'store results2', 'insert to word cloud2',
+    'update to overall total2']) delete nodes[k];
+  const s = (await runJob('Sheet Import Summary', nodes, { lenient: true }))[0].json;
+  assert.deepStrictEqual([s.rows, s.imported_count, s.error_count], [6, 2, 4]);
+  assert.ok(/already evaluated this instructor for this subject this term \(row 6\)/.test(s.message), s.message);
+  assert.ok(/1 saved but left out of the scores: fewer than 5 answers/.test(s.message), s.message);
+  assert.ok(/not 1 to 5 \(row 3\)/.test(s.message) && /supervisor was not found.*\(row 4\)/.test(s.message) && /database refused the row \(row 5\)/.test(s.message), s.message);
+  assert.ok(/runs for SET comments, not for the supervisor form/.test(s.message), s.message);
+  assert.ok(!/not run for the new forms/.test(s.message), s.message);
+});
+test('New forms: the summary counts SET AI groups with the old ones', async () => {
+  const nodes = sheetJobNodes({ 'Save New Form Row': { items: [{ result: { saved: true, counted: true }, row_no: 1 }] } });
+  const s = (await runJob('Sheet Import Summary', nodes, { lenient: true }))[0].json;
+  assert.strictEqual(s.ai_groups, 2);
+  assert.ok(/AI remark analysis done for 2 of 2 instructors \(SET comments; the supervisor form is not analysed/.test(s.message), s.message);
+});
+
+test('SET comments for AI: only SET-15, saved + counted, not updated, non-empty comment; one batch', async () => {
+  const mk = (instrument, remark, extra = {}) => ({ instrument, instructor_ID: INSTR, true_subject_id: SUBJ, current_term_id: TERM,
+    'Subject Taught': 'IT 101', 'Remarks & Suggestions': remark, ...extra });
+  const src = [
+    mk('SET-15', 'Good teacher'),                 // 0 passes
+    mk('SUP-15', 'Supervisor comment'),           // 1 supervisor: no
+    mk('SET-15', 'Under five answers'),           // 2 counted false: no
+    mk('SET-15', 'Re-import'),                    // 3 updated: no
+    mk('SET-15', 'N/A'),                          // 4 placeholder: no
+    mk('SET-15', ''),                             // 5 empty: no
+    mk('SET-15', 'Not saved'),                    // 6 not saved: no
+    mk('SET-15', 'Late but ok'),                  // 7 passes (paired by pairedItem)
+  ];
+  const ok = (r) => ({ result: { saved: true, counted: true, updated: false, ...r } });
+  const res = [ok({}), ok({}), ok({ counted: false }), ok({ updated: true }), ok({}), ok({}), { result: { saved: false, reason: 'invalid_rating' } }, ok({})];
+  const saved = res.map((j, i) => ({ json: j, pairedItem: { item: i } }));
+  const $ = (ref) => { assert.strictEqual(ref, 'Sheet New Form?'); return { all: () => src.map((json) => ({ json })) }; };
+  const fn = new AsyncFunction('$', '$input', codeOf('SET Comments for AI'));
+  const out = await fn($, { all: () => saved });
+  assert.deepStrictEqual(out.map((o) => o.json['Remarks & Suggestions']), ['Good teacher', 'Late but ok']);
+  assert.deepStrictEqual(Object.keys(out[0].json).sort(), ['Remarks & Suggestions', 'Subject Taught', 'current_term_id', 'instructor_ID', 'true_subject_id']);
+  assert.strictEqual(out[0].json.instructor_ID, INSTR);
+  // nothing qualifies: no items, so the AI loop does not run
+  assert.strictEqual((await fn($, { all: () => [{ json: { result: { saved: true, counted: false } } }] })).length, 0);
+});
+test('SET comments for AI: wiring (Save -> SET Comments for AI -> Instructor message2 -> grouped AI loop; summary still below If19)', () => {
+  const tgt = (n, i = 0) => ((wf.connections[n] || {}).main[i] || []).map((c) => c.node);
+  assert.deepStrictEqual(tgt('Save New Form Row'), ['SET Comments for AI', 'SET Low Score Push']);
+  assert.deepStrictEqual(tgt('SET Comments for AI'), ['Instructor message2']);
+  assert.deepStrictEqual(tgt('If21'), ['Instructor message2'], 'old SAST path unchanged');
+  assert.deepStrictEqual(tgt('Instructor message2'), ['Group feedback by instructor1']);
+  const n = wf.nodes.find((x) => x.name === 'SET Comments for AI');
+  assert.ok(!n.parameters.mode || n.parameters.mode === 'runOnceForAllItems');
+  const pos = (name) => wf.nodes.find((x) => x.name === name).position;
+  assert.ok(pos('Sheet Import Summary')[1] > pos('If19')[1] && pos('Sheet Import Summary')[1] > pos('SET Comments for AI')[1]);
+  assert.deepStrictEqual(tgt('After Sheet Response'), ['If19', 'Sheet Import Summary']);
+  const code = n.parameters.jsCode;
+  assert.ok(!/first_name|last_name|Instructor\/Professor/.test(code), 'no instructor name in the AI path');
+});
+
+// ---- 2026-10-30: re-import skips rows already stored (migration 021), details, form-type guard, SET low-score push
+const OLD_SAST_MSG = 'This sheet looks like the old SAST form (20 items) – choose Old SAST form.';
+const SET_MSG = 'This sheet looks like the SET form (15 items) – choose SET.';
+const SUP_MSG = 'This sheet looks like the supervisor form (SUP, 15 items) – choose SUP.';
+const qRow = (n, extra = {}) => {
+  const r = { ...SET_BASE, ...extra };
+  for (let i = 1; i <= n; i++) r['Q' + i] = 4;
+  return r;
+};
+test('Form-type guard: SET/SUP chosen on an old SAST sheet (Q16..Q20 or M/P columns) stops with a clear message', async () => {
+  for (const ft of ['SET-15', 'SUP-15', 'SET', 'sup']) {
+    await assert.rejects(() => normNew([qRow(20)], ft), (e) => e.message === OLD_SAST_MSG, ft + ' + Q1..Q20');
+    await assert.rejects(() => normNew([newSheetRow()], ft), (e) => e.message === OLD_SAST_MSG, ft + ' + "16. ..." headers');
+    await assert.rejects(() => normNew([{ ...SET_BASE, M1: 4, P1: 5 }], ft), (e) => e.message === OLD_SAST_MSG, ft + ' + M1/P1');
+  }
+  // a header only in a later row still counts; n8n's row_number key is never a header
+  await assert.rejects(() => normNew([qRow(15, { row_number: 2 }), { ...qRow(15), Q17: '' }], 'SET-15'), (e) => e.message === OLD_SAST_MSG);
+  // SET chosen on a supervisor sheet
+  await assert.rejects(() => normNew([qRow(15, { 'Supervisor Email': 'c@x.ph' })], 'SET-15'), (e) => e.message === SUP_MSG);
+  // the right choice passes
+  assert.strictEqual((await normNew([qRow(15)], 'SET-15'))[0].Instrument, 'SET-15');
+  assert.strictEqual((await normNew([qRow(15, { 'Supervisor Email': 'c@x.ph' })], 'SUP-15'))[0].Instrument, 'SUP-15');
+});
+test('Form-type guard: the old SAST form chosen on a 15-item sheet stops (SET, or SUP when there is a Supervisor Email column)', async () => {
+  for (const ft of [undefined, '', 'SAST-20']) {
+    await assert.rejects(() => normNew([qRow(15)], ft), (e) => e.message === SET_MSG, String(ft));
+    await assert.rejects(() => normNew([{ ...SET_BASE, '1. gives': 4, '15. is ready': 5 }], ft), (e) => e.message === SET_MSG);
+    await assert.rejects(() => normNew([qRow(15, { 'Supervisor Email': 'c@x.ph' })], ft), (e) => e.message === SUP_MSG, String(ft));
+  }
+  // real old SAST sheets pass: "1. .." .. "20. ..", M1..P10, or no numbered column at all
+  assert.strictEqual((await normNew([newSheetRow()]))[0].M1, 3);
+  assert.strictEqual((await normNew([{ 'Student ID': 'S1', 'Instructor/Professor': 'Ana', M1: 5, P10: 4 }], 'SAST-20'))[0].P10, 4);
+  assert.strictEqual((await normNew([{ 'Student ID': 'S1', 'Instructor/Professor': 'Ana' }]))[0]['Student ID'], 'S1');
+});
+test('Form-type guard: bare SET / SUP are aliases of SET-15 / SUP-15 (any case); unknown values stay the old SAST sheet', async () => {
+  for (const [ft, want] of [['SET', 'SET-15'], ['set', 'SET-15'], [' SUP ', 'SUP-15'], ['sup-15', 'SUP-15'], ['SET-15', 'SET-15']]) {
+    const [r] = await normNew([qRow(15, { 'Supervisor Email': want === 'SUP-15' ? 'c@x.ph' : undefined })].map((x) => {
+      if (x['Supervisor Email'] === undefined) delete x['Supervisor Email'];
+      return x;
+    }), ft);
+    assert.strictEqual(r.Instrument, want, ft);
+  }
+  const [old] = await normNew([{ 'Student ID': 'S1', M1: 5 }], 'SETX');
+  assert.ok(!('Instrument' in old));
+});
+test('Form-type guard: Sheet Import Error Response answers 422 with the exact message (n8n adds [line N]); nothing saved', () => {
+  const raw = wf.nodes.find((x) => x.name === 'Sheet Import Error Response');
+  assert.strictEqual(raw.parameters.options.responseCode, 422);
+  const m = raw.parameters.responseBody.match(/^=\{\{([\s\S]*)\}\}$/);
+  const answer = ($json) => new Function('$json', `return (${m[1]});`)($json);
+  for (const msg of [OLD_SAST_MSG, SET_MSG, SUP_MSG]) {
+    for (const err of [msg, msg + ' [line 232]', { message: msg + ' [line 9]' }]) {
+      const r = answer({ error: err });
+      assert.deepStrictEqual(r, { status: 'error', code: 'wrong_form_type', error: msg, message: msg });
+    }
+  }
+  assert.ok(/no data rows/.test(answer({ error: 'The sheet has no data rows' }).message), 'other errors unchanged');
+  assert.strictEqual(answer({ error: 'The sheet has no data rows' }).code, undefined);
+  // the guard runs in Normalize Sheet Rows, before the lookups, the job row and every save
+  const tgt = (n, i) => (((wf.connections[n] || {}).main || [])[i] || []).map((c) => c.node);
+  assert.deepStrictEqual(tgt('Normalize Sheet Rows', 1), ['Sheet Import Error Response']);
+  assert.deepStrictEqual(tgt('Sheet Import Error Response', 0), []);
+});
+test('Sheet row numbers: Normalize gives the Google Sheets row (row_number, else header + position); Save New Form Row reports it, the task id keeps the old row key', async () => {
+  const rows = await normNew([qRow(15, { row_number: 2 }), qRow(15, { row_number: 5 }), qRow(15)], 'SET-15');
+  assert.deepStrictEqual(rows.map((r) => r['Sheet Row']), [2, 5, 4]);
+  const nodes = {
+    'Google LINK from phone1': { body: { term_id: TERM, semester: '1st', academic_year: '2026' } },
+    'Normalize Sheet Rows': { __items: rows },
+    'get instructor id5': { __items: rows.map(() => ({ instructor_id: INSTR })) },
+    'get subject id7': { __items: rows.map(() => ({ subject_id: SUBJ })) },
+    'GET TERM BY ID1': { __items: rows.map(() => ({ current_term_id: TERM })) },
+  };
+  const mapped = (await run('Map to Target Format', {}, nodes)).map((x) => x.json);
+  assert.deepStrictEqual(mapped.map((r) => [r.sheet_row, r.sheet_row_no]), [[1, 2], [2, 5], [3, 4]]);
+  const save = wf.nodes.find((n) => n.name === 'Save New Form Row');
+  const expr = save.parameters.options.queryReplacement.replace(/^=\{\{/, '').replace(/\}\}$/, '');
+  const mock = (ref) => ({ first: () => ({ json: ref === 'Google LINK from phone1'
+    ? { body: { link: 'https://docs.google.com/spreadsheets/d/SHEETID123/edit', user_id: JOB_ID } } : { id: JOB_ID } }) });
+  const p = new Function('$', '$json', 'return ' + expr)(mock, mapped[1]);
+  assert.strictEqual(p[8], `sheet:SHEETID123:${TERM}:2`, 'task id unchanged (rows stored before 021 still match)');
+  assert.strictEqual(p[10], '5', 'row_no = the Google Sheets row');
+  assert.strictEqual(p.length, 13);
+});
+
+const resRow = (result, row_no) => ({ result, row_no });
+function newFormJob(saveItems, mapRows) {
+  const nodes = sheetJobNodes({ 'Map to Target Format': { items: mapRows }, 'Save New Form Row': { items: saveItems } });
+  for (const k of ['Code in JavaScript', 'Insert or update rows in a table1', 'Insert import_errors1', 'Group feedback by instructor1',
+    'Unified AI Analysis1', 'Parse Unified AI Result1', 'insert data to student remarks2', 'store results2', 'insert to word cloud2',
+    'update to overall total2']) delete nodes[k];
+  return nodes;
+}
+const setMap = (n, unmatchedAt = []) => Array.from({ length: n }, (_, i) => ({
+  instrument: 'SET-15', current_term_id: TERM, sheet_row: i + 1, sheet_row_no: i + 2,
+  instructor_ID: unmatchedAt.includes(i + 2) ? null : INSTR, true_subject_id: SUBJ }));
+test('Re-import (incident 2026-10-30): the same 40-row SET sheet again = 0 new, 38 already imported (skipped, not errors), 2 refused', async () => {
+  // sheet rows 2..41; row 39 unmatched (never reaches the save); row 38 a bad rating; every other row is stored already
+  const map = setMap(40, [39]);
+  const saves = map.filter((r) => r.instructor_ID).map((r) => (r.sheet_row_no === 38
+    ? resRow({ saved: false, reason: 'invalid_rating', item_no: 4 }, r.sheet_row_no)
+    : resRow({ saved: false, reason: 'already_imported', match: r.sheet_row_no < 30 ? 'task_id' : 'stamp', response_id: r.sheet_row_no }, r.sheet_row_no)));
+  const s = (await runJob('Sheet Import Summary', newFormJob(saves, map), { lenient: true }))[0].json;
+  assert.deepStrictEqual([s.rows, s.matched, s.unmatched, s.imported_count, s.error_count], [40, 39, 1, 0, 2]);
+  assert.strictEqual(s.term_id, TERM);
+  const d = s.details;
+  assert.deepStrictEqual(Object.keys(d), ['form_type', 'term_label', 'rows', 'new', 'already_imported', 'excluded_under_5', 'rejected', 'reasons']);
+  assert.deepStrictEqual([d.form_type, d.term_label, d.rows, d.new, d.already_imported, d.excluded_under_5, d.rejected],
+    ['SET-15', null, 40, 0, 38, 0, 2]);
+  assert.strictEqual(d.new + d.already_imported + d.rejected, d.rows);
+  assert.deepStrictEqual(d.reasons.map((r) => [r.reason, r.kind, r.count]),
+    [['already_imported', 'skipped', 38], ['unmatched', 'rejected', 1], ['invalid_rating', 'rejected', 1]]);
+  const already = d.reasons[0];
+  assert.strictEqual(already.plain_text, 'already imported earlier – skipped');
+  assert.deepStrictEqual(already.rows, Array.from({ length: 40 }, (_, i) => i + 2).filter((r) => r !== 38 && r !== 39));
+  assert.deepStrictEqual(d.reasons[1].rows, [39]);
+  assert.deepStrictEqual(d.reasons[2].rows, [38]);
+  for (const r of d.reasons) assert.deepStrictEqual(Object.keys(r), ['reason', 'kind', 'plain_text', 'count', 'rows']);
+  assert.ok(/^Import finished: 0 of 40 rows saved, 38 already imported earlier – skipped \(row 2, 3, 4, 5, 6, 7, 8, 9, \.\.\.\)/.test(s.message), s.message);
+  assert.ok(/1 unmatched rows sent to Import Errors/.test(s.message) && /Not saved: 1 not saved: a rating that is not 1 to 5 \(row 38\)/.test(s.message), s.message);
+  assert.ok(!/already imported[^;]*Not saved/.test(s.message.split('Not saved:')[1] || ''), 'already imported is not listed as not saved');
+  assert.ok(!/student|2021-/i.test(JSON.stringify(d)), 'no student id in details');
+});
+test('First import: details count new (incl. under-5), refused reasons with sheet rows; imported = new, errors = refused only', async () => {
+  const map = setMap(6, [7]);
+  const saves = [
+    resRow({ saved: true, counted: true, updated: false }, 2), resRow({ saved: true, counted: false }, 3),
+    resRow({ saved: false, reason: 'duplicate_student' }, 4), resRow({ saved: false, reason: 'duplicate_stamp', duplicate_of: { source: 'sast' } }, 5),
+    { error: 'boom', row_no: 6 },
+  ];
+  const s = (await runJob('Sheet Import Summary', newFormJob(saves, map), { lenient: true }))[0].json;
+  const d = s.details;
+  assert.deepStrictEqual([s.imported_count, s.error_count, d.new, d.already_imported, d.excluded_under_5, d.rejected], [2, 4, 2, 0, 1, 4]);
+  assert.deepStrictEqual(d.reasons.map((r) => [r.reason, r.kind, r.rows]),
+    [['excluded_under_5', 'excluded', [3]], ['unmatched', 'rejected', [7]], ['duplicate_student', 'rejected', [4]],
+      ['duplicate_stamp', 'rejected', [5]], ['database_error', 'rejected', [6]]]);
+  assert.ok(!/already imported/.test(s.message), s.message);
+  assert.ok(/2 of 6 rows saved/.test(s.message) && /this stamp number was already used this term \(row 5\)/.test(s.message), s.message);
+});
+test('Old SAST sheet: details too (form_type SAST-20, unmatched rows by sheet row, failed saves counted)', async () => {
+  const nodes = sheetJobNodes({
+    'Map to Target Format': { items: [{ instructor_ID: INSTR, true_subject_id: SUBJ, current_term_id: TERM }, { instructor_ID: '', true_subject_id: SUBJ },
+      { instructor_ID: INSTR, true_subject_id: SUBJ }, { instructor_ID: INSTR, true_subject_id: SUBJ }, { instructor_ID: INSTR, true_subject_id: SUBJ }] },
+    'Insert or update rows in a table1': { runs: [[[{ id: 1 }, { error: 'duplicate key' }]], [[{ id: 3 }, { id: 4 }]]] },
+  });
+  const s = (await runJob('Sheet Import Summary', nodes))[0].json;
+  const d = s.details;
+  assert.deepStrictEqual([d.form_type, d.rows, d.new, d.already_imported, d.rejected, s.imported_count, s.error_count], ['SAST-20', 5, 3, 0, 2, 3, 2]);
+  assert.deepStrictEqual(d.reasons.map((r) => [r.reason, r.count, r.rows]), [['unmatched', 1, [3]], ['database_error', 1, []]]);
+  assert.strictEqual(s.term_id, TERM);
+});
+test('Mark Import Job Done writes details (+ term_label from academic_terms) and keeps the old message', () => {
+  const n = wf.nodes.find((x) => x.name === 'Mark Import Job Done');
+  const q = n.parameters.query;
+  assert.ok(/details = CASE WHEN \$12::jsonb = '\{\}'::jsonb THEN details/.test(q), 'no details: column kept');
+  assert.ok(/jsonb_set\(\$12::jsonb, '\{term_label\}'/.test(q) && /public\.academic_terms/.test(q) && /\$13::text/.test(q));
+  assert.ok(/message = CASE/.test(q) && /imported_count = \$5::int/.test(q) && /error_count = \$6::int/.test(q));
+  assert.ok(!/\$1[4-9]/.test(q), '13 parameters');
+});
+
+function if28Fires($json) {
+  const c = wf.nodes.find((x) => x.name === 'If28').parameters.conditions;
+  assert.strictEqual(c.combinator, 'or');
+  return c.conditions.some((cond) => {
+    const m = /^=\{\{([\s\S]*)\}\}$/.exec(cond.leftValue.trim());
+    assert.deepStrictEqual(cond.operator, { type: 'boolean', operation: 'true', singleValue: true });
+    return new Function('$json', `return (${m[1]});`)($json) === true;
+  });
+}
+test('SET low-score push: once per instructor per import, pooled overall_pct < 60, SET-15 only, no student data', async () => {
+  const A = INSTR, B = SUBJ, C = STAFF, D = ANA, E = '99999999-0000-4000-8000-000000000009';
+  const src = (instrument, instructor) => ({ instrument, instructor_ID: instructor, current_term_id: TERM, true_subject_id: SUBJ,
+    details: { student_id: '2021-0001' }, 'Remarks & Suggestions': 'secret comment' });
+  const ok = (pct, extra = {}) => ({ result: { saved: true, instrument: extra.instrument || 'SET-15', counted: true,
+    result: { respondents: 3, overall_mean: pct === null ? null : pct / 20, overall_pct: pct, verbal_label: 'x' } } });
+  const sources = [src('SET-15', A), src('SET-15', B), src('SET-15', A), src('SUP-15', C), src('SET-15', D), src('SET-15', E), src('SET-15', B)];
+  const saved = [ok(70), ok(75), ok(55.5), ok(40, { instrument: 'SUP-15' }),
+    { result: { saved: false, reason: 'already_imported', response_id: 9 } }, ok(null),
+    { result: { saved: false, reason: 'invalid_rating' } }];
+  const $ = (ref) => { assert.strictEqual(ref, 'Sheet New Form?'); return { all: () => sources.map((json) => ({ json })) }; };
+  const fn = new AsyncFunction('$', '$input', codeOf('SET Low Score Push'));
+  const out = (await fn($, { all: () => saved.map((json, i) => ({ json, pairedItem: { item: i } })) })).map((o) => o.json);
+  assert.deepStrictEqual(out, [{ set_low_score: true, instrument: 'SET-15', instructor_id: A, term_id: TERM, overall_pct: 55.5,
+    overall_mean: 2.775, respondents: 3 }], 'A once (its LAST pooled value); B 75 %; C supervisor; D nothing new; E no score');
+  assert.ok(!/2021-0001|secret/.test(JSON.stringify(out)));
+  // 60 % exactly is not low; a re-import that saves nothing sends nothing
+  assert.deepStrictEqual(await fn($, { all: () => [{ json: ok(60), pairedItem: { item: 0 } }] }), []);
+  assert.deepStrictEqual(await fn($, { all: () => [{ json: { result: { saved: false, reason: 'already_imported' } }, pairedItem: { item: 0 } }] }), []);
+  // If28 (the same push): fires for that item, and still for the SAST mean only below 3
+  assert.strictEqual(if28Fires(out[0]), true);
+  assert.strictEqual(if28Fires({ ...out[0], overall_pct: 60 }), false);
+  assert.strictEqual(if28Fires({ ...out[0], overall_pct: null }), false);
+  assert.strictEqual(if28Fires({ overall_pct: 10, instructor_id: A }), false, 'only SET Low Score Push items count');
+  assert.strictEqual(if28Fires({ combined_score_mean: '2.5', instructor_id: A }), true);
+  assert.strictEqual(if28Fires({ combined_score_mean: null, instructor_id: A }), false);
+  assert.strictEqual(if28Fires({ combined_score_mean: 3, instructor_id: A }), false);
+});
+test('SET low-score push: wiring (Save New Form Row -> SET Low Score Push -> If28 -> the existing FCM push; summary still last)', () => {
+  const tgt = (n, i = 0) => ((wf.connections[n] || {}).main[i] || []).map((c) => c.node);
+  assert.deepStrictEqual(tgt('SET Low Score Push'), ['If28']);
+  assert.deepStrictEqual(tgt('If28'), ['who is the departmeht head5', "Get the Phone's Token from Supabase5"]);
+  for (const n of ['who is the departmeht head5', "Get the Phone's Token from Supabase5"]) {
+    assert.ok(/\$json\.instructor_id/.test(wf.nodes.find((x) => x.name === n).parameters.options.queryReplacement), n + ' reads instructor_id');
+  }
+  const node = wf.nodes.find((x) => x.name === 'SET Low Score Push');
+  assert.ok(!node.parameters.mode || node.parameters.mode === 'runOnceForAllItems');
+  const pos = (name) => wf.nodes.find((x) => x.name === name).position;
+  assert.ok(pos('Sheet Import Summary')[1] > pos('SET Low Score Push')[1]);
+  assert.ok(!/student_id|Student ID|Remarks|first_name|last_name/.test(node.parameters.jsCode.replace(/^\/\/.*$/gm, '')));
+});
+test('Migration 021: save_eval_response keeps 16 args and skips rows from an earlier import (task_id, supervisor, stamp, student) as already_imported', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '021_eval_import_skip.sql'), 'utf8');
+  assert.ok(/create or replace function public\.save_eval_response\(\s*p_instrument_code text, p_instructor_id text, p_subject_id text, p_term_id text, p_answers jsonb,\s*p_comments text, p_source text, p_stamp_no text default null, p_stamp_source text default null,\s*p_evaluator_user_id text default null, p_import_job_id text default null, p_task_id text default null,\s*p_created_by text default null, p_status text default 'submitted', p_recompute boolean default true,\s*p_details jsonb default null\)/.test(sql));
+  assert.ok(!/drop function/i.test(sql), 'no drop: same signature, grants kept');
+  assert.ok(/v_old\.import_job_id is distinct from v_job/.test(sql) && /'match', 'stamp'/.test(sql) && /'match', 'student_id'/.test(sql));
+  assert.ok(/x\.instrument_id = v_inst\.id and x\.instructor_id = v_instructor\s+and x\.subject_id is not distinct from v_subject/.test(sql), 'stamp skip only on the same instrument + instructor + subject');
+  assert.ok(/return jsonb_build_object\('saved', false, 'reason', 'duplicate_student'\)/.test(sql) && /'reason', 'duplicate_stamp'/.test(sql));
+  assert.ok(/add column if not exists details jsonb/.test(sql));
+  const body = sql.slice(0, sql.indexOf('-- Verification'));
+  assert.ok(/\nrollback;\n-- commit;/.test(body), 'preview first (016-020 convention)');
+  assert.ok(/^[\x00-\x7f]*$/.test(sql), 'ASCII only, like 019 / 020');
 });
 
 (async () => {

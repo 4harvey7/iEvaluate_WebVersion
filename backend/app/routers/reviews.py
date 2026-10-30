@@ -427,6 +427,8 @@ def _serialize_queue(sb, row: dict, batch: dict, user: CurrentUser | None = None
 # ------------------------------------------------------------------ stamp numbers (migration 015)
 RAW = "sast_all_raw_data_survey"
 RAW_DUP_COLUMNS = "id, task_id, submitted_date, instructor_ID, subject_id, term_id, stamp_no"
+EVAL_RESPONSES = "eval_responses"
+EVAL_DUP_COLUMNS = "id, task_id, instructor_id, subject_id, term_id, stamp_no"
 
 
 def _in_chunks(sb, table: str, cols: str, col: str, values: list[str]) -> list[dict]:
@@ -518,6 +520,13 @@ def _stamp_duplicate(sb, term_id: str | None, stamp_no: str | None, task_id: str
         if task_id is not None and r.get("task_id") == task_id:
             continue
         return rl.duplicate_from_raw(r)
+    # A SET / supervisor form imported from a sheet keeps its stamp in eval_responses.
+    evals = (sb.table(EVAL_RESPONSES).select(EVAL_DUP_COLUMNS).eq("term_id", term_id).eq("stamp_no", stamp_no)
+             .limit(5).execute().data or [])
+    for r in evals:
+        if task_id is not None and r.get("task_id") == task_id:
+            continue
+        return rl.duplicate_from_eval_response(r)
     return None
 
 
