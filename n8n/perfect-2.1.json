@@ -208,6 +208,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "sast-link-upload",
+        "authentication": "headerAuth",
         "responseMode": "responseNode",
         "options": {}
       },
@@ -219,7 +220,13 @@
       ],
       "id": "d412a0e3-884f-4066-a278-76e515a386b2",
       "name": "Google LINK from phone1",
-      "webhookId": "9aa52ace-0a79-4d51-a5b6-a382201efc45"
+      "webhookId": "9aa52ace-0a79-4d51-a5b6-a382201efc45",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cGPn1nyAiZqSUx40",
+          "name": "iEvaluate website webhook secret"
+        }
+      }
     },
     {
       "parameters": {
@@ -794,6 +801,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "sast-manual-correction",
+        "authentication": "headerAuth",
         "responseMode": "responseNode",
         "options": {}
       },
@@ -805,7 +813,13 @@
       ],
       "id": "b92325dc-6324-4e1d-915d-072edf90960b",
       "name": "sast-manual-correction1",
-      "webhookId": "0fdecc61-4efa-4586-a5d6-393817ad1788"
+      "webhookId": "0fdecc61-4efa-4586-a5d6-393817ad1788",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cGPn1nyAiZqSUx40",
+          "name": "iEvaluate website webhook secret"
+        }
+      }
     },
     {
       "parameters": {
@@ -995,6 +1009,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "import-error-correction",
+        "authentication": "headerAuth",
         "responseMode": "responseNode",
         "options": {}
       },
@@ -1006,7 +1021,13 @@
       ],
       "id": "00608c0b-1aa6-419d-8d3c-bf4abdfd20fc",
       "name": "import-error-correction1",
-      "webhookId": "1d89d57b-57f3-4796-abf3-0a99e6c4b22f"
+      "webhookId": "1d89d57b-57f3-4796-abf3-0a99e6c4b22f",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cGPn1nyAiZqSUx40",
+          "name": "iEvaluate website webhook secret"
+        }
+      }
     },
     {
       "parameters": {
@@ -1229,6 +1250,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "subject-bulk-import",
+        "authentication": "headerAuth",
         "responseMode": "responseNode",
         "options": {}
       },
@@ -1240,7 +1262,13 @@
         -33968,
         30768
       ],
-      "webhookId": "2891ca56-e68d-49ae-8a26-9a9a3f4609ec"
+      "webhookId": "2891ca56-e68d-49ae-8a26-9a9a3f4609ec",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cGPn1nyAiZqSUx40",
+          "name": "iEvaluate website webhook secret"
+        }
+      }
     },
     {
       "parameters": {
@@ -2789,6 +2817,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "sast-scan-upload",
+        "authentication": "headerAuth",
         "responseMode": "responseNode",
         "options": {}
       },
@@ -2800,7 +2829,13 @@
       ],
       "id": "bdf9fdc3-5d6a-466a-8d18-ddd944515f7a",
       "name": "SAST image from phone",
-      "webhookId": "f8442f46-2566-41d2-b5d8-ff13ddb61bec"
+      "webhookId": "f8442f46-2566-41d2-b5d8-ff13ddb61bec",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cGPn1nyAiZqSUx40",
+          "name": "iEvaluate website webhook secret"
+        }
+      }
     },
     {
       "parameters": {
