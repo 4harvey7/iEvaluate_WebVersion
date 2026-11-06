@@ -862,7 +862,7 @@ def main(argv):
     if strip_comments(src_sql("known_names.sql")) != strip_comments(src_sql("website_known_names.sql")):
         known_bad.append("known_names.sql and website_known_names.sql must be the same subjects-only query")
     for name, needle in (("Website Decide", "String(rec.known_subject || '')"),
-                         ("reconcile ocr and omr1", "nmBestInstructor(rawInstructor, instructorCands, ")):
+                         ("reconcile ocr and omr1", "nmBestInstructor([rawInstructor, ...otherReadings], instructorCands, ")):
         code = by_name[name]["parameters"].get("jsCode", "")
         i = code.find(NM_START)
         j = code.find(NM_END, i)

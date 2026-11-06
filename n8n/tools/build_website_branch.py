@@ -153,6 +153,19 @@ What it does
      (white ink) -> white_ink_correction. Review only; an older OMR without ocr_meta.ink changes nothing.
      INVALID_MARK_TEXT names the OMR's new 'double' mark. Both Gemini prompts get WHITE_INK_LINE and a
      required corrected_rows array.
+ 12. Outside mark (apply_outside_mark; idempotent; 2026-11-06): INVALID_MARK_TEXT names the OMR's
+     'outside' mark (a check in a header row; the row stays null, never filled from Gemini) and both
+     Gemini prompts get OUTSIDE_LINE after the count-rows rule.
+ 13. Instructor readings (apply_instructor_readings; idempotent; 2026-11-06): both Gemini prompts ask for an
+     optional instructor_readings array (up to 3 other spellings of the handwritten name, no list given).
+     'Phone Instructor Candidates' also returns per person the subject codes linked this term; the phone
+     reconciler scores every reading (plus a sound-alike spelling) and ranks a person linked to the subject
+     on the form higher (name_match.js nmBestInstructor). Website Decide is unchanged (batch instructor).
+     --live first runs scrub_instructor_list (removes an instructor list sent to Gemini from a live export)
+     and skips apply_sast_v2 when it is already applied.
+ 14. Student ID check (apply_student_id_rule; idempotent; 2026-11-06, ported from the user's live export):
+     both prompts get STUDENT_ID_RULE (? for an unclear digit); both reconcilers keep only 6 to 12 digits,
+     else student_id_invalid (review).
 """
 from __future__ import annotations
 
@@ -2270,6 +2283,15 @@ def flagged_respond_expression() -> str:
         "message: 'Discarded automatically: this form was already scanned (stamp ' + (pr.stamp_no || '?') "
         "+ '), so it is not counted.' }); "
         "} "
+        # phone min-answered auto-discard (2026-11-06, the user's hand edit in perfect-2.1.json, kept here)
+        "if (!failed && rc && rc.rule === 'min_answered_5') { "
+        "const om = parseInt(String(rc.note || '').split('(only ')[1], 10); "
+        "return JSON.stringify({ status: 'discarded', flagged: true, auto_rejected: 'min_answered_5', "
+        "task_id: String(pr.task_id || ''), stamp_no: (pr.stamp_no || null), "
+        "review_reasons: (Array.isArray(pr.review_reasons) ? pr.review_reasons : []), "
+        "message: 'Discarded automatically: fewer than 5 of the 20 items were answered' "
+        "+ (Number.isInteger(om) ? ' (only ' + om + ')' : '') + ', so this form is not counted.' }); "
+        "} "
         f"return {phone_literal}; "
         "} "
         "const reasons = Array.isArray(w.review_reasons) ? w.review_reasons.slice() : []; "
@@ -3717,6 +3739,123 @@ def apply_ocr_crosscheck(out) -> list[str]:
     return done
 
 
+# Marks outside the answer rows (2026-11-06, OMR mark_detect OMR_OUTSIDE_MARK): a check in a header row
+# is no answer. The OMR sends II.1 as invalid_mark 'outside' (null, never filled from Gemini; both
+# reconcilers name it via INVALID_MARK_TEXT), and both main Gemini prompts get OUTSIDE_LINE, so Gemini
+# does not move such a mark to the row below either.
+OUTSIDE_ANCHOR = "- Count rows in printed order; never skip a blank row or shift numbering to fill a gap."
+OUTSIDE_LINE = ("- A mark in a header row (the O/VS/S/F/US column headings, 'I. Management', 'II. Performance') "
+                "or in the Remarks row is not an answer: never count it for the row below or above it.")
+
+
+def apply_outside_mark(out) -> list[str]:
+    """Idempotent; full build and live export; after apply_ocr_crosscheck (it refreshes the reconcilers).
+    OUTSIDE_LINE goes right after the count-rows rule (OUTSIDE_ANCHOR). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        if OUTSIDE_LINE not in gem["jsonBody"]:
+            gem["jsonBody"] = replace_once(gem["jsonBody"], OUTSIDE_ANCHOR + r"\n",
+                                           OUTSIDE_ANCHOR + r"\n" + OUTSIDE_LINE + r"\n", name)
+            done.append(f"{name}: outside-mark prompt line")
+        if gem["jsonBody"].count(OUTSIDE_LINE) != 1:
+            raise SystemExit(f"{name}: outside-mark line not exactly once")
+    for name in (WEB_RECONCILE, PHONE_RECONCILE):
+        if "outside: 'a mark outside the answer rows'" not in by_name[name]["parameters"]["jsCode"]:
+            raise SystemExit(f"{name}: INVALID_MARK_TEXT lacks 'outside' (website_src not applied?)")
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+# Instructor readings (2026-11-06): Gemini gives alternative spellings of the handwritten instructor name,
+# read without any list (privacy); matched locally in the phone reconciler (name_match.js).
+READINGS_ANCHOR = "1. instructor: full name with credentials, as written."
+READINGS_LINE = (r"\n   instructor_readings: up to 3 other ways the handwritten instructor name could be spelled, "
+                 "best first, each read from the handwriting alone (do not repeat instructor); [] when the name "
+                 "is clear or blank.")
+READINGS_SCHEMA_ANCHOR = '"known_subject": { "type": "STRING" },'
+READINGS_SCHEMA = '"instructor_readings": { "type": "ARRAY", "items": { "type": "STRING" } },\n        '
+
+
+# A live export with the instructor name list sent to Gemini (user's test, 2026-11-06: SEND_INSTRUCTORS block,
+# known_instructor, instructor_names/instructor_list in both Known Names queries). Privacy rule: removed.
+SEND_INSTRUCTORS_EXPR_RE = re.compile(r"\{\{ JSON\.stringify\(\(\(\) => \{ try \{ const SEND_INSTRUCTORS = "
+                                      r"[\s\S]*?\.slice\(1, -1\) \}\}")
+
+
+def scrub_instructor_list(out) -> list[str]:
+    """Idempotent; live export only, before every other step (they assert no instructor names to Gemini).
+    Both prompts lose the SEND_INSTRUCTORS block and known_instructor; both Known Names queries go back to
+    the subjects-only SQL. The reconcilers / Website Decide are refreshed from website_src later."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        body = SEND_INSTRUCTORS_EXPR_RE.sub("", gem["jsonBody"]).replace(OLD_PHONE_KNOWN_SCHEMA, "")
+        if body != gem["jsonBody"]:
+            gem["jsonBody"] = body
+            done.append(f"{name}: instructor list and known_instructor removed")
+    for name, src in ((PHONE_KNOWN_NAMES, "known_names.sql"), (WEB_KNOWN_NAMES, "website_known_names.sql")):
+        q = by_name[name]["parameters"]
+        if "instructor_list" in q.get("query", ""):
+            q["query"] = read(src)
+            done.append(f"{name}: {src} (subjects only)")
+    return done
+
+
+def apply_instructor_readings(out) -> list[str]:
+    """Idempotent; full build and live export. Both prompts: READINGS_LINE + optional schema field;
+    'Phone Instructor Candidates' refreshed from phone_instructor_candidates.sql (the reconcilers and
+    name_match.js copies are refreshed by the earlier steps). Returns what changed."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        if READINGS_LINE not in gem["jsonBody"]:
+            body = replace_once(gem["jsonBody"], READINGS_ANCHOR, READINGS_ANCHOR + READINGS_LINE, name)
+            gem["jsonBody"] = replace_once(body, READINGS_SCHEMA_ANCHOR, READINGS_SCHEMA + READINGS_SCHEMA_ANCHOR, name)
+            done.append(f"{name}: instructor_readings (prompt + optional schema field)")
+        if gem["jsonBody"].count(READINGS_LINE) != 1 or gem["jsonBody"].count('"instructor_readings": {') != 1:
+            raise SystemExit(f"{name}: instructor_readings not exactly once")
+    cand = by_name[PHONE_CANDIDATES]["parameters"]
+    sql = read("phone_instructor_candidates.sql")
+    if cand.get("query") != sql:
+        assert_no_param_in_sql_comments(PHONE_CANDIDATES, sql)
+        cand["query"] = sql
+        done.append(f"{PHONE_CANDIDATES}: phone_instructor_candidates.sql (subject links this term)")
+    if "instructor_readings" not in by_name[PHONE_RECONCILE]["parameters"]["jsCode"]:
+        raise SystemExit(f"{PHONE_RECONCILE}: not the current phone_reconcile.js (instructor_readings)")
+    assert_no_instructor_names_to_gemini(out)
+    return done
+
+
+# Student ID (2026-11-06, ported from the user's live export 'BUTITI NA KAAYO NI'): digit by digit, ? when
+# unclear; the reconcilers keep only 6 to 12 digits, else student_id_invalid.
+STUDENT_ID_OLD = "6. student_id: digits only."
+STUDENT_ID_RULE = (r"6. student_id: the student ID written in the ID box, digits only. Keep leading zeros and remove "
+                   r"spaces, dashes and dots.\n   - Read each digit one by one.\n   - If a digit is unclear (for "
+                   r"example 1 vs 7, 0 vs 6 vs 9, 3 vs 8, 4 vs 9, 5 vs 6), write ? for that digit. Never guess.\n"
+                   r"   - Never add, drop or invent digits to make the ID look complete.\n   - Do NOT use the stamp "
+                   r"number, the date, the section, a phone number or a rating as the student ID.\n   - If the ID box "
+                   r"is empty, return an empty string.")
+
+
+def apply_student_id_rule(out) -> list[str]:
+    """Idempotent; full build and live export; after every step that anchors on STUDENT_ID_OLD."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        if STUDENT_ID_RULE not in gem["jsonBody"]:
+            gem["jsonBody"] = replace_once(gem["jsonBody"], STUDENT_ID_OLD, STUDENT_ID_RULE, name)
+            done.append(f"{name}: student ID rule")
+    for name in (WEB_RECONCILE, PHONE_RECONCILE):
+        if "'student_id_invalid'" not in by_name[name]["parameters"]["jsCode"]:
+            raise SystemExit(f"{name}: no student ID check (website_src not applied?)")
+    return done
+
+
 def live_main(argv):
     """--live LIVE_EXPORT [OUTPUT]: apply only the migration-013 step (apply_sast_v2) to a live n8n
     export of this build. Everything else (node ids, positions, credentials, name, id, versionId,
@@ -3729,7 +3868,9 @@ def live_main(argv):
         raise SystemExit("output must differ from the live export (the export is never modified)")
     wf = json.loads(src.read_text(encoding="utf-8"))
     out = copy.deepcopy(wf)
-    apply_sast_v2(out)
+    scrubbed = scrub_instructor_list(out)
+    if any(n["name"] in SAST_DEAD_NODES for n in out["nodes"]):   # an export from before migration 013
+        apply_sast_v2(out)
     privacy = apply_phone_name_privacy(out)
     check_only = apply_check_only_rule(out)
     min_answers = apply_min_answers_rule(out)
@@ -3745,15 +3886,18 @@ def live_main(argv):
     jobs = apply_sheet_import_jobs(out)
     corr_match = apply_correction_name_match(out)
     crosscheck = apply_ocr_crosscheck(out)
+    outside = apply_outside_mark(out)
+    readings = apply_instructor_readings(out)
+    student_id = apply_student_id_rule(out)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(f"input : {src} (name {wf.get('name')!r}, id {wf.get('id')}, versionId {wf.get('versionId')})")
     print(f"output: {dst}")
-    print(f"nodes : {len(wf['nodes'])} -> {len(out['nodes'])} (removed {len(SAST_DEAD_NODES)}: "
-          f"{', '.join(SAST_DEAD_NODES)})")
+    print(f"nodes : {len(wf['nodes'])} -> {len(out['nodes'])}")
     print(f"flow  : {RAW_UPSERT_GATE} -> {SAST_PAIRS} -> {SAST_RECOMPUTE} (recompute_sast) -> {SAST_ALERT_IF}")
     print(f"null ratings: {CODE_IN_JS}, {FORMAT_FINAL}, {PHONE_MAP}, {WEBSITE_MAP}, {CORRECTION_BUILD}, "
           f"{', '.join(CORRECTION_MAPS)}")
+    print("instructor list scrub: " + ("; ".join(scrubbed) if scrubbed else "none found"))
     print("phone name privacy: " + ("; ".join(privacy) if privacy else "already applied"))
     print("check-only rule: " + ("; ".join(check_only) if check_only else "already applied"))
     print("min-answered rule: " + ("; ".join(min_answers) if min_answers else "already applied"))
@@ -3769,6 +3913,9 @@ def live_main(argv):
     print("sheet import jobs: " + ("; ".join(jobs) if jobs else "already applied"))
     print("correction name match: " + ("; ".join(corr_match) if corr_match else "already applied"))
     print("ocr cross-check: " + ("; ".join(crosscheck) if crosscheck else "already applied"))
+    print("outside mark: " + ("; ".join(outside) if outside else "already applied"))
+    print("instructor readings: " + ("; ".join(readings) if readings else "already applied"))
+    print("student id rule: " + ("; ".join(student_id) if student_id else "already applied"))
     return 0
 
 
@@ -3864,6 +4011,9 @@ def main(argv):
     apply_stamp_rule(out)
     apply_correction_name_match(out)   # unresolved instructor/subject -> 422, queue row stays pending
     apply_ocr_crosscheck(out)          # AI student ID / remark vs OMR ink, white-ink rows, double marks
+    apply_outside_mark(out)            # a check in a header row is no answer (OMR 'outside', prompt line)
+    apply_instructor_readings(out)     # alternative instructor spellings + subject links, matched locally
+    apply_student_id_rule(out)         # ? for an unclear ID digit; reconcilers keep 6 to 12 digits only
 
     # 5d. word cloud words (real word counts next to the AI themes)
     apply_wordcloud_words(out)

@@ -125,6 +125,15 @@ function stCheckStamp(gemini, geminiOk, sc) {
   const pyOne = py.ran && py.numbers.length === 1 ? py.numbers[0] : null;
   const unconfirmed = (why, hint) => Object.assign(res, { stamp_no: null, stamp_status: 'unconfirmed',
     stamp_hint: hint || null, stamp_check: { ...check, why } });
+  // Python is the source of truth (2026-11-06, from the user's live export): when the Python reader found
+  // exactly one complete stamp that passes the format rule, use it even if the AI read something else
+  // or nothing. Several stamps seen by Python still go to review.
+  if (py.ran && py.numbers.length === 1 && py.stamp_like === 1 && stFormatOk(py.numbers[0])) {
+    check.agreed = true;
+    check.why = 'python_trusted';
+    return Object.assign(res, { stamp_no: py.numbers[0], stamp_status: 'ok', stamp_candidates: [py.numbers[0]],
+      stamp_hint: null, stamp_source: 'gemini+python', stamp_check: check });
+  }
   if (g.stamp_status === 'missing') {
     if (pyOne) return unconfirmed('gemini_none_python_read', pyOne);
     check.why = 'none';

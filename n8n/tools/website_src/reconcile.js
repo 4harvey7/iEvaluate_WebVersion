@@ -16,7 +16,8 @@ const WEAK_MARGIN       = 0.02;
 const WEAK_ROW_LIMIT    = 4;
 const WEAK_BLANK_LIMIT    = 3;    // website only
 const WEAK_DISAGREE_LIMIT = 3;    // website only
-const INVALID_MARK_TEXT = { x: 'an x', shade: 'a shaded bubble', circle: 'a circle', dot: 'a dot', double: 'two marks' };
+const INVALID_MARK_TEXT = { x: 'an x', shade: 'a shaded bubble', circle: 'a circle', dot: 'a dot', double: 'two marks',
+  outside: 'a mark outside the answer rows' };
 const FALLBACK_GRID_SOURCE  = 'fallback';
 const CRITICAL_QUALITY_ISSUES = ['low_light', 'scribbled_grid', 'damaged_form'];
 const AGREEMENT_MIN_ROWS = Math.ceil(AGREEMENT_MIN * TOTAL_ROWS - 1e-9);   // 0.30 -> 6 of 20
@@ -347,6 +348,15 @@ if (geminiCallFailed) {
   noteParts.push('The AI cross-check did not return a result for this scan, so the OMR reading has not been verified against a second source and no text (student ID, remarks, date) was read. Please check it manually.');
 }
 
+// student ID check (2026-11-06, from the user's live export): Gemini writes ? for an unclear digit;
+// anything but 6 to 12 digits is not kept and goes to review (scanned IDs in the database are 6 to 9 digits)
+const sidRaw = String(gText('student_id') ?? '').replace(/\s+/g, '');
+const SID_RE = /^[0-9]{6,12}$/;
+const sidValid = SID_RE.test(sidRaw);
+if (sidRaw && !sidValid) {
+  reasons.push('student_id_invalid');
+  noteParts.push(`The student ID was read as "${sidRaw.slice(0, 20)}", which is not a valid ID (unclear digits or wrong length). Type it from the sheet.`);
+}
 const needsReview = reasons.length > 0;
 // always show agreement on flagged pages
 if (needsReview && agreementText && !reasons.some((r) => r.startsWith('omr_agreement_below_'))) {
@@ -368,7 +378,7 @@ return [{
     remarks_masked: remarkResult.masked,
     remark_check: remarkResult.check,
     date: clean(gText('date')).slice(0, 50),
-    student_id: ocrCheck.drop_student_id ? '' : clean(gText('student_id')).replace(/\s+/g, '').slice(0, 50),
+    student_id: ocrCheck.drop_student_id || !sidValid ? '' : sidRaw,
     ocr_check: ocrCheck.check,
     text_source: geminiOk ? 'gemini' : 'none',
     stamp_no: stamp.stamp_no,                 // the one stamp read on the page (status 'ok'), else null

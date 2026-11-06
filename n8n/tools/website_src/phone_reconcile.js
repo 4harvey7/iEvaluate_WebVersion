@@ -15,12 +15,15 @@ const FLAG_DIFF_MARGIN  = 2;  // levels apart for a real conflict (S vs VS is no
 const WEAK_TOP_SCORE    = 0.05;
 const WEAK_MARGIN       = 0.02;
 const WEAK_ROW_LIMIT    = 4;  // review if Python is unsure on this many rows
-const INVALID_MARK_TEXT = { x: 'an x', shade: 'a shaded bubble', circle: 'a circle', dot: 'a dot', double: 'two marks' };
+const INVALID_MARK_TEXT = { x: 'an x', shade: 'a shaded bubble', circle: 'a circle', dot: 'a dot', double: 'two marks',
+  outside: 'a mark outside the answer rows' };
 const CRITICAL_QUALITY_ISSUES = ['low_light', 'scribbled_grid', 'damaged_form']; // both engines can agree on the same wrong answer
 const AGREEMENT_MIN_ROWS = Math.ceil(AGREEMENT_MIN * TOTAL_ROWS - 1e-9);   // 0.30 -> 6 of 20
 const AGREEMENT_MIN_PCT  = Math.round(AGREEMENT_MIN * 100);
 const INSTRUCTOR_MATCH_MIN    = 0.70;   // local instructor match (same as Website Decide's NAME_MATCH_MIN)
 const INSTRUCTOR_MATCH_MARGIN = 0.10;   // best must beat the next by this (Website Decide's MATCH_MARGIN)
+const INSTRUCTOR_SUBJECT_BONUS = 0.10;  // ranking bonus for an instructor linked this term to the subject on the form
+const INSTRUCTOR_READINGS_MAX  = 3;     // Gemini's alternative spellings of the name (instructor_readings)
 
 const LETTER_TO_SCORE = { O: 5, VS: 4, S: 3, F: 2, US: 1 };
 const SCORE_TO_LETTER = { 5: 'O', 4: 'VS', 3: 'S', 2: 'F', 1: 'US' };
@@ -201,21 +204,30 @@ const gText = (k) => {
 // matched locally against the creditable instructors ('Phone Instructor Candidates'). Only a clear
 // match replaces it (exact database name, so 'get instructor id6' finds it); several close matches
 // flag the scan for review; no match keeps the raw reading for 'get instructor id6' as before (not
-// found there -> import error, reviewed by staff).
+// found there -> import error, reviewed by staff). Every reading counts (instructor + Gemini's
+// instructor_readings, read without any list), plus a sound-alike spelling; a person linked this
+// term to the subject on the form ranks INSTRUCTOR_SUBJECT_BONUS higher (never a filter, never for
+// the minimum score).
 let known = {};
 try { known = $('Phone Known Names').first().json || {}; } catch (e) {}
 let instructorCands = null;   // null = lookup unavailable
 try {
   const c = $('Phone Instructor Candidates').first().json || {};
-  if (Number(c.candidates_version) === 1) instructorCands = nmList(c.instructor_names);
+  if (Number(c.candidates_version) === 1) {
+    instructorCands = Array.isArray(c.instructors) ? c.instructors : nmList(c.instructor_names);
+  }
 } catch (e) {}
 const rawInstructor = gText('instructor');
 const rawSubject    = gText('subject');
+const resolvedSubject = (rawSubject && nmKnownSubject(gText('known_subject'), known.subjects, rawSubject)) || rawSubject;
+const otherReadings = (geminiOk && Array.isArray(gemini.instructor_readings) ? gemini.instructor_readings : [])
+  .filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim().slice(0, 120)).slice(0, INSTRUCTOR_READINGS_MAX);
 const instructorMatch = (rawInstructor && instructorCands)
-  ? nmBestInstructor(rawInstructor, instructorCands, INSTRUCTOR_MATCH_MIN, INSTRUCTOR_MATCH_MARGIN)
+  ? nmBestInstructor([rawInstructor, ...otherReadings], instructorCands, INSTRUCTOR_MATCH_MIN, INSTRUCTOR_MATCH_MARGIN, {
+    soundAlike: true, bonus: INSTRUCTOR_SUBJECT_BONUS,
+    subjects: resolvedSubject ? [resolvedSubject, ...nmCodeKeys(resolvedSubject), ...nmCodeKeys(rawSubject)] : [] })
   : { match: rawInstructor ? 'unavailable' : 'unreadable', name: '', score: null, contenders: [] };
 const resolvedInstructor = (instructorMatch.match === 'found' && instructorMatch.name) || rawInstructor;
-const resolvedSubject = (rawSubject && nmKnownSubject(gText('known_subject'), known.subjects, rawSubject)) || rawSubject;
 // remark is masked after the re-check
 const remarkResult = pfResolveRemark(gText('remarks'), 'Phone Verify Remark Words');
 
@@ -323,6 +335,15 @@ if (stNote(stamp)) noteParts.push(stNote(stamp));
 noteParts.push(...ocrCheck.notes);
 if (!geminiOk) noteParts.push('The AI cross-check did not return a result for this scan, so the OMR reading has not been verified against a second source and no text was read. Please check it manually.');
 
+// student ID check (2026-11-06, from the user's live export): Gemini writes ? for an unclear digit;
+// anything but 6 to 12 digits is not kept and goes to review (scanned IDs in the database are 6 to 9 digits)
+const sidRaw = String(gText('student_id') ?? '').replace(/\s+/g, '');
+const SID_RE = /^[0-9]{6,12}$/;
+const sidValid = SID_RE.test(sidRaw);
+if (sidRaw && !sidValid) {
+  reasons.push('student_id_invalid');
+  noteParts.push(`The student ID was read as "${sidRaw.slice(0, 20)}", which is not a valid ID (unclear digits or wrong length). Type it from the sheet.`);
+}
 const needsReview = reasons.length > 0;
 const validationStatus = needsReview ? 'flagged' : 'auto';
 // always show agreement on flagged scans
@@ -361,14 +382,15 @@ try {
 return [{
   json: {
     instructor:  resolvedInstructor,
-    instructor_match: { match: instructorMatch.match, score: instructorMatch.score, raw: rawInstructor },
+    instructor_match: { match: instructorMatch.match, score: instructorMatch.score, raw: rawInstructor,
+      readings: otherReadings, subject_linked: instructorMatch.linked === true },
     subject:     resolvedSubject,
     ay_semester: gText('ay_semester'),
     remarks:     remarkResult.text,
     remarks_masked: remarkResult.masked,
     remark_check:   remarkResult.check,
     date:        clean(gText('date')),
-    student_id:  ocrCheck.drop_student_id ? '' : clean(gText('student_id')),   // box empty: the AI's ID is not kept
+    student_id:  ocrCheck.drop_student_id || !sidValid ? '' : sidRaw,   // box empty / not a valid ID: not kept
     ocr_check:   ocrCheck.check,
     text_source: geminiOk ? 'gemini' : 'none',
     stamp_no:         stamp.stamp_no,           // the one stamp read on the page (status 'ok'), else null

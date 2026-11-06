@@ -89,22 +89,50 @@ function nmList(v) {
   if (Array.isArray(v)) return v;
   try { const p = JSON.parse(String(v ?? '')); return Array.isArray(p) ? p : []; } catch (e) { return []; }
 }
+// Filipino sound-alike spelling, both sides folded the same way: e/i, o/u, c/k/q, ph/f, v/b, z/s, y/i,
+// double letters (Licayan / Licayen, Kristoffer / Cristofer).
+function nmSoundAlike(tok) {
+  return tok.replace(/ph/g, 'f').replace(/[cq]/g, 'k').replace(/v/g, 'b').replace(/z/g, 's')
+    .replace(/e/g, 'i').replace(/o/g, 'u').replace(/y/g, 'i').replace(/(.)\1+/g, '$1');
+}
 // Phone reconciler: the database instructor the raw reading names, matched locally (Gemini never
 // sees an instructor list). found = one entry scores >= minScore and beats every other by margin;
 // ambiguous = several entries are that close (also two people with the same name); none = no entry
 // reaches minScore. Only 'found' returns a name.
-function nmBestInstructor(raw, names, minScore, margin) {
-  const got = nmNameTokens(raw);
-  const scored = !got.length ? [] : nmList(names)
-    .map((n) => String(n ?? '').trim())
-    .filter(Boolean)
-    .map((name) => ({ name, score: nmScore(nmNameTokens(name), got).score }))
+// raw: one reading or several (best score over all of them). names: strings, or { name, subjects }
+// (subject codes linked to that person this term). opts (phone only): soundAlike also scores the
+// sound-alike spelling; subjects = codes read on the form: a linked entry gets +bonus for the ranking
+// only, never for minScore, and an entry that is not linked still competes (never a filter).
+function nmBestInstructor(raw, names, minScore, margin, opts = {}) {
+  const reads = (Array.isArray(raw) ? raw : [raw]).map(nmNameTokens).filter((t) => t.length);
+  const keys = new Set((opts.subjects || []).map(nmAlnum).filter(Boolean));
+  const nameScore = (name) => {
+    const want = nmNameTokens(name);
+    const wantS = want.map(nmSoundAlike);
+    let best = 0;
+    for (const got of reads) {
+      best = Math.max(best, nmScore(want, got).score);
+      // sound-alike only replaces a form token that sounds exactly like a database token (no looser fuzzy match)
+      const same = got.map((t) => { const i = wantS.indexOf(nmSoundAlike(t)); return i >= 0 ? want[i] : t; });
+      if (opts.soundAlike) best = Math.max(best, nmScore(want, same).score);
+    }
+    return best;
+  };
+  const scored = !reads.length ? [] : nmList(names)
+    .map((n) => (n && typeof n === 'object' ? n : { name: n }))
+    .map((n) => ({ name: String(n.name ?? '').trim(), subjects: nmList(n.subjects) }))
+    .filter((c) => c.name)
+    .map((c) => {
+      const linked = keys.size > 0 && c.subjects.some((x) => keys.has(nmAlnum(x)));
+      const score = nameScore(c.name);
+      return { name: c.name, score, linked, rank: score + (linked ? (opts.bonus || 0) : 0) };
+    })
     .filter((c) => c.score >= minScore - 1e-6)
-    .sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+    .sort((a, b) => (b.rank - a.rank) || a.name.localeCompare(b.name));
   if (!scored.length) return { match: 'none', name: '', score: null, contenders: [] };
-  const close = scored.filter((c) => scored[0].score - c.score < margin - 1e-6);
+  const close = scored.filter((c) => scored[0].rank - c.rank < margin - 1e-6);
   if (close.length > 1) return { match: 'ambiguous', name: '', score: scored[0].score, contenders: close.map((c) => c.name) };
-  return { match: 'found', name: scored[0].name, score: scored[0].score, contenders: [] };
+  return { match: 'found', name: scored[0].name, score: scored[0].score, contenders: [], linked: scored[0].linked };
 }
 // same for the subject: known is a subject code from the list
 function nmKnownSubject(known, subjects, raw) {

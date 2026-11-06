@@ -530,7 +530,7 @@ test('Phone reconcile: engines agree -> auto, same output fields as before + agr
     'validation_status', 'needs_review', 'review_reasons', 'omr_agreement', 'grid_source', 'review_note', 'comparisons',
     'python_raw_ratings', 'summary', 'task_id', 'user_id', 'term_id', 'scan_image']) assert.ok(k in r, `missing ${k}`);
   assert.strictEqual(r.instructor, 'Dr. Juan A. Dela Cruz, MIT');
-  assert.strictEqual(r.student_id, '2021 0001');
+  assert.strictEqual(r.student_id, '20210001', 'spaces removed (student ID check, 2026-11-06)');
   assert.strictEqual(r.task_id, 'phone-1');
   assert.strictEqual(r.scan_image, 'AAAA');
   assert.strictEqual(r.review_note, null);
@@ -838,6 +838,25 @@ test('Double mark (OMR invalid_mark "double"): row blank, never filled from Gemi
     assert.deepStrictEqual(r.review_reasons, [], which);
     assert.strictEqual(r.review_note, 'm5: scanner saw two marks (not counted). Only a check or slash mark counts, '
       + 'so those answers stay blank. A row with two marks has no single answer.', which);
+  }
+});
+test('Outside mark (OMR invalid_mark "outside", a check in a header row): II.1 blank, never filled from Gemini, no flag; prompt line once', async () => {
+  for (const [which, rec] of RECONCILERS) {
+    const r = await rec(python({ invalid: { 10: 'outside' } }), geminiWith({ p1: 'S' }));
+    const c = r.comparisons.find((x) => x.question === 'p1');
+    assert.strictEqual(r.ratings.p1, null, which);
+    assert.strictEqual(c.source, 'invalid_mark', which);
+    assert.strictEqual(c.invalid_mark, 'outside', which);
+    assert.deepStrictEqual(r.review_reasons, [], which);
+    assert.strictEqual(r.review_note, 'p1: scanner saw a mark outside the answer rows (not counted). Only a check or '
+      + 'slash mark counts, so those answers stay blank.', which);
+  }
+  const LINE = "- A mark in a header row (the O/VS/S/F/US column headings, 'I. Management', 'II. Performance') "
+    + 'or in the Remarks row is not an answer: never count it for the row below or above it.';
+  for (const name of ['ai validation ocr and omr', 'Website AI Validation']) {
+    const body = wf.nodes.find((x) => x.name === name).parameters.jsonBody;
+    assert.strictEqual(body.split(LINE).length - 1, 1, name);
+    assert.ok(body.includes(`- Count rows in printed order; never skip a blank row or shift numbering to fill a gap.\\n${LINE}\\n`), name);
   }
 });
 test('OCR cross-check: both Gemini prompts carry the white-ink line once (after the two-bubbles rule) and a required corrected_rows; no names', () => {
@@ -1544,6 +1563,65 @@ test('Phone reconcile: the instructor is matched locally against Phone Instructo
   assert.ok(r.review_reasons.includes('missing_instructor'));
   assert.strictEqual(r.instructor_match.match, 'unreadable');
 });
+test('Phone reconcile: instructor readings + subject link bonus (bonus never a filter, ties go to review)', async () => {
+  // 'Phone Instructor Candidates' v1 with per-person subject codes linked this term
+  const cands = { candidates_version: 1, instructor_names: ['Jose Rizal', 'Maria Santos', 'Mario Santos'],
+    instructors: [{ name: 'Jose Rizal', subjects: [] }, { name: 'Maria Santos', subjects: ['IT 101'] },
+      { name: 'Mario Santos', subjects: ['SE 201'] }] };
+  const phone = async (fields, cn = cands) => (await run('reconcile ocr and omr1', {}, {
+    'image to ocr and omr python': python(), 'ai validation ocr and omr': geminiResp(fields),
+    'SAST image from phone': PHONE_HOOK, 'Phone Known Names': { subjects: [] }, 'Phone Instructor Candidates': cn,
+  }))[0].json;
+  // subject boost wins: 'Mari Santos' fits Maria and Mario equally; only Maria teaches IT 101 this term
+  let r = await phone({ instructor: 'Mari Santos', subject: 'IT 101' });
+  assert.deepStrictEqual([r.instructor_match.match, r.instructor, r.instructor_match.subject_linked], ['found', 'Maria Santos', true]);
+  assert.deepStrictEqual(r.review_reasons, []);
+  // an instructor not linked to the subject still wins on a clear name match
+  r = await phone({ instructor: 'Jose Rizal', subject: 'IT 101' });
+  assert.deepStrictEqual([r.instructor_match.match, r.instructor, r.instructor_match.subject_linked], ['found', 'Jose Rizal', false]);
+  // tie -> review: both linked to the subject on the form, or the exact name of an unlinked one vs a close linked one
+  const both = { ...cands, instructors: cands.instructors.map((c) => ({ ...c, subjects: ['IT 101'] })) };
+  r = await phone({ instructor: 'Mari Santos', subject: 'IT 101' }, both);
+  assert.strictEqual(r.instructor_match.match, 'ambiguous');
+  assert.ok(r.review_reasons.includes('instructor_ambiguous'));
+  assert.strictEqual(r.instructor, 'Mari Santos', 'raw reading kept');
+  r = await phone({ instructor: 'Mario Santos', subject: 'IT 101' });
+  assert.strictEqual(r.instructor_match.match, 'ambiguous', 'a near-tie is never decided by the bonus alone');
+  // no subject, an unknown subject, or no links -> no bonus (same as before: review)
+  for (const [subject, cn] of [['', cands], ['XX 999', cands], ['IT 101', { candidates_version: 1, instructor_names: cands.instructor_names }]]) {
+    r = await phone({ instructor: 'Mari Santos', subject }, cn);
+    assert.strictEqual(r.instructor_match.match, 'ambiguous', `subject ${JSON.stringify(subject)}`);
+  }
+  // multi-reading: the main reading matches nobody, one of Gemini's alternative readings does
+  r = await phone({ instructor: 'Xqz Wtv', subject: '', instructor_readings: ['Jose Rizal', 'Jsoe Rzal'] });
+  assert.deepStrictEqual([r.instructor_match.match, r.instructor], ['found', 'Jose Rizal']);
+  assert.deepStrictEqual(r.instructor_match.readings, ['Jose Rizal', 'Jsoe Rzal']);
+  // readings: strings only, at most 3, a non-array is ignored
+  r = await phone({ instructor: 'Xqz Wtv', instructor_readings: [1, null, 'a', 'b', 'c', 'Jose Rizal'] });
+  assert.deepStrictEqual(r.instructor_match.readings, ['a', 'b', 'c']);
+  assert.strictEqual(r.instructor_match.match, 'none');
+  r = await phone({ instructor: 'Xqz Wtv', instructor_readings: 'Jose Rizal' });
+  assert.deepStrictEqual([r.instructor_match.match, r.instructor], ['none', 'Xqz Wtv']);
+  // sound-alike spelling (e/i, o/u, z/s): 'Josi Risal' -> Jose Rizal
+  r = await phone({ instructor: 'Josi Risal', subject: '' });
+  assert.deepStrictEqual([r.instructor_match.match, r.instructor], ['found', 'Jose Rizal']);
+});
+test('name_match.js: nmBestInstructor without options is unchanged (correction path); nmSoundAlike folds Filipino spellings', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'website_src', 'name_match.js'), 'utf8');
+  const nm = new Function(`${src}\nreturn { nmBestInstructor, nmSoundAlike };`)();   // eslint-disable-line no-new-func
+  assert.strictEqual(nm.nmSoundAlike('philippe'), 'filipi');
+  assert.strictEqual(nm.nmSoundAlike('licayan'), nm.nmSoundAlike('likayan'));
+  assert.strictEqual(nm.nmSoundAlike('gonzales'), nm.nmSoundAlike('gonsalis'));
+  // no options: plain spelling only, strings in, same result shape as before
+  const plain = nm.nmBestInstructor('Josi Risal', ['Jose Rizal', 'Maria Santos'], 0.95, 0.10);
+  assert.strictEqual(plain.match, 'none', 'sound-alike only when asked for');
+  const sound = nm.nmBestInstructor('Josi Risal', ['Jose Rizal', 'Maria Santos'], 0.95, 0.10, { soundAlike: true });
+  assert.deepStrictEqual([sound.match, sound.name], ['found', 'Jose Rizal']);
+  // the bonus never lifts a weak name over the minimum
+  const weak = nm.nmBestInstructor('Santos', [{ name: 'Maria Santos', subjects: ['IT 101'] }], 0.70, 0.10,
+    { bonus: 0.5, subjects: ['IT101'] });
+  assert.strictEqual(weak.match, 'none');
+});
 test('Main Gemini prompts: known subjects only from Known Names, optional known_subject, old fields unchanged', async () => {
   const known = { instructor_list: 'Joseph King; Rodz Harvey d Licayan', subject_list: 'PC121 = Discreet Math; SE101 = Software "Eng"' };
   const body = (name, kn, extra = {}) => {
@@ -1558,7 +1636,7 @@ test('Main Gemini prompts: known subjects only from Known Names, optional known_
   {
     const b = body('ai validation ocr and omr', known);
     const text = b.contents[0].parts[0].text;
-    assert.match(text, /6\. student_id: digits only\.\n7\. known_subject: /);
+    assert.match(text, /6\. student_id: the student ID written in the ID box, digits only\.[^]*If the ID box is empty, return an empty string\.\n7\. known_subject: /);
     assert.ok(!text.includes('known_instructor'));
     assert.ok(!text.includes('Known instructors') && !text.includes('Joseph King'), 'no instructor name list sent (privacy)');
     assert.ok(text.includes('Known subjects (code = title): PC121 = Discreet Math; SE101 = Software "Eng"'));
@@ -1568,13 +1646,15 @@ test('Main Gemini prompts: known subjects only from Known Names, optional known_
     assert.strictEqual(b.contents[0].parts[1].inlineData.data, 'QUJD');
     const sch = b.generationConfig.responseSchema;
     assert.strictEqual(sch.properties.known_instructor, undefined);
+    assert.ok(text.includes('1. instructor: full name with credentials, as written.\n   instructor_readings: up to 3 other ways'));
+    assert.deepStrictEqual(sch.properties.instructor_readings, { type: 'ARRAY', items: { type: 'STRING' } }, 'optional, not required');
     assert.deepStrictEqual(sch.properties.known_subject, { type: 'STRING' });
     assert.deepStrictEqual(sch.required, ['instructor', 'subject', 'ay_semester', 'remarks', 'date', 'student_id', 'stamp_numbers',
       'stamp_numbers_page', 'stamp_reads_tiles', 'document_check', 'scan_quality', 'corrected_rows', 'ratings'], 'known_subject is optional; stamp_numbers and corrected_rows are required');
     assert.deepStrictEqual(sch.properties.stamp_numbers, { type: 'ARRAY', items: { type: 'STRING' } });
     for (const kn of [{ error: 'timeout' }, {}, undefined]) {
       const t = body('ai validation ocr and omr', kn).contents[0].parts[0].text;
-      assert.ok(t.includes('6. student_id: digits only.\n\n--- STAMP ---\nstamp_numbers: ') && !t.includes('known_subject'));
+      assert.ok(t.includes('If the ID box is empty, return an empty string.\n\n--- STAMP ---\nstamp_numbers: ') && !t.includes('known_subject'));
     }
   }
   // website: subject list only (privacy -- no instructor names sent to Gemini), optional
@@ -1582,7 +1662,7 @@ test('Main Gemini prompts: known subjects only from Known Names, optional known_
   {
     const b = body('Website AI Validation', known);
     const text = b.contents[0].parts[0].text;
-    assert.match(text, /6\. student_id: digits only\.\n7\. known_subject: /);
+    assert.match(text, /6\. student_id: the student ID written in the ID box, digits only\.[^]*If the ID box is empty, return an empty string\.\n7\. known_subject: /);
     assert.ok(!text.includes('known_instructor'));
     assert.ok(!text.includes('Known instructors'), 'no instructor name list sent (privacy)');
     assert.ok(text.includes('Known subjects (code = title): PC121 = Discreet Math; SE101 = Software "Eng"'));
@@ -1593,6 +1673,8 @@ test('Main Gemini prompts: known subjects only from Known Names, optional known_
     assert.ok(!text.includes('HEADER CLOSE-UP'), 'no header hint text when no header image was sent');
     const sch = b.generationConfig.responseSchema;
     assert.strictEqual(sch.properties.known_instructor, undefined);
+    assert.ok(text.includes('1. instructor: full name with credentials, as written.\n   instructor_readings: up to 3 other ways'));
+    assert.deepStrictEqual(sch.properties.instructor_readings, { type: 'ARRAY', items: { type: 'STRING' } }, 'optional, not required');
     assert.deepStrictEqual(sch.properties.known_subject, { type: 'STRING' });
     assert.deepStrictEqual(sch.properties.instructor_confidence, { type: 'STRING', enum: ['high', 'medium', 'low'] });
     assert.deepStrictEqual(sch.required, ['instructor', 'subject', 'ay_semester', 'remarks', 'date', 'student_id', 'stamp_numbers',
@@ -1600,7 +1682,7 @@ test('Main Gemini prompts: known subjects only from Known Names, optional known_
     assert.deepStrictEqual(sch.properties.stamp_numbers, { type: 'ARRAY', items: { type: 'STRING' } });
     for (const kn of [{ error: 'timeout' }, {}, undefined]) {
       const t = body('Website AI Validation', kn).contents[0].parts[0].text;
-      assert.ok(t.includes('6. student_id: digits only.\n\n--- STAMP ---\nstamp_numbers: ') && !t.includes('known_subject'));
+      assert.ok(t.includes('If the ID box is empty, return an empty string.\n\n--- STAMP ---\nstamp_numbers: ') && !t.includes('known_subject'));
     }
     // header image present -> third part + hint text
     const b2 = body('Website AI Validation', known, { header_image_base64: 'SEVBREVS' });
@@ -3024,8 +3106,9 @@ test('Stamp: both reconcilers -- ok (leading zeros kept, de-duplicated, separato
       [['1234567890123'], 'unreadable', null, []],      // 13 digits: too long
       [['abc'], 'unreadable', null, []],
       [['0100005', '0200006'], 'multiple', null, ['0100005', '0200006']],
-      [['0100005', '01?0006'], 'multiple', null, ['0100005']],
-      [['0100005', '12'], 'multiple', null, ['0100005']],
+      // Python read exactly one complete stamp: trusted over Gemini's several (python_trusted, 2026-11-06)
+      [['0100005', '01?0006'], 'ok', '0100005', ['0100005']],
+      [['0100005', '12'], 'ok', '0100005', ['0100005']],
     ];
     const REASON = { ok: null, missing: 'stamp_missing', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps' };
     for (const [stamps, status, no, cands] of cases) {
@@ -3042,14 +3125,14 @@ test('Stamp: both reconcilers -- ok (leading zeros kept, de-duplicated, separato
         assert.deepStrictEqual(r.review_reasons, [], tag);
       }
     }
-    // Gemini answered without JSON -> unreadable (the stamp could not be read)
-    const nj = await rec(python(), { candidates: [{ content: { parts: [{ text: 'no json' }] } }] });
+    // Gemini answered without JSON and Python read no stamp -> unreadable (the stamp could not be read)
+    const nj = await rec(python({ stamp: pyStamp([]) }), { candidates: [{ content: { parts: [{ text: 'no json' }] } }] });
     assert.strictEqual(nj.stamp_status, 'unreadable', which);
     assert.ok(nj.review_reasons.includes('stamp_unreadable') && nj.review_reasons.includes('gemini_unavailable'), which);
   }
   // website: the Gemini call itself failed -> unreadable
   const failed = (await run('Website Reconcile OCR OMR', { error: 'timeout' },
-    { 'Website Python OMR': python(), 'Website AI Validation': undefined }))[0].json;
+    { 'Website Python OMR': python({ stamp: pyStamp([]) }), 'Website AI Validation': undefined }))[0].json;
   assert.strictEqual(failed.stamp_status, 'unreadable');
   assert.deepStrictEqual(failed.review_reasons, ['ai_validation_failed', 'stamp_unreadable']);
   // one copy of website_src/stamp.js in each reconciler
@@ -3351,27 +3434,28 @@ const gem2 = ({ final = ['0100005'], page = ['0100005'], tiles = ['0100005'] } =
 test('Stamp (two readers): every decision path in both reconcilers', async () => {
   const cases = [
     // [tag, python block, gemini, status, stamp_no, hint, why, source]
-    ['agree', pyStamp(['0100005']), gem2(), 'ok', '0100005', null, 'agree', 'gemini+python'],
-    ['disagree', pyStamp(['0100006']), gem2(), 'unconfirmed', null, '0100005', 'python_differs', null],
+    ['agree', pyStamp(['0100005']), gem2(), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['disagree: Python trusted', pyStamp(['0100006']), gem2(), 'ok', '0100006', null, 'python_trusted', 'gemini+python'],
+    ['disagree, Python unsure', pyStamp(['01?0006']), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
     ['python ?', pyStamp(['01?0005']), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
     ['python read nothing', pyStamp([]), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
     ['python block missing (old OMR / failed)', null, gem2(), 'unconfirmed', null, '0100005', 'python_not_run', null],
     ['python reader off', pyStamp(['0100005'], { reader: false }), gem2(), 'unconfirmed', null, '0100005', 'python_not_run', null],
     ['python 2 stamp-like, 1 complete', pyStamp(['0100005', '01?0005']), gem2(), 'unconfirmed', null, '0100005', 'python_stamp_like', null],
-    ['gemini ?', pyStamp(['0100005']), gem2({ final: ['01?0005'], page: ['01?0005'], tiles: ['01?0005'] }), 'unreadable', null, '0100005', 'gemini_unreadable', null],
-    ['gemini nothing, python read', pyStamp(['0100005']), gem2({ final: [], page: [], tiles: [] }), 'unconfirmed', null, '0100005', 'gemini_none_python_read', null],
+    ['gemini ?', pyStamp(['0100005']), gem2({ final: ['01?0005'], page: ['01?0005'], tiles: ['01?0005'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['gemini nothing, python read', pyStamp(['0100005']), gem2({ final: [], page: [], tiles: [] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
     ['nothing at all', pyStamp([]), gem2({ final: [], page: [], tiles: [] }), 'missing', null, null, 'none', null],
-    ['page differs', pyStamp(['0100005']), gem2({ page: ['0100006'] }), 'unconfirmed', null, '0100005', 'page_differs', null],
-    ['page ?', pyStamp(['0100005']), gem2({ page: ['01?0005'] }), 'unconfirmed', null, '0100005', 'page_differs', null],
-    ['tiles differ', pyStamp(['0100005']), gem2({ tiles: ['0100006'] }), 'unconfirmed', null, '0100005', 'tiles_differ', null],
-    ['tile ?', pyStamp(['0100005']), gem2({ tiles: ['0100?05'] }), 'unconfirmed', null, '0100005', 'tiles_differ', null],
-    ['no tile sheet', pyStamp(['0100005'], { sheet: false }), gem2({ tiles: [] }), 'unconfirmed', null, '0100005', 'no_tile_sheet', null],
-    ['gemini multiple', pyStamp(['0100005']), gem2({ final: ['0100005', '0200006'] }), 'multiple', null, null, 'gemini_multiple', null],
-    ['page multiple', pyStamp(['0100005']), gem2({ page: ['0100005', '0200006'] }), 'multiple', null, null, 'readers_see_several', null],
+    ['page differs', pyStamp(['0100005']), gem2({ page: ['0100006'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['page ?', pyStamp(['0100005']), gem2({ page: ['01?0005'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['tiles differ', pyStamp(['0100005']), gem2({ tiles: ['0100006'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['tile ?', pyStamp(['0100005']), gem2({ tiles: ['0100?05'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['no tile sheet', pyStamp(['0100005'], { sheet: false }), gem2({ tiles: [] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['gemini multiple', pyStamp(['0100005']), gem2({ final: ['0100005', '0200006'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
+    ['page multiple', pyStamp(['0100005']), gem2({ page: ['0100005', '0200006'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
     ['python multiple', pyStamp(['0100005', '0200006']), gem2(), 'multiple', null, null, 'readers_see_several', null],
-    ['format check off by default: 5 digits', pyStamp(['12345']), gem2({ final: ['12345'], page: ['12345'], tiles: ['12345'] }), 'ok', '12345', null, 'agree', 'gemini+python'],
-    ['9 digits', pyStamp(['012345678']), gem2({ final: ['012345678'], page: ['012345678'], tiles: ['012345678'] }), 'ok', '012345678', null, 'agree', 'gemini+python'],
-    ['length differs', pyStamp(['0100005']), gem2({ final: ['01000050'], page: ['01000050'], tiles: ['01000050'] }), 'unconfirmed', null, '01000050', 'python_differs', null],
+    ['format check off by default: 5 digits', pyStamp(['12345']), gem2({ final: ['12345'], page: ['12345'], tiles: ['12345'] }), 'ok', '12345', null, 'python_trusted', 'gemini+python'],
+    ['9 digits', pyStamp(['012345678']), gem2({ final: ['012345678'], page: ['012345678'], tiles: ['012345678'] }), 'ok', '012345678', null, 'python_trusted', 'gemini+python'],
+    ['length differs', pyStamp(['0100005']), gem2({ final: ['01000050'], page: ['01000050'], tiles: ['01000050'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
   ];
   const REASON = { ok: null, unconfirmed: 'stamp_unconfirmed', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps', missing: 'stamp_missing' };
   for (const [which, rec] of RECONCILERS) {
@@ -3399,7 +3483,7 @@ test('Stamp (two readers): every decision path in both reconcilers', async () =>
     assert.deepStrictEqual(q.stamp_check.gemini_tiles, ['0100005']);
     const old = await rec(python({ stamp: null }), gem2());
     assert.match(old.review_note, /Scanner read: did not run/);
-    const pg = await rec(python({ stamp: pyStamp(['0100005']) }), gem2({ page: ['0100006'] }));
+    const pg = await rec(python({ stamp: pyStamp(['01?0005']) }), gem2({ page: ['0100006'] }));
     assert.match(pg.review_note, /AI read: 0100005 \(full page 0100006\)\./);
   }
 });
@@ -3419,7 +3503,7 @@ test('Stamp (two readers): format check and the Gemini-only fallback are config 
   const f1 = fb({ stamp_numbers: ['0100005'] }, true, undefined);
   assert.deepStrictEqual([f1.stamp_status, f1.stamp_no, f1.stamp_source, f1.stamp_check.why], ['ok', '0100005', 'gemini', 'gemini_only_fallback']);
   // with the reader present the fallback changes nothing: a disagreement still goes to review
-  assert.strictEqual(fb(G('0100005'), true, pyStamp(['0100006'])).stamp_status, 'unconfirmed');
+  assert.strictEqual(fb(G('0100005'), true, pyStamp(['01?0006'])).stamp_status, 'unconfirmed');
   const off = load(src)({ stamp_numbers: ['0100005'] }, true, undefined);
   assert.deepStrictEqual([off.stamp_status, off.stamp_source], ['unconfirmed', null]);
 });
@@ -3457,7 +3541,7 @@ test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an 
   const da = await decide(identity({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }), acc);
   assert.strictEqual(da.auto_reject, 'duplicate_stamp');
   // phone: the hint goes to Phone Stamp Check; a match adds a note, never an auto-reject
-  const pu = await phoneReconcile(python({ stamp: pyStamp(['0100006']) }), gem2());
+  const pu = await phoneReconcile(python({ stamp: pyStamp(['01?0006']) }), gem2());
   assert.deepStrictEqual(exprValue('Phone Stamp Check', {}, { 'reconcile ocr and omr1': pu }), ['', '0100005', 'phone-1']);
   const v = (await run('Phone Stamp Verdict', { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }, { 'reconcile ocr and omr1': pu }))[0].json;
   assert.strictEqual(v.auto_reject, undefined);
@@ -3469,7 +3553,7 @@ test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an 
   assert.strictEqual(pq.status, 'pending');
   assert.strictEqual(pq.stamp_no, null);
   assert.deepStrictEqual(pq.partial_data.stamp_duplicate_hint, DUP);
-  assert.strictEqual(pq.partial_data.stamp_check.why, 'python_differs');
+  assert.strictEqual(pq.partial_data.stamp_check.why, 'python_incomplete');
   // a failed check on a hint does not add stamp_check_failed (the scan is in review anyway)
   const vf = (await run('Phone Stamp Verdict', {}, { 'reconcile ocr and omr1': pu }))[0].json;
   assert.deepStrictEqual(vf.review_reasons, ['stamp_unconfirmed']);
