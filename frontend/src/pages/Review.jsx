@@ -1077,7 +1077,7 @@ function QueueEditor({ row, importRow, pendingTasks, draft, setDraft, meta, me, 
 
             <div className="grid-2">
               <div>
-                <label htmlFor={`sid-${row.id}`}>Student ID</label>
+                <label htmlFor={`sid-${row.id}`}>Student ID (as read, optional)</label>
                 <input id={`sid-${row.id}`} value={values.student_id} maxLength={50} autoComplete="off"
                   onChange={(e) => edit({ student_id: e.target.value })} />
               </div>

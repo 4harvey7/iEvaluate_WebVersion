@@ -17,7 +17,6 @@ def test_health_is_public():
     ("get", "/departments"),
     ("get", "/instructors/search?q=ab"),
     ("post", "/instructors"),
-    ("post", "/instructors/00000000-0000-0000-0000-000000000000/activate"),
     ("get", "/subjects/search?q=ab"),
     ("post", "/batches/start"),
     ("get", "/batches/00000000-0000-0000-0000-000000000000"),

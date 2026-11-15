@@ -264,9 +264,7 @@ export const api = {
   skippedPages: (id, action) => request(`/stations/${q(id)}/skipped-pages`, { method: "POST", body: { action } }),
 
   searchInstructors: (term, signal) => request(`/instructors/search?q=${q(term)}`, { signal }),
-  searchPlaceholders: (term, signal) => request(`/instructors/placeholders?q=${q(term)}`, { signal }),
   createInstructor: (body) => request("/instructors", { method: "POST", body }),
-  activateInstructor: (id, real_email) => request(`/instructors/${q(id)}/activate`, { method: "POST", body: { real_email } }),
 
   searchSubjects: (term, signal) => request(`/subjects/search?q=${q(term)}`, { signal }),
   createSubject: (body) => request("/subjects", { method: "POST", body }),

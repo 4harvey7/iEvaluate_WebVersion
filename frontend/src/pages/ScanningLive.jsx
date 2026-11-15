@@ -22,7 +22,7 @@ const POLL_MS = 3000;
 const COUNTERS = [
   { key: "processed", label: "Scored", cls: "", help: "Read and scored. Nothing to do." },
   { key: "flagged", label: "Flagged", cls: "c-flag", help: "Scored, but a person has to check it. The line under the number shows how many still wait for review." },
-  { key: "rejected", label: "Rejected", cls: "c-reject", help: "Couldn't be scored. Check the sheet and scan it again." },
+  { key: "rejected", label: "Rejected", cls: "c-reject", help: "Not counted: not an evaluation form (check the sheet and scan it again), its stamp number was already scanned this term, or fewer than 5 of the 20 items were answered." },
   { key: "duplicates", label: "Already scanned", cls: "c-dup", help: "This exact page was already received, so it was ignored." },
   { key: "errors", label: "Trying again", cls: "c-err", help: "Not marked yet. It is tried again automatically." },
   {
@@ -54,6 +54,7 @@ const EMPTY_TEXT = {
 // except pages whose copy waits on the review page ("Couldn't be saved").
 function itemBucket(item) {
   if (item?.status === "error" && itemCode(item) === "not_saved_needs_review") return "unsaved";
+  if (isAutoRejected(item)) return "rejected"; // same rule as the server's Rejected counter (batches.py)
   switch (item?.status) {
     case "success":
       return "processed";
@@ -88,7 +89,14 @@ function allItems(batch) {
 }
 
 const REVIEWED_LABEL = { validated: "Reviewed", discarded: "Discarded" };
-const isStampDuplicate = (item) => (item.review_reasons || []).some((r) => String(r).trim().toLowerCase() === "duplicate_stamp");
+const hasReason = (item, ...codes) => (item?.review_reasons || []).some((r) => codes.includes(String(r).trim().toLowerCase()));
+// Marking discarded it by itself (n8n answers "flagged"; counted under Rejected): its stamp number was
+// already saved this term, or fewer than 5 of the 20 items were answered (logic.AUTO_REJECT_RULES).
+// Taken back on the review page (Override), it is an ordinary flagged form again.
+function isAutoRejected(item) {
+  return item?.status === "flagged" && hasReason(item, "duplicate_stamp", "min_answered_5") && !["pending", "validated"].includes(item.review_status);
+}
+const isAlreadyScanned = (item) => isAutoRejected(item) && hasReason(item, "duplicate_stamp");
 
 const IDENTITY_WORDS = { match: "matches", mismatch: "doesn't match", unreadable: "can't read it" };
 
@@ -124,9 +132,7 @@ function ItemRow({ item, now, markingOff, reviewTo, canView, onView }) {
   const mismatch = item.identity && (item.identity.instructor === "mismatch" || item.identity.subject === "mismatch");
   // Flagged pages already fixed on the review page or in the app (queue row no longer pending).
   const reviewed = bucket === "flagged" && item.review_status && item.review_status !== "pending";
-  // Its stamp number was already saved this term: marking discarded it by itself (counted under Flagged).
-  // Taken back on the review page (Override), it is an ordinary flagged form again.
-  const alreadyScanned = bucket === "flagged" && isStampDuplicate(item) && !["pending", "validated"].includes(item.review_status);
+  const alreadyScanned = isAlreadyScanned(item);
   const label = waiting
     ? "Waiting for marking"
     : unreadable
@@ -169,7 +175,9 @@ function ItemRow({ item, now, markingOff, reviewTo, canView, onView }) {
         ? "error"
         : alreadyScanned
           ? "duplicate"
-          : reviewed
+          : bucket === "rejected"
+            ? "rejected"
+            : reviewed
             ? "reviewed"
             : item.status;
   const rowCls = waiting ? "waiting" : bucket === "unsaved" ? "flagged" : bucket === "failed" || bucket === "errors" ? "error" : item.status;

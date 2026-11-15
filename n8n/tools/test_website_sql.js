@@ -16,7 +16,8 @@
 // The schema gets migrations/013_sast_null_aware_means.sql (public.recompute_sast, rating CHECKs),
 // which the recompute nodes call; it is also tested directly (blank answers left out of the means),
 // then migrations/014_sast_min_answered.sql (a form with fewer than 5 of 20 answered is not counted)
-// and migrations/015_stamp_no.sql (the numbering-machine stamp: one form per stamp and term).
+// and migrations/015_stamp_no.sql (the numbering-machine stamp: one form per stamp and term),
+// then migrations/021_student_id_hash.sql (keyed student-ID hash; a mock vault.decrypted_secrets holds the pepper).
 // It also runs the optional clean-up migrations/004_mask_existing_profanity.sql on synthetic
 // rows (preview, apply, student_remarks duplicates, idempotency) and checks that its SQL filter
 // masks exactly like the n8n JS filter (profanity.js) on a large synthetic corpus.
@@ -151,6 +152,15 @@ const MIG013 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '0
 const MIG014 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '014_sast_min_answered.sql'), 'utf8');
 // migration 015 (stamp rule: stamp columns, unique (term_id, stamp_no), save_website_raw_row, sast_stamp_duplicate_of)
 const MIG015 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '015_stamp_no.sql'), 'utf8');
+// migration 021 (student_id_hash: HMAC-SHA256 with a Vault pepper, trigger, hash unique index, column privileges)
+const MIG021 = fs.readFileSync(path.join(__dirname, '..', '..', 'migrations', '021_student_id_hash.sql'), 'utf8');
+const PEPPER = 'test-pepper-0123456789abcdef0123456789abcdef';
+// Supabase Vault stand-in: the only thing 021 reads is vault.decrypted_secrets (name, decrypted_secret)
+const VAULT_SQL = `CREATE SCHEMA IF NOT EXISTS vault;
+  CREATE TABLE IF NOT EXISTS vault.decrypted_secrets (name text PRIMARY KEY, decrypted_secret text);
+  INSERT INTO vault.decrypted_secrets VALUES ('sast_student_id_pepper', '${PEPPER}')
+    ON CONFLICT (name) DO UPDATE SET decrypted_secret = EXCLUDED.decrypted_secret;`;
+const hmacHex = (id, pepper = PEPPER) => 'h1:' + require('crypto').createHmac('sha256', pepper).update(id).digest('hex');
 
 // ------------------------------------------------------------------ sexual-word filter / migration 004
 const MIG_PATH = path.join(__dirname, '..', '..', 'migrations', '004_mask_existing_profanity.sql');
@@ -891,9 +901,9 @@ async function suite(rawIdType) {
       assert.strictEqual(b.d.partial_data.instructor_match, 'unreadable');
       assert.strictEqual(b.d.partial_data.suggested_instructor_id, ID.juan);
     }
-    // blank student id -> student_id_missing
+    // blank student id -> no reason (2026-11-10: the stamp number identifies the form)
     const noId = await websiteDecide('web:e2e-noid', gemResp({ student_id: '', instructor: 'Sir J. Dela Cruz', subject: 'IT-101' }));
-    assert.deepStrictEqual(noId.d.review_reasons, ['student_id_missing']);
+    assert.ok(!noId.d.review_reasons.some((x) => x.startsWith('student_id')));
     assert.strictEqual(noId.d.student_id, null);
     const r = await websiteToRaw(d);
     assert.strictEqual(r.saved, true);
@@ -1557,6 +1567,85 @@ async function suite(rawIdType) {
     }
     await db.none(`DELETE FROM public.failed_scan_queue WHERE task_id IN ('q-a', 'q-b')`);
   });
+  test('021: sast_hash_student_id = h1: + HMAC-SHA256 (Vault pepper); deterministic, idempotent, NULL/blank unchanged', async () => {
+    const h = async (v) => (await db.one('SELECT public.sast_hash_student_id($1) AS h', [v])).h;
+    const a = await h('2021-0001');
+    assert.strictEqual(a, hmacHex('2021-0001'), 'same bytes as Node crypto HMAC-SHA256 with the pepper');
+    assert.match(a, /^h1:[0-9a-f]{64}$/);
+    assert.strictEqual(await h('  2021-0001 '), a, 'trimmed first');
+    assert.strictEqual(await h('2021-0001'), a, 'deterministic');
+    assert.notStrictEqual(await h('2021-0002'), a, 'another ID, another hash');
+    assert.notStrictEqual(a, 'h1:' + require('crypto').createHash('sha256').update('2021-0001').digest('hex'), 'not plain SHA-256');
+    assert.strictEqual(await h(a), a, 'an h1: value passes through');
+    assert.strictEqual(await h(null), null);
+    assert.strictEqual(await h(''), '');
+    assert.strictEqual(await h('   '), '   ');
+  });
+  test('021: a missing or short pepper fails loudly (function, raw insert); nothing is stored', async () => {
+    try {
+      await db.none(`DELETE FROM vault.decrypted_secrets WHERE name = 'sast_student_id_pepper'`);
+      await assert.rejects(db.one(`SELECT public.sast_hash_student_id('2021-0001')`), /sast_student_id_pepper is missing/);
+      await assert.rejects(db.none(`INSERT INTO public.sast_all_raw_data_survey ("instructor_ID", subject_id, term_id, student_id, task_id)
+        VALUES ($1, $2, $3, 'NO-KEY', 'web:no-key')`, [ID.juan, ID.it101, ID.term]), /sast_student_id_pepper is missing/);
+      assert.strictEqual((await db.one(`SELECT public.sast_hash_student_id(NULL) IS NULL AS ok`)).ok, true, 'blank needs no key');
+      await db.none(`INSERT INTO vault.decrypted_secrets VALUES ('sast_student_id_pepper', 'too-short')`);
+      await assert.rejects(db.one(`SELECT public.sast_hash_student_id('2021-0001')`), /shorter than 32/);
+      assert.strictEqual((await db.one(`SELECT count(*)::int AS n FROM public.sast_all_raw_data_survey WHERE task_id = 'web:no-key'`)).n, 0);
+    } finally {
+      await db.multi(VAULT_SQL);
+    }
+  });
+  test('021: trigger keeps the real ID for staff and fills student_id_hash (insert, update, no hand-set hash); identity check uses it', async () => {
+    assert.strictEqual((await websiteToRaw(decideItem({ task_id: 'web:h1', student_id: '2021-0777', subject_id: ID.ge104 }))).saved, true);
+    let row = await db.one(`SELECT id, student_id, student_id_hash FROM public.sast_all_raw_data_survey WHERE task_id = 'web:h1'`);
+    assert.strictEqual(row.student_id, '2021-0777', 'staff-facing column stays plaintext');
+    assert.strictEqual(row.student_id_hash, hmacHex('2021-0777'));
+    await db.none(`UPDATE public.sast_all_raw_data_survey SET student_id_hash = 'forged' WHERE id = $1`, [row.id]);
+    assert.strictEqual((await db.one('SELECT student_id_hash FROM public.sast_all_raw_data_survey WHERE id = $1', [row.id])).student_id_hash,
+      hmacHex('2021-0777'), 'recomputed, never set by hand');
+    await db.none(`UPDATE public.sast_all_raw_data_survey SET student_id = '2021-0778' WHERE id = $1`, [row.id]);
+    row = await db.one('SELECT student_id_hash FROM public.sast_all_raw_data_survey WHERE id = $1', [row.id]);
+    assert.strictEqual(row.student_id_hash, hmacHex('2021-0778'));
+    const blank = await db.one(`INSERT INTO public.sast_all_raw_data_survey (task_id, student_id) VALUES ('web:h-blank', '  ')
+      RETURNING student_id_hash`);
+    assert.strictEqual(blank.student_id_hash, null, 'blank ID -> no hash');
+    // identity check finds the stored page by hash ...
+    const batch = { subject_id: ID.ge104 };
+    assert.strictEqual((await identity('Juan Dela Cruz', 'GE 104', batch, { student_id: ' 2021-0778 ' })).duplicate_student_task_id, 'web:h1');
+    // ... and a different pepper (lost / rotated secret) makes every stored hash unmatchable
+    await db.none(`UPDATE vault.decrypted_secrets SET decrypted_secret = repeat('x', 40) WHERE name = 'sast_student_id_pepper'`);
+    try {
+      assert.strictEqual((await identity('Juan Dela Cruz', 'GE 104', batch, { student_id: '2021-0778' })).duplicate_student_exists, false);
+    } finally {
+      await db.multi(VAULT_SQL);
+    }
+    await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE task_id IN ('web:h1', 'web:h-blank')`);
+  });
+  test('021: backfill on re-run, hash unique index, plaintext index kept, anon/authenticated cannot read student_id, re-run safe', async () => {
+    // a row stored before 021 (no hash): re-running the migration fills it
+    await db.none(`ALTER TABLE public.sast_all_raw_data_survey DISABLE TRIGGER sast_raw_student_id_hash`);
+    await db.none(`INSERT INTO public.sast_all_raw_data_survey ("instructor_ID", subject_id, term_id, student_id, task_id)
+      VALUES ($1, $2, $3, 'OLD-1', 'web:old-1')`, [ID.pedro, ID.it102, ID.term]);
+    await db.none(`ALTER TABLE public.sast_all_raw_data_survey ENABLE TRIGGER sast_raw_student_id_hash`);
+    await db.multi(MIG021);
+    await db.multi(MIG021);
+    const old = await db.one(`SELECT student_id, student_id_hash FROM public.sast_all_raw_data_survey WHERE task_id = 'web:old-1'`);
+    assert.deepStrictEqual(old, { student_id: 'OLD-1', student_id_hash: hmacHex('OLD-1') });
+    // the hash index also stops an ID that differs only by spaces (the plaintext index would not)
+    await assert.rejects(db.none(`INSERT INTO public.sast_all_raw_data_survey ("instructor_ID", subject_id, term_id, student_id, task_id)
+      VALUES ($1, $2, $3, ' OLD-1 ', 'web:old-2')`, [ID.pedro, ID.it102, ID.term]), /sast_raw_student_hash_uniq/);
+    const idx = await db.one(`SELECT indexdef FROM pg_indexes WHERE indexname = 'sast_raw_student_hash_uniq'`);
+    assert.match(idx.indexdef, /UNIQUE INDEX .*\(student_id_hash, "instructor_ID", subject_id, term_id\) WHERE \(student_id_hash IS NOT NULL\)/);
+    for (const role of ['anon', 'authenticated']) {
+      const p = await db.one(`SELECT has_column_privilege($1, 'public.sast_all_raw_data_survey', 'student_id', 'SELECT') AS sid,
+        has_column_privilege($1, 'public.sast_all_raw_data_survey', 'student_id_hash', 'SELECT') AS hash,
+        has_column_privilege($1, 'public.sast_all_raw_data_survey', 'm1', 'SELECT') AS m1,
+        has_function_privilege($1, 'public.sast_hash_student_id(text)', 'EXECUTE') AS fn`, [role]);
+      assert.deepStrictEqual(p, { sid: false, hash: true, m1: true, fn: false }, role);
+    }
+    assert.strictEqual((await db.one(`SELECT has_function_privilege('service_role', 'public.sast_hash_student_id(text)', 'EXECUTE') AS ok`)).ok, true);
+    await db.none(`DELETE FROM public.sast_all_raw_data_survey WHERE task_id = 'web:old-1'`);
+  });
   return t;
 }
 
@@ -1581,6 +1670,8 @@ async function suite(rawIdType) {
       await db.multi(MIG013);
       await db.multi(MIG014);
       await db.multi(MIG015);
+      await db.multi(VAULT_SQL);
+      await db.multi(MIG021);
       for (const tc of await suite(rawIdType)) {
         total++;
         try {

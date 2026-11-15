@@ -6,7 +6,6 @@ import BatchSetup from "./pages/BatchSetup.jsx";
 import ScanningLive from "./pages/ScanningLive.jsx";
 import Review from "./pages/Review.jsx";
 import ReviewBatches from "./pages/ReviewBatches.jsx";
-import Activation from "./pages/Activation.jsx";
 import WatcherSetup from "./pages/WatcherSetup.jsx";
 import Help from "./pages/Help.jsx";
 import SastGuide, { GuideModal } from "./pages/SastGuide.jsx";
@@ -322,15 +321,6 @@ function Shell({ profile, stationId, busy, onRequest, onStationMissing, children
             <span className="nav-step">4</span> Review forms
           </NavLink>
 
-          {profile.is_admin && (
-            <>
-              <div className="nav-group">Admin</div>
-              <NavLink to="/activate">
-                <Icon name="userCheck" /> Activate instructor logins
-              </NavLink>
-            </>
-          )}
-
           <div className="nav-group">Support</div>
           <NavLink to="/sast-guidelines">
             <Icon name="help" /> SAST Guidelines
@@ -379,6 +369,9 @@ export default function App() {
   const [bindProblem, setBindProblem] = useState("");
 
   const profile = session?.profile;
+  // Guide hook must always run at the top level so hook order remains stable across login/logout
+  const guide = useGuideGate(profile);
+  const keyForStation = stationKey?.stationId === stationId ? stationKey.key : null;
 
   const setStationId = useCallback((id) => {
     writeStationId(id);
@@ -432,109 +425,84 @@ export default function App() {
     setPendingAction({ type, openBatch });
   }
 
-  if (!session) {
-    return (
-      <BrowserRouter>
+  return (
+    <BrowserRouter>
+      {!session ? (
         <AuthLayout>
           <Login onLogin={(s) => setSession(s)} />
         </AuthLayout>
-      </BrowserRouter>
-    );
-  }
-
-  if (!stationId) {
-    return (
-      <BrowserRouter>
+      ) : !stationId ? (
         <AuthLayout>
           <ChooseStation profile={profile} onDone={setStationId} onLogout={doLogout} onStationKey={setStationKey} />
         </AuthLayout>
-      </BrowserRouter>
-    );
-  }
-
-  const guide = useGuideGate(profile);
-  const keyForStation = stationKey?.stationId === stationId ? stationKey.key : null;
-
-  return (
-    <BrowserRouter>
-      <Shell profile={profile} stationId={stationId} busy={busy} onRequest={requestAction} onStationMissing={handleStationMissing}>
-        {bindProblem && (
-          <div className="warning-box small" role="alert">
-            <p>{bindProblem}</p>
-          </div>
-        )}
-        <Routes>
-          <Route
-            path="/"
-            element={
-              <Home
-                stationId={stationId}
-                profile={profile}
-                onSwitchStation={() => requestAction("switch")}
-                onStationMissing={handleStationMissing}
+      ) : (
+        <>
+          <Shell profile={profile} stationId={stationId} busy={busy} onRequest={requestAction} onStationMissing={handleStationMissing}>
+            {bindProblem && (
+              <div className="warning-box small" role="alert">
+                <p>{bindProblem}</p>
+              </div>
+            )}
+            <Routes>
+              <Route
+                path="/"
+                element={
+                  <Home
+                    stationId={stationId}
+                    profile={profile}
+                    onSwitchStation={() => requestAction("switch")}
+                    onStationMissing={handleStationMissing}
+                  />
+                }
               />
-            }
-          />
-          <Route path="/start" element={<BatchSetup stationId={stationId} onStationMissing={handleStationMissing} />} />
-          <Route
-            path="/scanner-setup"
-            element={
-              <WatcherSetup
-                stationId={stationId}
-                stationKey={keyForStation}
-                onStationKey={(key) => setStationKey({ stationId, key })}
-                onStationMissing={handleStationMissing}
+              <Route path="/start" element={<BatchSetup stationId={stationId} onStationMissing={handleStationMissing} />} />
+              <Route
+                path="/scanner-setup"
+                element={
+                  <WatcherSetup
+                    stationId={stationId}
+                    stationKey={keyForStation}
+                    onStationKey={(key) => setStationKey({ stationId, key })}
+                    onStationMissing={handleStationMissing}
+                  />
+                }
               />
-            }
-          />
-          {/* Old address, kept so bookmarks still work. */}
-          <Route path="/watcher-setup" element={<Navigate to="/scanner-setup" replace />} />
-          <Route path="/batch/:batchId" element={<ScanningLive stationId={stationId} />} />
-          <Route path="/batch/:batchId/review" element={<Review profile={profile} />} />
-          <Route path="/review" element={<ReviewBatches profile={profile} stationId={stationId} />} />
-          <Route
-            path="/activate"
-            element={
-              profile.is_admin ? (
-                <Activation />
+              {/* Old address, kept so bookmarks still work. */}
+              <Route path="/watcher-setup" element={<Navigate to="/scanner-setup" replace />} />
+              <Route path="/batch/:batchId" element={<ScanningLive stationId={stationId} />} />
+              <Route path="/batch/:batchId/review" element={<Review profile={profile} />} />
+              <Route path="/review" element={<ReviewBatches profile={profile} stationId={stationId} />} />
+              <Route path="/sast-guidelines" element={<SastGuide />} />
+              <Route path="/help" element={<Help stationId={stationId} onStationMissing={handleStationMissing} />} />
+              <Route path="*" element={<Navigate to="/" />} />
+            </Routes>
+          </Shell>
+
+          {guide.show && <GuideModal onAck={guide.ack} />}
+
+          {pendingAction && (
+            <ConfirmDialog
+              title={pendingAction.type === "logout" ? "Log out while a batch is open?" : "Change which laptop this is?"}
+              confirmLabel={pendingAction.type === "logout" ? "Log out" : "Change laptop"}
+              danger={!!pendingAction.openBatch}
+              busy={busy}
+              onCancel={() => setPendingAction(null)}
+              onConfirm={pendingAction.type === "logout" ? doLogout : doSwitchStation}
+            >
+              {pendingAction.openBatch ? (
+                <p>
+                  A batch is still <strong>open</strong> on this laptop. It stays open and new scans keep going into it.
+                  Finish and close it first, unless someone else will carry on with it.
+                </p>
               ) : (
-                <PageHeader
-                  title="Admins only"
-                  subtitle="Only an SAO admin can activate instructor logins."
-                  back={{ to: "/", label: "Home" }}
-                />
-              )
-            }
-          />
-          <Route path="/sast-guidelines" element={<SastGuide />} />
-          <Route path="/help" element={<Help stationId={stationId} onStationMissing={handleStationMissing} />} />
-          <Route path="*" element={<Navigate to="/" />} />
-        </Routes>
-      </Shell>
-
-      {guide.show && <GuideModal onAck={guide.ack} />}
-
-      {pendingAction && (
-        <ConfirmDialog
-          title={pendingAction.type === "logout" ? "Log out while a batch is open?" : "Change which laptop this is?"}
-          confirmLabel={pendingAction.type === "logout" ? "Log out" : "Change laptop"}
-          danger={!!pendingAction.openBatch}
-          busy={busy}
-          onCancel={() => setPendingAction(null)}
-          onConfirm={pendingAction.type === "logout" ? doLogout : doSwitchStation}
-        >
-          {pendingAction.openBatch ? (
-            <p>
-              A batch is still <strong>open</strong> on this laptop. It stays open and new scans keep going into it.
-              Finish and close it first, unless someone else will carry on with it.
-            </p>
-          ) : (
-            <p>
-              You'll pick a different laptop from the list, or add this one as new. Only do this if the wrong laptop
-              was chosen. The scanner laptop must be set up for the one you pick.
-            </p>
+                <p>
+                  You'll pick a different laptop from the list, or add this one as new. Only do this if the wrong laptop
+                  was chosen. The scanner laptop must be set up for the one you pick.
+                </p>
+              )}
+            </ConfirmDialog>
           )}
-        </ConfirmDialog>
+        </>
       )}
     </BrowserRouter>
   );

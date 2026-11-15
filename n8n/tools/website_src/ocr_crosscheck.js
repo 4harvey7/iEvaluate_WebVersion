@@ -9,9 +9,8 @@
 // Thresholds from 134 labelled scanner pages (2026-10-28): remarks 'empty' 58/58 and 'ink' 40/40 right,
 // student ID 'empty' 19/19 and 'ink' 43/44 right (one mislocated page); the rest stays undecided.
 // Only the two MISMATCHES flag; a blank box with a blank AI read (the normal case) never does:
-//   student ID: box empty + AI read an ID  -> the ID is dropped (stored blank), student_id_unverified
-//               box written + AI read none -> student_id_missed (phone only; the website's Decide
-//               already flags every blank ID as student_id_missing)
+//   student ID: box empty + AI read an ID  -> the ID is dropped (stored blank), note only
+//               box written + AI read none -> note only (phone only); no student ID case flags (2026-11-10)
 //   remarks:    box written + AI read none (raw text)              -> remarks_missed
 //               box empty + AI read a real comment (not a placeholder such as 'N/A') -> remarks_unverified
 // #11 White ink: Gemini lists in corrected_rows the rows where correction fluid/tape or a heavy
@@ -61,13 +60,12 @@ function ocCrossCheck(py, gemini, geminiOk, { studentIdMissed = false } = {}) {
   const remState = formOk ? ocInkState(py, 'remarks') : null;
   const sid = formOk ? ocText(gemini.student_id) : '';
   const rem = formOk ? ocText(gemini.remarks) : '';
+  // student ID: notes only, never a review reason (2026-11-10: the stamp number identifies the form)
   if (sidState === 'empty' && /[0-9a-z]/i.test(sid)) {
     dropStudentId = true;
-    reasons.push('student_id_unverified');
-    notes.push('The AI read a student ID but the ID box looks empty. Check the sheet.');
+    notes.push('The AI read a student ID but the ID box looks empty, so no ID was kept. Not required: the stamp number identifies the form.');
   } else if (sidState === 'ink' && !sid && studentIdMissed) {
-    reasons.push('student_id_missed');
-    notes.push('The student ID box has writing but the AI read no student ID. Type it from the sheet.');
+    notes.push('The student ID box has writing but the AI read no student ID. Not required: the stamp number identifies the form.');
   }
   if (remState === 'ink' && !rem) {
     reasons.push('remarks_missed');

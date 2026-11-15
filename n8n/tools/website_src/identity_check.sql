@@ -1,5 +1,6 @@
 -- Batch still valid, no other stored form of this student, and (stamp rule, 2026-10-16) no other
 -- stored form with this page's numbering-machine stamp in the resolved term ('' = no stamp).
+-- The student is compared by keyed hash (migration 021: student_id_hash, sast_hash_student_id).
 WITH
 bi AS (
   -- placeholder instructors never count as disabled
@@ -38,7 +39,7 @@ dup AS (
     AND r."instructor_ID"::text = lower(btrim(COALESCE($1, '')))
     AND r.subject_id::text      = lower(btrim(COALESCE($2, '')))
     AND r.term_id::text         = t.term_id
-    AND r.student_id            = btrim($4)
+    AND r.student_id_hash       = public.sast_hash_student_id(btrim($4))
     AND r.task_id IS DISTINCT FROM $5
   LIMIT 1
 ),

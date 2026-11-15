@@ -610,6 +610,27 @@ def test_batch_counts_needs_review_not_failed(env, monkeypatch):
     assert codes[I1] == "not_saved_needs_review" and codes["i2"] == "failed_after_retries" and codes["i3"] == "pipeline_error"
 
 
+def test_batch_counts_auto_rejected_as_rejected(env, monkeypatch):
+    # n8n answers an auto-rejected stamp duplicate 'flagged' (flagged_count +1); the page shows it as Rejected
+    dup = dict(status="flagged", retryable=True, review_reasons=["duplicate_stamp"], message="Discarded automatically")
+    db, _, client = env(items=[
+        _item(id="f1", file_sha256="1" * 64, task_id="t-dup", **dup),
+        _item(id="f2", file_sha256="2" * 64, task_id="t-over", **dup),  # taken back with Override
+        _item(id="f3", file_sha256="3" * 64, task_id="t-few", status="flagged", retryable=True,
+              review_reasons=["min_answered_5", "too_few_answers_4_of_20"], message="Discarded automatically"),
+    ], unsaved_rows=[])
+    db.tables["failed_scan_queue"] = [{"id": "q1", "task_id": "t-dup", "batch_id": BATCH, "status": "discarded"},
+                                      {"id": "q2", "task_id": "t-over", "batch_id": BATCH, "status": "pending"},
+                                      {"id": "q3", "task_id": "t-few", "batch_id": BATCH, "status": "discarded"}]
+    next(b for b in db.tables["scan_batches"] if b["id"] == BATCH).update(flagged_count=3)
+    monkeypatch.setattr(batches, "get_supabase", lambda: db)
+    monkeypatch.setattr(batches, "get_settings", lambda: SimpleNamespace(
+        n8n_batch_webhook_url="x", simulate_scans=False, abandoned_batch_hours=3, watcher_online_seconds=90,
+        simulation_mode=False))
+    c = client.get(f"/batches/{BATCH}").json()["counts"]
+    assert c["rejected"] == 2 and c["flagged"] == 1 and c["total"] == 3
+
+
 # ------------------------------------------------------------------ ingest keeps a copy
 class IngestSB:
     """Chainable no-op tables (scan_batches -> the open batch, scan_batch_items -> `item`) + rpc capture."""

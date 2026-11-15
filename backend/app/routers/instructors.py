@@ -1,5 +1,4 @@
 import logging
-import re
 import secrets
 import uuid
 from typing import Literal
@@ -7,17 +6,14 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app import mailer
 from app.audit import audit
 from app.db import get_supabase, is_valid_uuid
 from app.name_match import is_near_duplicate, same_name, search_words_match, surname_parts
 from app.routers.departments import department_lookup
-from app.security import INSTRUCTOR_ROLES, CurrentUser, require_admin, require_staff, role_maps
+from app.security import INSTRUCTOR_ROLES, CurrentUser, require_staff, role_maps
 
 router = APIRouter()
 log = logging.getLogger("ievaluate.instructors")
-
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _full_name(r: dict) -> str:
@@ -79,11 +75,6 @@ def _search(q: str) -> list[dict]:
 @router.get("/search")
 def search_instructors(q: str = Query(..., max_length=100), user: CurrentUser = Depends(require_staff)):
     return _search(q)
-
-
-@router.get("/placeholders")
-def search_placeholders(q: str = Query(..., max_length=100), user: CurrentUser = Depends(require_admin)):
-    return [r for r in _search(q) if r["is_placeholder"]]
 
 
 class CreatePlaceholder(BaseModel):
@@ -268,78 +259,3 @@ def create_placeholder_instructor(body: CreatePlaceholder, user: CurrentUser = D
         "disabled": True,
     }
 
-
-def _is_blank(value) -> bool:
-    return value is None or not str(value).strip()
-
-
-class ActivateInstructor(BaseModel):
-    real_email: str = Field(min_length=3, max_length=254)
-
-
-@router.post("/{instructor_id}/activate")
-def activate_instructor(instructor_id: str, body: ActivateInstructor, admin: CurrentUser = Depends(require_admin)):
-    """SAO admin only: turn a placeholder instructor into a real login with
-    their real email (same account id, so their batches and results stay).
-    Then emails them (Brevo, app/mailer.py) how to set a password with
-    "Forgot Password?" in the iEvaluate phone app. The email is best effort:
-    the activation is already saved, so a mail failure only comes back as
-    email_sent: false for the admin to pass the steps on in person."""
-    if not is_valid_uuid(instructor_id):
-        raise HTTPException(status_code=404, detail="Instructor not found")
-    email = body.real_email.strip().lower()
-    if not EMAIL_RE.match(email):
-        raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "Enter a valid email address."})
-
-    sb = get_supabase()
-    res = sb.table("user_info").select("id, first_name, last_name, email, is_placeholder, university_id, address").eq("id", instructor_id).limit(1).execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Instructor not found")
-    existing = res.data[0]
-    if not existing.get("is_placeholder"):
-        raise HTTPException(status_code=400, detail={"code": "not_placeholder", "message": "This is not a placeholder account."})
-
-    like_email = email.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    taken = sb.table("user_info").select("id").ilike("email", like_email).neq("id", instructor_id).limit(1).execute()
-    if taken.data:
-        raise HTTPException(status_code=409, detail={"code": "email_in_use", "message": "That email already belongs to another account."})
-
-    old_email = existing.get("email")
-    try:
-        # Update the EXISTING auth user so every batch/result tied to this id stays intact.
-        sb.auth.admin.update_user_by_id(instructor_id, {"email": email, "email_confirm": True, "ban_duration": "none"})
-    except Exception:
-        log.exception("activation: auth update failed")
-        raise HTTPException(status_code=502, detail="Could not update the login account (the email may already be registered).")
-
-    try:
-        sb.table("user_info").update({
-            "email": email,
-            "disabled": False,
-            "is_placeholder": False,
-            "account_status": "approved",
-        }).eq("id", instructor_id).execute()
-    except Exception:
-        log.exception("activation: user_info update failed; reverting auth user")
-        try:
-            sb.auth.admin.update_user_by_id(instructor_id, {"email": old_email, "ban_duration": "876000h"})
-        except Exception:
-            log.exception("activation: auth revert failed")
-        raise HTTPException(status_code=500, detail="Activation failed. Nothing was changed; try again.")
-
-    # Activation is saved. Now tell the instructor how to set a password ("Forgot
-    # Password?" in the phone app). Never raises and never rolls back: a mail
-    # failure is reported (email_sent false) and the admin passes the steps on.
-    subject, html = mailer.activation_email(
-        existing.get("first_name"),
-        email,
-        missing_id=_is_blank(existing.get("university_id")),
-        missing_address=_is_blank(existing.get("address")),
-    )
-    email_sent, email_error = mailer.send_email(email, subject, html)
-
-    meta = {"instructor_id": instructor_id, "new_email": email, "email_sent": email_sent}
-    if not email_sent:
-        meta["email_error"] = email_error
-    audit(admin.id, "instructor_account_activated", meta)
-    return {"ok": True, "activated": True, "email": email, "email_sent": email_sent}

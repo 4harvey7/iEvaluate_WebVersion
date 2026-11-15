@@ -58,7 +58,7 @@ const MISMATCH_REASONS = ['instructor_mismatch_found', 'instructor_mismatch_not_
   'subject_mismatch_found', 'subject_mismatch_not_found', 'subject_mismatch_ambiguous'];
 const MISMATCH_RE = /^(instructor|subject)_mismatch_/;
 // Blank/unreadable header fields ('Website Decide'): held for review, never saved silently.
-const MISSING_REASONS = ['instructor_missing', 'subject_missing', 'student_id_missing'];
+const MISSING_REASONS = ['instructor_missing', 'subject_missing'];   // a blank student ID is no reason (2026-11-10)
 function assertContract(out, expectStatus) {
   assert.ok(Array.isArray(out) && out.length === 1, 'exactly one item');
   const r = out[0].json;
@@ -67,7 +67,7 @@ function assertContract(out, expectStatus) {
   assert.deepStrictEqual(Object.keys(r).sort(),
     ['flagged', 'identity_check', 'message', 'review_reasons', 'status', 'task_id', ...stampKeys].sort());
   if (stampKeys.length) {
-    assert.ok(r.auto_rejected === null || r.auto_rejected === 'duplicate_stamp', `auto_rejected ${r.auto_rejected}`);
+    assert.ok([null, 'duplicate_stamp', 'min_answered_5'].includes(r.auto_rejected), `auto_rejected ${r.auto_rejected}`);
     assert.ok(r.stamp_no === null || /^[0-9]{3,12}$/.test(r.stamp_no), `stamp_no ${r.stamp_no}`);
   }
   assert.ok(STATUSES.includes(r.status), `status ${r.status}`);
@@ -397,11 +397,10 @@ test('Agreement: confident scanner vs Gemini differing on every row -> scanner k
 });
 test('Agreement: weak scanner vs far-apart Gemini -> flagged; adjacent-level differences are not', async () => {
   const farW = await reconcile(python({ weak: weakRows(15) }), geminiWith(far(15)));
-  assert.ok(farW.review_reasons.includes('omr_agreement_below_30'), farW.review_reasons.join(','));
-  assert.ok(farW.review_reasons.includes('python_weak_disagreement_15_rows'));
+  assert.deepStrictEqual(farW.review_reasons, ['omr_agreement_below_30'], 'weak rows add no flag of their own (2026-11-10)');
   assert.strictEqual(farW.comparisons[0].resolved_by, null);
   const adj = await reconcile(python({ weak: weakRows(15) }), geminiWith(adjacent(15)));
-  assert.deepStrictEqual(adj.review_reasons, ['low_confidence_ocr_15_rows'], 'only the weak-row count flags it');
+  assert.deepStrictEqual(adj.review_reasons, [], 'weak rows alone no longer flag (2026-11-10)');
   assert.strictEqual(adj.agreement_rows, 5);
   assert.strictEqual(adj.omr_agreement.flag_agreement_rows, 20);
   assert.strictEqual(adj.comparisons[0].resolved_by, 'adjacent_level');
@@ -455,42 +454,23 @@ test('Reconcile hardening: strong agreement -> clean', async () => {
   const r = await reconcile(python());
   assert.deepStrictEqual(r.review_reasons, []);
 });
-test('Reconcile hardening: WEAK_BLANK_LIMIT / WEAK_DISAGREE_LIMIT = 3 (website)', async () => {
+test('Reconcile: weak (unsure) scanner rows never flag on their own (2026-11-10)', async () => {
   const code = codeOf('Website Reconcile OCR OMR');
-  assert.match(code, /^const WEAK_BLANK_LIMIT\s+= 3;/m);
-  assert.match(code, /^const WEAK_DISAGREE_LIMIT = 3;/m);
-});
-test('Reconcile hardening: specks (weak Python rating, Gemini blank) on 3 rows -> python_weak_gemini_blank_3_rows', async () => {
-  const specks = { m2: '', m3: '', m4: '' };
-  const r = await reconcile(python({ weak: weakRows(3, 1) }), geminiWith(specks));
-  assert.deepStrictEqual(r.review_reasons, ['python_weak_gemini_blank_3_rows'], '17/20 passes the agreement rule, the weak-row rule catches it');
-  assert.match(r.review_note, /m2, m3, m4/);
-  // 2 specks -> under the limit, clean and no note
-  const two = await reconcile(python({ weak: weakRows(2, 1) }), geminiWith({ m2: '', m3: '' }));
-  assert.deepStrictEqual(two.review_reasons, []);
-  assert.strictEqual(two.review_note, null);
-  // a STRONG Python row vs Gemini blank is not flagged by this rule
-  assert.deepStrictEqual((await reconcile(python(), geminiWith(specks))).review_reasons, []);
-});
-test('Reconcile hardening: weak rows, ratings 2+ levels apart on 3 rows -> python_weak_disagreement_3_rows', async () => {
-  // rows 10..12 = p1..p3: Python O / VS / S; Gemini S / F / US
-  const g = geminiWith({ p1: 'S', p2: 'F', p3: 'US' });
-  const r = await reconcile(python({ weak: weakRows(3, 10) }), g);
-  assert.deepStrictEqual(r.review_reasons, ['python_weak_disagreement_3_rows']);
-  assert.match(r.review_note, /unsure on p1, p2, p3 and the AI read a rating two or more levels away/);
-  assert.strictEqual(r.ratings.p1, 5, 'scanner value stored');
-  // 2 such rows -> under the limit
-  assert.deepStrictEqual((await reconcile(python({ weak: weakRows(2, 10) }), geminiWith({ p1: 'S', p2: 'F' }))).review_reasons, []);
-  // 3 weak rows one level apart -> not a conflict
-  const adj = await reconcile(python({ weak: weakRows(3, 10) }), geminiWith({ p1: 'VS', p2: 'S', p3: 'F' }));
-  assert.deepStrictEqual(adj.review_reasons, []);
-  assert.ok(adj.comparisons.slice(10, 13).every((c) => c.resolved_by === 'adjacent_level'));
-  // weak but agreeing -> clean
-  assert.deepStrictEqual((await reconcile(python({ weak: weakRows(3, 10) }))).review_reasons, []);
-});
-test('Reconcile hardening: Python unsure on >= 4 rows -> low_confidence_ocr_4_rows even when Gemini agrees', async () => {
+  for (const gone of ['low_confidence_ocr_', 'python_weak_gemini_blank_', 'python_weak_disagreement_', 'WEAK_ROW_LIMIT']) {
+    assert.ok(!code.includes(gone), gone);
+  }
+  // specks: weak Python rating, Gemini blank on 3 rows -> clean, scanner value kept
+  const specks = await reconcile(python({ weak: weakRows(3, 1) }), geminiWith({ m2: '', m3: '', m4: '' }));
+  assert.deepStrictEqual(specks.review_reasons, []);
+  assert.strictEqual(specks.review_note, null);
+  // weak rows 2+ levels apart on 3 rows -> clean (17/20 passes the agreement rule), scanner value stored
+  const far3 = await reconcile(python({ weak: weakRows(3, 10) }), geminiWith({ p1: 'S', p2: 'F', p3: 'US' }));
+  assert.deepStrictEqual(far3.review_reasons, []);
+  assert.strictEqual(far3.ratings.p1, 5);
+  assert.ok(far3.comparisons[10].python_weak, 'python_weak still reported per row');
+  // Python unsure on 4 rows where Gemini agrees -> clean
   const weak = { 0: { a: 0.04, b: 0.0 }, 1: { a: 0.04, b: 0.0 }, 2: { a: 0.04, b: 0.0 }, 3: { a: 0.04, b: 0.0 } };
-  assert.deepStrictEqual((await reconcile(python({ weak }))).review_reasons, ['low_confidence_ocr_4_rows']);
+  assert.deepStrictEqual((await reconcile(python({ weak }))).review_reasons, []);
 });
 test('Reconcile hardening: fixed fallback grid -> omr_fallback_grid', async () => {
   const r = await reconcile(python({ grid: 'fallback' }));
@@ -561,19 +541,19 @@ test('Phone reconcile: confident scanner vs Gemini differing -> not flagged; wea
   assert.ok(conf.comparisons.every((c) => c.resolved_by === 'python_confident'));
   assert.strictEqual(conf.ratings.m1, 5);
   const farW = await phoneReconcile(python({ weak: weakRows(15) }), geminiWith(far(15)));
-  assert.deepStrictEqual(farW.review_reasons, ['omr_agreement_below_30', 'low_confidence_ocr_15_rows']);
+  assert.deepStrictEqual(farW.review_reasons, ['omr_agreement_below_30']);
   const adj = await phoneReconcile(python({ weak: weakRows(15) }), geminiWith(adjacent(15)));
-  assert.deepStrictEqual(adj.review_reasons, ['low_confidence_ocr_15_rows']);
+  assert.deepStrictEqual(adj.review_reasons, []);
   assert.strictEqual(adj.comparisons[0].resolved_by, 'adjacent_level');
 });
-test('Phone reconcile: Python OMR crashed -> omr_unavailable (no Gemini-only pass); weak rows still flagged', async () => {
+test('Phone reconcile: Python OMR crashed -> omr_unavailable (no Gemini-only pass); weak rows alone not flagged', async () => {
   const r = await phoneReconcile({ error: 'Request failed with status code 400' });
   assert.ok(r.review_reasons.includes('omr_unavailable'), r.review_reasons.join(','));
   assert.strictEqual(r.needs_review, true);
   const weak = { 0: { a: 0.04, b: 0.0 }, 1: { a: 0.04, b: 0.0 }, 2: { a: 0.04, b: 0.0 }, 3: { a: 0.04, b: 0.0 } };
   const w = await phoneReconcile(python({ weak }));
-  assert.deepStrictEqual(w.review_reasons, ['low_confidence_ocr_4_rows']);
-  assert.match(w.review_note, /Python and Gemini agree on 20 of 20 rows \(100%\)\./);
+  assert.deepStrictEqual(w.review_reasons, []);
+  assert.ok(!codeOf('reconcile ocr and omr1').includes('low_confidence_ocr_'));
 });
 test('Phone reconcile: grid_not_detected still dropped when Python read the grid and Gemini agrees (phone rule kept)', async () => {
   assert.deepStrictEqual((await phoneReconcile(python({ table: false }))).review_reasons, []);
@@ -741,27 +721,26 @@ test('OCR cross-check: blank ID box + blank remarks box read blank by the AI -> 
     assert.strictEqual(ok.student_id.replace(/\s+/g, ''), '20210001', which);
   }
 });
-test('OCR cross-check: empty ID box but the AI read an ID -> ID dropped (blank), student_id_unverified + note; never discarded', async () => {
+test('OCR cross-check: empty ID box but the AI read an ID -> ID dropped (blank), note only (2026-11-10: never a reason)', async () => {
   for (const [which, rec] of RECONCILERS) {
     const r = await rec(withInk(python(), { student_id: 0.0004 }), geminiResp({ student_id: '2021 0001' }));
-    assert.deepStrictEqual(r.review_reasons, ['student_id_unverified'], which);
-    assert.strictEqual(r.needs_review, true, which);
+    assert.deepStrictEqual(r.review_reasons, [], which);
+    assert.strictEqual(r.needs_review, false, which);
     assert.strictEqual(r.auto_discard, false, which);
     assert.strictEqual(r.student_id, '', `${which}: the AI's ID is not stored`);
     assert.strictEqual(r.ocr_check.student_id_ai, '2021 0001', `${which}: kept for the reviewer`);
-    assert.ok(r.review_note.includes('The AI read a student ID but the ID box looks empty. Check the sheet.'), which);
-    if (which === 'phone') assert.strictEqual(r.validation_status, 'flagged');
+    assert.ok(r.review_note.includes('The AI read a student ID but the ID box looks empty, so no ID was kept.'), which);
   }
 });
-test('OCR cross-check: written ID box read empty -> student_id_missed on the phone only (website keeps student_id_missing in Decide)', async () => {
+test('OCR cross-check: written ID box read empty -> note only on the phone; Decide does not flag a blank ID (2026-11-10)', async () => {
   const py = () => withInk(python(), { student_id: 0.03 });
   const phone = await phoneReconcile(py(), geminiResp({ student_id: '' }));
-  assert.deepStrictEqual(phone.review_reasons, ['student_id_missed']);
+  assert.deepStrictEqual(phone.review_reasons, []);
   assert.ok(phone.review_note.includes('The student ID box has writing but the AI read no student ID.'));
   const web = await reconcile(py(), geminiResp({ student_id: '' }));
-  assert.deepStrictEqual(web.review_reasons, [], 'no duplicate of student_id_missing');
+  assert.deepStrictEqual(web.review_reasons, []);
   const d = await decide(identity(), { ...REC, student_id: web.student_id });
-  assert.ok(d.review_reasons.includes('student_id_missing'), 'Decide still flags the blank ID');
+  assert.ok(!d.review_reasons.some((r) => r.startsWith('student_id')), 'a blank ID is never a reason');
 });
 test('OCR cross-check: remarks -> ink + AI blank = remarks_missed; no ink + AI text = remarks_unverified (text kept)', async () => {
   for (const [which, rec] of RECONCILERS) {
@@ -1261,29 +1240,31 @@ test('Form check: duplicate_student_id (vs the batch) dropped when the suggestio
   const nf = formMatch({ i: 'jose rizal', ic: [BATCH_I(0.04)] });
   assert.deepStrictEqual((await decide(dupRow, REC, nf)).review_reasons, ['duplicate_student_id']);
 });
-test('Missing header fields: blank / placeholder student ID -> student_id_missing (stored NULL), never a duplicate; instructor/subject only when unreadable', async () => {
+test('Missing header fields: blank / placeholder student ID -> no reason (stored NULL, 2026-11-10), never a duplicate; instructor/subject only when unreadable', async () => {
   for (const sid of ['', '   ', 'N/A', 'n.a.', 'none', 'illegible', '-', '?']) {
-    const d = await decide(identity({ duplicate_student_exists: true, duplicate_student_task_id: 'web:other' }), { ...REC, student_id: sid });
-    assert.strictEqual(d.decision, 'flagged', `student id ${JSON.stringify(sid)}`);
-    assert.deepStrictEqual(d.review_reasons, ['student_id_missing'], `a placeholder ID is no duplicate (${JSON.stringify(sid)})`);
+    const d = await decide(identity({ duplicate_student_exists: true, duplicate_student_task_id: 'web:other' }), { ...REC, student_id: sid, student_id_read: '' });
+    assert.ok(!d.review_reasons.some((r) => r.startsWith('student_id') || r === 'duplicate_student_id'), `student id ${JSON.stringify(sid)}`);
     assert.strictEqual(d.student_id, null);
-    assert.strictEqual(d.partial_data.student_id, '');
-    assert.match(d.review_note, /student ID on the form is blank or could not be read/);
-    assert.match(d.review_note, /can also be approved without one/);
+    assert.strictEqual(d.partial_data.student_id, sid.trim(), 'the raw read is shown to the reviewer');
     assert.strictEqual(d.identity_check, null);
     assert.strictEqual(d.instructor_id, INSTR);
   }
+  // the reconciler's raw read of an invalid ID reaches the review form (top-level ID stays blank)
+  const raw = await decide(identity(), { ...REC, student_id: '', student_id_read: '2021?001' });
+  assert.strictEqual(raw.student_id, null);
+  assert.strictEqual(raw.partial_data.student_id, '2021?001');
+  assert.ok(!raw.review_reasons.some((r) => r.startsWith('student_id')));
   // a real ID is kept as read; a real duplicate still flags
   const ok = await decide(identity(), { ...REC, student_id: '2021-0001' });
   assert.deepStrictEqual(ok.review_reasons, []);
   assert.strictEqual(ok.student_id, '2021-0001');
   const dup = await decide(identity({ duplicate_student_exists: true }), { ...REC, student_id: '2021-0001' });
   assert.deepStrictEqual(dup.review_reasons, ['duplicate_student_id']);
-  // all three blank -> all three reasons, nothing saved
+  // all three blank -> instructor + subject reasons only, nothing saved
   const all = await decide(identity(), { ...REC, ocr_instructor: '', ocr_subject: '', student_id: '' },
     formMatch({ i: '', ic: [BATCH_I(0)], s: '', sc: [BATCH_S({ ns: 0 })] }));
   assert.strictEqual(all.decision, 'flagged');
-  assert.deepStrictEqual(all.review_reasons, ['instructor_missing', 'subject_missing', 'student_id_missing']);
+  assert.deepStrictEqual(all.review_reasons, ['instructor_missing', 'subject_missing']);
   // only the unreadable one: a readable batch instructor + unreadable subject
   const subjOnly = await decide(identity(), { ...REC, ocr_subject: '' }, formMatch({ s: '', sc: [BATCH_S({ ns: 0 })] }));
   assert.deepStrictEqual(subjOnly.review_reasons, ['subject_missing']);
@@ -1296,12 +1277,12 @@ test('Missing header fields: blank / placeholder student ID -> student_id_missin
     'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': { ...REC, ocr_instructor: '' }, 'Website Identity Check': identity(),
   }))[0].json;
   assert.deepStrictEqual(unchecked.review_reasons, ['form_match_failed']);
-  // a page with a missing field is never also a spot check
+  // a page with only a blank student ID is a normal page: clean, or at most a random spot check
   for (let i = 0; i < 200; i++) {
     const out = (await run('Website Decide', formMatch(), {
       'Website Prepare Scan': { ...CTX, task_id: `spot-check-${i}` }, 'Website Reconcile OCR OMR': { ...REC, student_id: '' }, 'Website Identity Check': identity(),
     }))[0].json;
-    assert.deepStrictEqual(out.review_reasons, ['student_id_missing']);
+    assert.ok(out.review_reasons.length === 0 || (out.review_reasons.length === 1 && out.review_reasons[0] === 'spot_check'));
   }
 });
 test('Reused image: Prepare passes a valid reused_image through (else null); Decide flags reused_image, never rejects or saves it', async () => {
@@ -1330,7 +1311,7 @@ test('Reused image: Prepare passes a valid reused_image through (else null); Dec
   const both = (await run('Website Decide', formMatch(), {
     'Website Prepare Scan': ctx, 'Website Reconcile OCR OMR': { ...REC, student_id: '' }, 'Website Identity Check': identity(),
   }))[0].json;
-  assert.deepStrictEqual(both.review_reasons, ['student_id_missing', 'reused_image']);
+  assert.deepStrictEqual(both.review_reasons, ['reused_image'], 'a blank student ID adds no reason');
   for (let i = 0; i < 200; i++) {
     const out = (await run('Website Decide', formMatch(), {
       'Website Prepare Scan': { ...ctx, task_id: `spot-check-${i}` }, 'Website Reconcile OCR OMR': REC, 'Website Identity Check': identity(),
@@ -1378,6 +1359,7 @@ test('Form check: identity_check is non-null exactly when a *_mismatch_* reason 
   const code = codeOf('Website Decide');
   for (const r of IDENTITY_REASONS) assert.ok(!code.includes(`'${r}'`), `Decide still emits ${r}`);
   for (const r of [...MISMATCH_REASONS, 'form_match_failed', ...MISSING_REASONS, 'reused_image']) assert.ok(code.includes(`'${r}'`), `Decide lacks ${r}`);
+  assert.ok(!code.includes("'student_id_missing'"), 'a blank student ID is never a reason');
 });
 // ---------------------------------------------------------------- real batch from the live site (2026-09-28)
 // Batch Rodz Harvey D Licayan / PC121 Discreet Math, 8 pages of the same instructor/subject; every page
@@ -2067,7 +2049,9 @@ test('Min answered (website): Decide flags it, Flagged Record passes auto_discar
   const ok = assertContract([{ json: JSON.parse(evalBody({}, { 'Website Flagged Record': wrec })) }], 'flagged');
   assert.deepStrictEqual(ok.review_reasons, ['too_few_answers_4_of_20']);
   assert.strictEqual(ok.message, 'Discarded automatically: fewer than 5 of the 20 items were answered (only 4), so this form is not counted.');
+  assert.strictEqual(ok.auto_rejected, 'min_answered_5', 'the backend counts it under Rejected');
   const failed = JSON.parse(evalBody({ error: 'HTTP 500' }, { 'Website Flagged Record': wrec }));
+  assert.strictEqual(failed.auto_rejected, null);
   assert.ok(failed.review_reasons.includes('internal_error_not_saved'));
   assert.match(failed.message, /^NOT SAVED/);
   // no staff push for a discarded form; a pending one still notifies its staff member
@@ -3083,37 +3067,33 @@ test('Stamp: Gemini prompt (both) carries the verbatim stamp paragraph; stamp_nu
     }
   }
 });
-test('Stamp: both reconcilers -- ok (leading zeros kept, de-duplicated, separators stripped), missing, unreadable, multiple', async () => {
+test('Stamp: both reconcilers -- the Python reader alone decides (2026-11-10); the AI stamp is shown, never used', async () => {
+  // rec(python stamp reads, Gemini's stamp_numbers): Gemini's page/tile reads agree with Gemini's answer
+  const pyRec = async (rec, reads, gem, opts = {}) => rec(python({ stamp: pyStamp(reads, opts) }), geminiResp({
+    stamp_numbers: gem, stamp_numbers_page: gem, stamp_reads_tiles: gem.map((n, i) => ({ tile: `T${i + 1}`, number: n })) }));
   for (const [which, rec] of RECONCILERS) {
-    const ok = await stampRec(rec, ['0100005'], ['0100005']);
+    const ok = await pyRec(rec, ['0100005'], ['9999999']);
     assert.strictEqual(ok.stamp_status, 'ok', which);
-    assert.strictEqual(ok.stamp_no, '0100005', `${which}: leading zero kept`);
+    assert.strictEqual(ok.stamp_no, '0100005', `${which}: Python's number, not the AI's`);
     assert.deepStrictEqual(ok.stamp_candidates, ['0100005'], which);
-    assert.deepStrictEqual(ok.stamp_raw, ['0100005'], which);
+    assert.deepStrictEqual(ok.stamp_raw, ['9999999'], `${which}: the AI's read is kept for the reviewer`);
     assert.deepStrictEqual(ok.review_reasons, [], which);
     assert.strictEqual(ok.stamp_source, 'gemini+python', which);
     const cases = [
-      [['0100005', ' 0100005 '], 'ok', '0100005', ['0100005']],
-      [['No. 0100-005'], 'ok', '0100005', ['0100005']],
-      [['123'], 'ok', '123', ['123']],
-      [['000000000012'], 'ok', '000000000012', ['000000000012']],
-      [[], 'missing', null, []],
-      [['', '   '], 'missing', null, []],
-      [undefined, 'missing', null, []],
-      ['0100005', 'missing', null, []],                 // not an array = []
-      [['01?0005'], 'unreadable', null, []],
-      [['12'], 'unreadable', null, []],                 // too short
-      [['1234567890123'], 'unreadable', null, []],      // 13 digits: too long
-      [['abc'], 'unreadable', null, []],
-      [['0100005', '0200006'], 'multiple', null, ['0100005', '0200006']],
-      // Python read exactly one complete stamp: trusted over Gemini's several (python_trusted, 2026-11-06)
-      [['0100005', '01?0006'], 'ok', '0100005', ['0100005']],
-      [['0100005', '12'], 'ok', '0100005', ['0100005']],
+      [['0100005'], {}, ['0100005'], 'ok', '0100005', ['0100005']],
+      [['000000000012'], {}, [], 'ok', '000000000012', ['000000000012']],
+      [[], {}, ['0100005'], 'missing', null, []],                       // the AI's number is never used
+      [[], {}, [], 'missing', null, []],
+      [['01?0005'], {}, ['0100005'], 'unreadable', null, []],
+      [['0100005', '0200006'], {}, ['0100005'], 'multiple', null, ['0100005', '0200006']],
+      [['0100005'], { like: 2 }, ['0100005'], 'unconfirmed', null, ['0100005']],   // other stamp-like marks too
+      [['0100005'], { reader: false }, ['0100005'], 'unconfirmed', null, []],     // reader did not run: no AI fallback
     ];
-    const REASON = { ok: null, missing: 'stamp_missing', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps' };
-    for (const [stamps, status, no, cands] of cases) {
-      const r = await stampRec(rec, stamps, cands);
-      const tag = `${which}: ${JSON.stringify(stamps)}`;
+    const REASON = { ok: null, missing: 'stamp_missing', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps',
+      unconfirmed: 'stamp_unconfirmed' };
+    for (const [reads, opts, gem, status, no, cands] of cases) {
+      const r = await pyRec(rec, reads, gem, opts);
+      const tag = `${which}: python ${JSON.stringify(reads)} ${JSON.stringify(opts)} AI ${JSON.stringify(gem)}`;
       assert.strictEqual(r.stamp_status, status, tag);
       assert.strictEqual(r.stamp_no, no, tag);
       assert.deepStrictEqual(r.stamp_candidates, cands, tag);
@@ -3125,16 +3105,18 @@ test('Stamp: both reconcilers -- ok (leading zeros kept, de-duplicated, separato
         assert.deepStrictEqual(r.review_reasons, [], tag);
       }
     }
-    // Gemini answered without JSON and Python read no stamp -> unreadable (the stamp could not be read)
-    const nj = await rec(python({ stamp: pyStamp([]) }), { candidates: [{ content: { parts: [{ text: 'no json' }] } }] });
-    assert.strictEqual(nj.stamp_status, 'unreadable', which);
-    assert.ok(nj.review_reasons.includes('stamp_unreadable') && nj.review_reasons.includes('gemini_unavailable'), which);
+    assert.strictEqual((await pyRec(rec, ['0100005'], [], { reader: false })).stamp_hint, null, `${which}: no AI hint`);
+    // Gemini answered without JSON: the stamp still comes from Python
+    const nj = await rec(python({ stamp: pyStamp(['0100005']) }), { candidates: [{ content: { parts: [{ text: 'no json' }] } }] });
+    assert.strictEqual(nj.stamp_status, 'ok', which);
+    assert.strictEqual(nj.stamp_no, '0100005', which);
+    assert.ok(nj.review_reasons.includes('gemini_unavailable') && !nj.review_reasons.some((x) => x.startsWith('stamp')), which);
   }
-  // website: the Gemini call itself failed -> unreadable
+  // website: the Gemini call itself failed and Python read no stamp -> missing
   const failed = (await run('Website Reconcile OCR OMR', { error: 'timeout' },
     { 'Website Python OMR': python({ stamp: pyStamp([]) }), 'Website AI Validation': undefined }))[0].json;
-  assert.strictEqual(failed.stamp_status, 'unreadable');
-  assert.deepStrictEqual(failed.review_reasons, ['ai_validation_failed', 'stamp_unreadable']);
+  assert.strictEqual(failed.stamp_status, 'missing');
+  assert.deepStrictEqual(failed.review_reasons, ['ai_validation_failed', 'stamp_missing']);
   // one copy of website_src/stamp.js in each reconciler
   const copies = ['Website Reconcile OCR OMR', 'reconcile ocr and omr1'].map((n) => {
     const c = codeOf(n);
@@ -3174,7 +3156,7 @@ test('Stamp: Decide -- duplicate in the term -> auto_reject duplicate_stamp firs
   assert.match(d.partial_data.summary, / — discarded: duplicate_stamp$/);
   // other reasons stay after it; a JSON-string DUP (driver) is parsed
   const d2 = await run2({}, { student_id: '', review_reasons: ['omr_agreement_below_30'] });
-  assert.deepStrictEqual(d2.review_reasons, ['duplicate_stamp', 'omr_agreement_below_30', 'student_id_missing']);
+  assert.deepStrictEqual(d2.review_reasons, ['duplicate_stamp', 'omr_agreement_below_30']);
   const d3 = (await run('Website Decide', formMatch(), { 'Website Prepare Scan': CTX, 'Website Reconcile OCR OMR': REC,
     'Website Identity Check': identity({ duplicate_stamp_exists: true, duplicate_stamp_of: JSON.stringify(DUP) }) }))[0].json;
   assert.deepStrictEqual(d3.duplicate_of, DUP);
@@ -3436,11 +3418,12 @@ test('Stamp (two readers): every decision path in both reconcilers', async () =>
     // [tag, python block, gemini, status, stamp_no, hint, why, source]
     ['agree', pyStamp(['0100005']), gem2(), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
     ['disagree: Python trusted', pyStamp(['0100006']), gem2(), 'ok', '0100006', null, 'python_trusted', 'gemini+python'],
-    ['disagree, Python unsure', pyStamp(['01?0006']), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
-    ['python ?', pyStamp(['01?0005']), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
-    ['python read nothing', pyStamp([]), gem2(), 'unconfirmed', null, '0100005', 'python_incomplete', null],
-    ['python block missing (old OMR / failed)', null, gem2(), 'unconfirmed', null, '0100005', 'python_not_run', null],
-    ['python reader off', pyStamp(['0100005'], { reader: false }), gem2(), 'unconfirmed', null, '0100005', 'python_not_run', null],
+    // 2026-11-10: Python alone decides; the AI's number is never the stamp or the hint
+    ['disagree, Python unsure', pyStamp(['01?0006']), gem2(), 'unreadable', null, null, 'python_incomplete', null],
+    ['python ?', pyStamp(['01?0005']), gem2(), 'unreadable', null, null, 'python_incomplete', null],
+    ['python read nothing', pyStamp([]), gem2(), 'missing', null, null, 'none', null],
+    ['python block missing (old OMR / failed)', null, gem2(), 'unconfirmed', null, null, 'python_not_run', null],
+    ['python reader off', pyStamp(['0100005'], { reader: false }), gem2(), 'unconfirmed', null, null, 'python_not_run', null],
     ['python 2 stamp-like, 1 complete', pyStamp(['0100005', '01?0005']), gem2(), 'unconfirmed', null, '0100005', 'python_stamp_like', null],
     ['gemini ?', pyStamp(['0100005']), gem2({ final: ['01?0005'], page: ['01?0005'], tiles: ['01?0005'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
     ['gemini nothing, python read', pyStamp(['0100005']), gem2({ final: [], page: [], tiles: [] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
@@ -3452,7 +3435,7 @@ test('Stamp (two readers): every decision path in both reconcilers', async () =>
     ['no tile sheet', pyStamp(['0100005'], { sheet: false }), gem2({ tiles: [] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
     ['gemini multiple', pyStamp(['0100005']), gem2({ final: ['0100005', '0200006'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
     ['page multiple', pyStamp(['0100005']), gem2({ page: ['0100005', '0200006'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
-    ['python multiple', pyStamp(['0100005', '0200006']), gem2(), 'multiple', null, null, 'readers_see_several', null],
+    ['python multiple', pyStamp(['0100005', '0200006']), gem2(), 'multiple', null, null, 'python_several', null],
     ['format check off by default: 5 digits', pyStamp(['12345']), gem2({ final: ['12345'], page: ['12345'], tiles: ['12345'] }), 'ok', '12345', null, 'python_trusted', 'gemini+python'],
     ['9 digits', pyStamp(['012345678']), gem2({ final: ['012345678'], page: ['012345678'], tiles: ['012345678'] }), 'ok', '012345678', null, 'python_trusted', 'gemini+python'],
     ['length differs', pyStamp(['0100005']), gem2({ final: ['01000050'], page: ['01000050'], tiles: ['01000050'] }), 'ok', '0100005', null, 'python_trusted', 'gemini+python'],
@@ -3477,7 +3460,7 @@ test('Stamp (two readers): every decision path in both reconcilers', async () =>
     }
     // the reviewer sees both reads, with the reader's '?' positions
     const q = await rec(python({ stamp: pyStamp(['01?0005']) }), gem2());
-    assert.match(q.review_note, /not confirmed by both readers/);
+    assert.match(q.review_note, /The scanner could not read the whole stamp number/);
     assert.match(q.review_note, /AI read: 0100005\. Scanner read: 01\?0005 \(\? = a digit it was not sure of\)\./, which);
     assert.deepStrictEqual(q.stamp_check.python, ['01?0005']);
     assert.deepStrictEqual(q.stamp_check.gemini_tiles, ['0100005']);
@@ -3490,7 +3473,7 @@ test('Stamp (two readers): every decision path in both reconcilers', async () =>
 test('Stamp (two readers): format check and the Gemini-only fallback are config switches, both OFF', () => {
   const src = fs.readFileSync(path.join(__dirname, 'website_src', 'stamp.js'), 'utf8');
   assert.match(src, /^const ST_FORMAT_CHECK = false;$/m);
-  assert.match(src, /^const ST_ALLOW_GEMINI_ONLY = false;$/m);
+  assert.ok(!src.includes('ST_ALLOW_GEMINI_ONLY'), 'no Gemini-only fallback (2026-11-10)');
   const load = (s) => new Function(`${s}\nreturn stCheckStamp;`)();   // eslint-disable-line no-new-func
   const G = (n) => ({ stamp_numbers: [n], stamp_numbers_page: [n], stamp_reads_tiles: [{ tile: 'T1', number: n }] });
   const fmt = load(src.replace('const ST_FORMAT_CHECK = false;', 'const ST_FORMAT_CHECK = true;')
@@ -3499,17 +3482,12 @@ test('Stamp (two readers): format check and the Gemini-only fallback are config 
   const bad = fmt(G('9900005'), true, pyStamp(['9900005']));
   assert.deepStrictEqual([bad.stamp_status, bad.stamp_check.why, bad.stamp_hint], ['unconfirmed', 'format', '9900005']);
   assert.strictEqual(fmt(G('01000051'), true, pyStamp(['01000051'])).stamp_check.why, 'format');
-  const fb = load(src.replace('const ST_ALLOW_GEMINI_ONLY = false;', 'const ST_ALLOW_GEMINI_ONLY = true;'));
-  const f1 = fb({ stamp_numbers: ['0100005'] }, true, undefined);
-  assert.deepStrictEqual([f1.stamp_status, f1.stamp_no, f1.stamp_source, f1.stamp_check.why], ['ok', '0100005', 'gemini', 'gemini_only_fallback']);
-  // with the reader present the fallback changes nothing: a disagreement still goes to review
-  assert.strictEqual(fb(G('0100005'), true, pyStamp(['01?0006'])).stamp_status, 'unconfirmed');
   const off = load(src)({ stamp_numbers: ['0100005'] }, true, undefined);
-  assert.deepStrictEqual([off.stamp_status, off.stamp_source], ['unconfirmed', null]);
+  assert.deepStrictEqual([off.stamp_status, off.stamp_no, off.stamp_source, off.stamp_hint], ['unconfirmed', null, null, null]);
 });
 test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an unconfirmed match is a hint (website + phone)', async () => {
   const ctx = { instructor_id: INSTR, subject_id: SUBJ, term_id: TERM, task_id: TASK };
-  const unc = await reconcile(python({ stamp: pyStamp(['01?0005']) }), gem2());
+  const unc = await reconcile(python({ stamp: pyStamp(['0100005', '01?0005']) }), gem2());
   assert.strictEqual(unc.stamp_status, 'unconfirmed');
   // Identity Check $6: the accepted stamp, else the hint
   assert.strictEqual(exprValue('Website Identity Check', unc, { 'Website Prepare Scan': ctx })[5], '0100005');
@@ -3523,7 +3501,7 @@ test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an 
   assert.match(d.review_note, /Possible duplicate: a form with stamp 0100005 is already stored for this term \(saved 2026-10-01\)/);
   assert.deepStrictEqual(d.partial_data.stamp_duplicate_hint, DUP);
   assert.strictEqual(d.partial_data.stamp_hint, '0100005');
-  assert.strictEqual(d.partial_data.stamp_check.why, 'python_incomplete');
+  assert.strictEqual(d.partial_data.stamp_check.why, 'python_stamp_like');
   // no duplicate -> no hint note
   const d0 = await decide(identity({ duplicate_stamp_exists: false, duplicate_stamp_of: null }), unc);
   assert.ok(!/Possible duplicate/.test(d0.review_note) && !('stamp_duplicate_hint' in d0.partial_data));
@@ -3534,14 +3512,14 @@ test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an 
   assert.strictEqual(q.stamp_no, null);
   assert.strictEqual(q.stamp_source, null);
   assert.strictEqual(q.partial_data.stamp_status, 'unconfirmed');
-  assert.deepStrictEqual(q.partial_data.stamp_check.python, ['01?0005']);
+  assert.deepStrictEqual(q.partial_data.stamp_check.python, ['0100005', '01?0005']);
   assert.deepStrictEqual(q.partial_data.stamp_duplicate_hint, DUP);
   // accepted stamp + duplicate -> auto-reject (unchanged), source gemini+python
   const acc = await reconcile(python(), gem2());
   const da = await decide(identity({ duplicate_stamp_exists: true, duplicate_stamp_of: DUP }), acc);
   assert.strictEqual(da.auto_reject, 'duplicate_stamp');
   // phone: the hint goes to Phone Stamp Check; a match adds a note, never an auto-reject
-  const pu = await phoneReconcile(python({ stamp: pyStamp(['01?0006']) }), gem2());
+  const pu = await phoneReconcile(python({ stamp: pyStamp(['0100005', '01?0006']) }), gem2());
   assert.deepStrictEqual(exprValue('Phone Stamp Check', {}, { 'reconcile ocr and omr1': pu }), ['', '0100005', 'phone-1']);
   const v = (await run('Phone Stamp Verdict', { duplicate_stamp_exists: true, duplicate_stamp_of: DUP }, { 'reconcile ocr and omr1': pu }))[0].json;
   assert.strictEqual(v.auto_reject, undefined);
@@ -3553,7 +3531,7 @@ test('Stamp (two readers): duplicate auto-reject only for an accepted stamp; an 
   assert.strictEqual(pq.status, 'pending');
   assert.strictEqual(pq.stamp_no, null);
   assert.deepStrictEqual(pq.partial_data.stamp_duplicate_hint, DUP);
-  assert.strictEqual(pq.partial_data.stamp_check.why, 'python_incomplete');
+  assert.strictEqual(pq.partial_data.stamp_check.why, 'python_stamp_like');
   // a failed check on a hint does not add stamp_check_failed (the scan is in review anyway)
   const vf = (await run('Phone Stamp Verdict', {}, { 'reconcile ocr and omr1': pu }))[0].json;
   assert.deepStrictEqual(vf.review_reasons, ['stamp_unconfirmed']);

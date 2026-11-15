@@ -86,7 +86,7 @@ function InstructorPicker({ departments, selected, onSelect, inputId }) {
       {showCreate && (
         <div className="warning-box">
           <strong>Add a new instructor</strong>
-          <p>This adds the instructor now so you can scan their sheets. Their login stays switched off until an SAO admin activates it with their real email.</p>
+          <p>This adds the instructor now so you can scan their sheets. Their login stays switched off on this website.</p>
           <div className="grid-2">
             <div>
               <label htmlFor="new-inst-first">First name</label>

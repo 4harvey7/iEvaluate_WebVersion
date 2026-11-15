@@ -286,10 +286,8 @@ if (subj.match === 'unreadable') {
 const studentIdIn = String(rec.student_id || '').trim();
 const studentIdNorm = studentIdIn.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 const studentId = (studentIdNorm && !NAME_PLACEHOLDERS.has(studentIdNorm)) ? studentIdIn : null;
-if (!studentId) {
-  reasons.push('student_id_missing');
-  notes.push(`The student ID on the form is blank or could not be read${studentIdIn ? ` (${quote(studentIdIn)})` : ''}. Type it from the sheet if it is there; the page can also be approved without one.`);
-}
+// blank / unreadable ID is never a review reason (2026-11-10): the stamp number identifies the form
+const studentIdRead = String(rec.student_id_read || '').trim() || studentIdIn;
 
 // the same image file was already marked in another batch (backend lookup by sha256)
 const reused = ctx.reused_image;
@@ -412,7 +410,7 @@ return [{
       remarks: remark,
       ...(remarksMasked ? { remarks_masked: true } : {}),
       date: rec.date || '',
-      student_id: studentId || '',
+      student_id: studentId || studentIdRead,   // what was read, even if not a valid ID (editable on review)
       ratings: rec.ratings ?? null,
       summary: `${answered}/20 answered`
         + (agreementPercent !== null ? `, agreement ${agreementPercent}%` : '')

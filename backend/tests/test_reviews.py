@@ -3,6 +3,8 @@ fake n8n: no network, no database. The fake evaluates the filters the router
 uses, so version-conditional updates really match or miss, and it mimics the
 migration-005 trigger (updated_at + review_version) or its absence."""
 import base64
+import hashlib
+import hmac
 import io
 import re
 from datetime import datetime, timedelta, timezone
@@ -71,6 +73,17 @@ def _jpeg_b64():
 
 
 # ------------------------------------------------------------------ fake PostgREST
+def fake_hash(student_id):
+    """Stand-in for public.sast_hash_student_id (migration 021): same shape, test pepper."""
+    v = (student_id or "").strip()
+    return v and "h1:" + hmac.new(b"test-pepper-" * 4, v.encode(), hashlib.sha256).hexdigest()
+
+
+def raw_row(**kw):
+    """A stored sast_all_raw_data_survey row, with the hash the 021 trigger would add."""
+    return {**kw, "student_id_hash": fake_hash(kw.get("student_id")) or None}
+
+
 def _s(v):
     return None if v is None else str(v)
 
@@ -177,6 +190,10 @@ class FakeDB:
 
     def table(self, name):
         return FakeQuery(self, name)
+
+    def rpc(self, name, params):
+        assert name == "sast_hash_student_id", name  # the only RPC the review router calls
+        return SimpleNamespace(execute=lambda: SimpleNamespace(data=fake_hash(params["p_student_id"])))
 
     def touch(self, table, old, new):
         """migrations/005 trigger."""
@@ -553,7 +570,7 @@ def test_approve_in_progress_and_stale_submission(env):
 def test_approve_would_overwrite_and_confirm(env):
     db, n8n, client = env()
     db.tables["sast_all_raw_data_survey"] = [
-        {"instructor_ID": PEDRO, "subject_id": IT101, "term_id": TERM, "student_id": "2021-0001", "task_id": "web:x:other"}]
+        raw_row(instructor_ID=PEDRO, subject_id=IT101, term_id=TERM, student_id="2021-0001", task_id="web:x:other")]
     r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body())
     assert r.status_code == 409
     d = r.json()["detail"]
@@ -563,11 +580,27 @@ def test_approve_would_overwrite_and_confirm(env):
     assert r.status_code == 200 and len(n8n.calls) == 1
 
 
+def test_overwrite_check_compares_the_keyed_hash_not_the_plaintext(env):
+    db, n8n, client = env()
+    # same plaintext but no/other hash (e.g. a different pepper): not this student's stored form
+    db.tables["sast_all_raw_data_survey"] = [
+        {"instructor_ID": PEDRO, "subject_id": IT101, "term_id": TERM, "student_id": "2021-0001",
+         "student_id_hash": "h1:" + "0" * 64, "task_id": "web:x:other"}]
+    assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body()).status_code == 200
+    # the stored row's hash matches the typed ID (spaces ignored, like the database's btrim)
+    db2, _, client2 = env()
+    db2.tables["sast_all_raw_data_survey"] = [
+        {"instructor_ID": PEDRO, "subject_id": IT101, "term_id": TERM, "student_id": None,
+         "student_id_hash": fake_hash(" 2021-0001 "), "task_id": "web:x:other"}]
+    r = client2.post(f"/reviews/queue/{Q1}/approve", json=approve_body())
+    assert r.status_code == 409 and r.json()["detail"]["student_id"] == "2021-0001"
+
+
 def test_same_task_raw_row_is_not_an_overwrite(env):
     db, _, client = env()
     db.tables["sast_all_raw_data_survey"] = [
-        {"instructor_ID": PEDRO, "subject_id": IT101, "term_id": TERM, "student_id": "2021-0001",
-         "task_id": f"web:{BATCH}:aaaa000000000001"}]
+        raw_row(instructor_ID=PEDRO, subject_id=IT101, term_id=TERM, student_id="2021-0001",
+                task_id=f"web:{BATCH}:aaaa000000000001")]
     assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body()).status_code == 200
 
 
@@ -805,7 +838,7 @@ def test_import_error_resolve_keeps_raw_values_when_not_edited(env):
 def test_import_error_resolve_http_error_and_overwrite(env):
     db, n8n, client = env(n8n=FakeN8n(status=502))
     db.tables["sast_all_raw_data_survey"] = [
-        {"instructor_ID": JUAN, "subject_id": IT101, "term_id": TERM, "student_id": "2021-0009", "task_id": None}]
+        raw_row(instructor_ID=JUAN, subject_id=IT101, term_id=TERM, student_id="2021-0009", task_id=None)]
     body = {"expected_version": 1, "instructor_id": JUAN, "subject_id": IT101}
     r = client.post("/reviews/import-errors/101/resolve", json=body)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "would_overwrite"

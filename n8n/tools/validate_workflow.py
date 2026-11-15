@@ -1051,7 +1051,7 @@ def main(argv):
         st_bad.append("build flagged record1: stamp block missing, repeated or before the min-answered block")
     if "$('Phone Stamp Verdict')" not in bfc:
         st_bad.append("build flagged record1: does not read Phone Stamp Verdict")
-    if "auto_rejected: (dupStamp ? 'duplicate_stamp' : null)" not in respond_body or "rc.rule === 'duplicate_stamp'" not in respond_body:
+    if "auto_rejected: (dupStamp ? 'duplicate_stamp' : (discarded ? 'min_answered_5' : null))" not in respond_body or "rc.rule === 'duplicate_stamp'" not in respond_body:
         st_bad.append(f"{FLAGGED_RESPOND}: duplicate_stamp answers (website auto_rejected, phone JSON) missing")
     psc, psv = by_name.get(PHONE_STAMP_CHECK), by_name.get(PHONE_STAMP_VERDICT)
     if not psc or psc["type"] != "n8n-nodes-base.postgres" or psc["parameters"].get("query") != read("phone_stamp_check.sql") \

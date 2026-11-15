@@ -6,18 +6,16 @@
 //             '?' for a digit it cannot read;
 //   Python  - the OMR's stamp_candidates block (/process, STAMP_READER): python_numbers (complete
 //             reads, no '?'), python_stamp_like (candidates with >= 4 sure digits), boxes[].python_read.
-// stCheckStamp -> stamp_status:
-//   ok          Gemini gives exactly one number (no '?', nothing else), the full-page read and every
-//               tile read are that number, Python's complete reads are exactly that number with
-//               exactly one stamp-like candidate, and (optional, ST_FORMAT_CHECK) the format fits.
-//               stamp_source 'gemini+python'. Only an ok stamp is saved / auto-rejected as a duplicate.
-//   unconfirmed the readers disagree, Python's read is incomplete ('?') or missing, the page and tile
-//               reads differ, or the stamp reader did not run (old OMR / /process failed) -> review;
-//               stamp_hint = the number to check for a possible duplicate (a hint, never a reject).
-//   unreadable  Gemini failed, or read only '?' / broken entries.
-//   multiple    two or more different numbers (Gemini's answer, its page or tile reads, or Python).
-//   missing     no stamp at all (Gemini read none and Python read no complete number).
-// stReadStamps (Gemini's stamp_numbers alone) is the first step and the old one-reader rule.
+// stCheckStamp -> stamp_status, from the Python reader ONLY (2026-11-10; the AI's stamp reads are unreliable
+// and are kept for the reviewer to see, never used):
+//   ok          Python read exactly one complete number with exactly one stamp-like candidate and
+//               (optional, ST_FORMAT_CHECK) the format fits. stamp_source 'gemini+python' (DB value for
+//               "read automatically"). Only an ok stamp is saved / auto-rejected as a duplicate.
+//   unconfirmed the reader did not run (old OMR / /process failed), one complete number but other
+//               stamp-like marks too, or a format miss -> review; stamp_hint = Python's number (a hint).
+//   unreadable  Python saw a stamp but no complete number ('?' digits).
+//   multiple    Python read two or more complete numbers.
+//   missing     Python saw no stamp at all.
 const ST_STAMP_RE = /^[0-9]{3,12}$/;
 const ST_MAX_ENTRIES = 20;
 const ST_REASONS = { missing: 'stamp_missing', unreadable: 'stamp_unreadable', multiple: 'multiple_stamps',
@@ -27,9 +25,6 @@ const ST_REASONS = { missing: 'stamp_missing', unreadable: 'stamp_unreadable', m
 // matches no rule is 'unconfirmed'. Example: [{ length: [7], prefix: ['00', '01', '12', '45'] }]
 const ST_FORMAT_CHECK = false;
 const ST_FORMAT_RULES = [];
-// Fallback when the OMR sent no stamp reader result (old OMR, /process failed, STAMP_READER off):
-// false (default) = review; true = Gemini's one number alone is accepted (stamp_source 'gemini').
-const ST_ALLOW_GEMINI_ONLY = false;
 function stReadStamps(raw, geminiOk) {
   // Gemini's array as received (bounded), for the reviewer
   const stampRaw = Array.isArray(raw)
@@ -100,7 +95,6 @@ function stFormatOk(num) {
     return (!lens.length || lens.includes(num.length)) && (!pre.length || pre.some((p) => num.startsWith(p)));
   });
 }
-const stDistinct = (reads) => [...new Set(reads.filter((s) => ST_STAMP_RE.test(s)))];
 // gemini: Gemini's parsed answer; geminiOk: it answered with JSON; sc: the OMR's stamp_candidates block
 function stCheckStamp(gemini, geminiOk, sc) {
   const g0 = (gemini && typeof gemini === 'object') ? gemini : {};
@@ -121,57 +115,26 @@ function stCheckStamp(gemini, geminiOk, sc) {
     agreed: false,
     why: '',
   };
-  const res = { ...g, stamp_source: null, stamp_hint: null, stamp_check: check };
+  // Python is the ONLY source of the stamp number (2026-11-10): the AI's reads (stamp_raw, stamp_check.gemini*)
+  // are kept for the reviewer to look at but never become stamp_no, a candidate or a duplicate hint.
+  // stamp_source stays 'gemini+python' (the DB CHECK value for "read automatically", migration 015).
+  const res = { stamp_no: null, stamp_status: 'missing', stamp_candidates: py.numbers.slice(0, 10),
+    stamp_raw: g.stamp_raw, stamp_source: null, stamp_hint: null, stamp_check: check };
   const pyOne = py.ran && py.numbers.length === 1 ? py.numbers[0] : null;
-  const unconfirmed = (why, hint) => Object.assign(res, { stamp_no: null, stamp_status: 'unconfirmed',
+  const unconfirmed = (why, hint) => Object.assign(res, { stamp_status: 'unconfirmed',
     stamp_hint: hint || null, stamp_check: { ...check, why } });
-  // Python is the source of truth (2026-11-06, from the user's live export): when the Python reader found
-  // exactly one complete stamp that passes the format rule, use it even if the AI read something else
-  // or nothing. Several stamps seen by Python still go to review.
-  if (py.ran && py.numbers.length === 1 && py.stamp_like === 1 && stFormatOk(py.numbers[0])) {
+  if (!py.ran) return unconfirmed('python_not_run', null);
+  if (pyOne && py.stamp_like === 1) {
+    if (!stFormatOk(pyOne)) return unconfirmed('format', pyOne);
     check.agreed = true;
     check.why = 'python_trusted';
-    return Object.assign(res, { stamp_no: py.numbers[0], stamp_status: 'ok', stamp_candidates: [py.numbers[0]],
-      stamp_hint: null, stamp_source: 'gemini+python', stamp_check: check });
+    return Object.assign(res, { stamp_no: pyOne, stamp_status: 'ok', stamp_source: 'gemini+python', stamp_check: check });
   }
-  if (g.stamp_status === 'missing') {
-    if (pyOne) return unconfirmed('gemini_none_python_read', pyOne);
-    check.why = 'none';
-    return res;
-  }
-  if (g.stamp_status === 'unreadable') {
-    res.stamp_hint = pyOne;
-    check.why = 'gemini_unreadable';
-    return res;
-  }
-  if (g.stamp_status === 'multiple') {
-    check.why = 'gemini_multiple';
-    return res;
-  }
-  const n = g.stamp_no;
-  if (!py.ran) {
-    if (ST_ALLOW_GEMINI_ONLY) {
-      check.why = 'gemini_only_fallback';
-      return Object.assign(res, { stamp_source: 'gemini' });
-    }
-    return unconfirmed('python_not_run', n);
-  }
-  const seen = [...new Set([n, ...stDistinct(page.reads), ...stDistinct(tiles.reads), ...py.numbers])];
-  if (stDistinct(page.reads).length >= 2 || stDistinct(tiles.reads).length >= 2
-      || (py.numbers.length >= 2 && py.stamp_like >= 2)) {
-    return Object.assign(res, { stamp_no: null, stamp_status: 'multiple', stamp_candidates: seen.slice(0, 10),
-      stamp_check: { ...check, why: 'readers_see_several' } });
-  }
-  const allAre = (r) => r.list && r.bad === 0 && r.reads.length >= 1 && r.reads.every((s) => s === n);
-  if (!allAre(tiles)) return unconfirmed(check.tile_sheet ? 'tiles_differ' : 'no_tile_sheet', n);
-  if (!allAre(page)) return unconfirmed('page_differs', n);
-  if (!py.numbers.length) return unconfirmed('python_incomplete', n);
-  if (py.numbers.length !== 1 || py.numbers[0] !== n) return unconfirmed('python_differs', n);
-  if (py.stamp_like !== 1) return unconfirmed('python_stamp_like', n);
-  if (!stFormatOk(n)) return unconfirmed('format', n);
-  check.agreed = true;
-  check.why = 'agree';
-  return Object.assign(res, { stamp_source: 'gemini+python' });
+  if (py.numbers.length >= 2) return Object.assign(res, { stamp_status: 'multiple', stamp_check: { ...check, why: 'python_several' } });
+  if (pyOne) return unconfirmed('python_stamp_like', pyOne);   // one complete read plus other stamp-like marks
+  if (py.reads.length || py.stamp_like > 0) return Object.assign(res, { stamp_status: 'unreadable', stamp_check: { ...check, why: 'python_incomplete' } });
+  check.why = 'none';
+  return res;
 }
 // the review reason for a stamp result ('' when the stamp is ok)
 function stReason(st) {
@@ -197,15 +160,13 @@ function stNote(st) {
     return 'No numbering-machine stamp was found on this page. Type the stamp number from the sheet, or approve it without one if it has none.';
   }
   if (st.stamp_status === 'unconfirmed') {
-    return withReads('The stamp number was not confirmed by both readers, so it was not saved automatically. Check it on the sheet and type it.');
+    return withReads('The scanner did not read one clear stamp number, so it was not saved automatically. Check it on the sheet and type it.');
   }
   if (st.stamp_status === 'multiple') {
-    return withReads(`More than one stamp number was read (${(st.stamp_candidates.length ? st.stamp_candidates : ['?']).join(', ')}`
-      + `${Array.isArray(st.stamp_raw) && st.stamp_raw.length > st.stamp_candidates.length ? ', plus unreadable ones' : ''}). Type the right one from the sheet.`);
+    return withReads(`The scanner read more than one stamp number (${(st.stamp_candidates.length ? st.stamp_candidates : ['?']).join(', ')}). Type the right one from the sheet.`);
   }
   if (st.stamp_status === 'unreadable') {
-    const seen = Array.isArray(st.stamp_raw) ? st.stamp_raw.filter((e) => typeof e === 'string' && e.trim()) : [];
-    return withReads(`The stamp number could not be read${seen.length ? ` (read as ${seen.slice(0, 3).map((e) => `"${e.trim()}"`).join(', ')})` : ''}. Type it from the sheet.`);
+    return withReads('The scanner could not read the whole stamp number. Type it from the sheet.');
   }
   return '';
 }

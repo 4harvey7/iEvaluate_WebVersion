@@ -76,7 +76,6 @@ Consistent names used throughout this document.
 | Mark labelling tool | sast-mark-dataset tool | Static web page for marking dataset images | Any browser | `c:\Projects\shisss complee new website\app\sast-mark-dataset\index.html` | not applicable |
 | OMR patch notes | omr_patch | Docs and test scripts | not applicable | `c:\Projects\shisss complee new website\app\omr_patch` | not applicable |
 | Caddy | web server on the VPS | Adds HTTPS to n8n | VPS, Docker | `/root/ievaluate-stack/` | not recorded |
-| Brevo | email service | Sends instructor activation emails (from the website backend) | Cloud | not applicable | not applicable |
 
 Hosting files exist for a future online deployment of the website: `render.yaml`, `frontend\vercel.json`, `backend\Dockerfile`, `backend\Procfile`. They are NOT in use.
 
@@ -100,7 +99,7 @@ Both paths save to the same cloud database. The Flutter phone app also lets inst
 | Who | Uses what | What they do |
 |---|---|---|
 | SAO staff (`SAO_STAFF`) | Website, scanning PC, Flutter phone app | Scan forms, review problem forms |
-| SAO admin (`SAO_ADMIN`) | Website, Flutter phone app | Everything staff do, plus activate instructor accounts, manage users, subjects, departments, terms |
+| SAO admin (`SAO_ADMIN`) | Website, Flutter phone app | Everything staff do, plus manage users, subjects, departments, terms (instructor accounts are activated in the phone app only) |
 | Instructor | Flutter phone app only | See own scores, remarks, AI suggestions |
 | Department head or dean | Flutter phone app only | See department results, write intervention reports (the app emails the instructor) |
 
@@ -197,7 +196,6 @@ The website frontend is the browser interface for staff. Pages (staff only):
 | Review | `/batch/<id>/review` | "Needs review" forms, import errors, "Couldn't be saved" pages. Edit and credit or discard. |
 | Review batches | `/review` | All batches the person may review |
 | Scanner laptop | `/scanner-setup` | Online/Offline light, download watcher installer, change scan folder |
-| Activation | `/activate` | Admin only. Give a placeholder instructor a real email so they can use the app (email sent through Brevo) |
 | SAST guidelines | `/sast-guidelines` | Do's and don'ts for filling the form. Shown once per semester |
 | Help | `/help` | "Something went wrong?" table |
 
@@ -262,7 +260,7 @@ Webhooks of the n8n workflow (a webhook is a web address that starts the workflo
 | `health-check` | Flutter phone app | Returns "online" |
 
 Notes about the n8n workflow:
-- Alerts are push notifications (Firebase). The n8n workflow sends no emails. The instructor activation email comes from the website backend (Brevo). Intervention emails come from a Supabase function used by the Flutter phone app.
+- Alerts are push notifications (Firebase). The n8n workflow sends no emails. Intervention emails come from a Supabase function used by the Flutter phone app.
 - Do NOT rearrange the canvas or set an Error Workflow in the n8n settings. Order of branches matters.
 - Node names contain typos (`subjetc`, `departmeht`). Keep them, because code refers to nodes by name.
 - The n8n workflow's source pieces live in `n8n\tools\website_src\`. See `n8n\WEBSITE_BRANCH.md` (the main technical document for the n8n workflow).
@@ -345,7 +343,7 @@ The Flutter phone app talks to Supabase directly, and to the n8n workflow only t
 | Flutter phone app | Supabase CLI | any recent | Only to deploy edge functions |
 | n8n tools (optional) | Python 3 and Node | any | For build and test scripts |
 
-Accounts needed: Supabase project, Google (Gemini API key; Google Cloud service accounts for Firebase and Sheets), Brevo (email), GitHub repos, VPS provider (Contabo), DuckDNS (name of the n8n address).
+Accounts needed: Supabase project, Google (Gemini API key; Google Cloud service accounts for Firebase and Sheets), GitHub repos, VPS provider (Contabo), DuckDNS (name of the n8n address).
 
 ---
 
@@ -394,7 +392,6 @@ Accounts needed: Supabase project, Google (Gemini API key; Google Cloud service 
 | `WATCHER_ONLINE_SECONDS`, `WATCHER_API_BASE`, `PUBLIC_API_BASE` | Watcher light timing and the address given to watchers |
 | `PAD_FOR_OMR`, `PAD_PERCENT`, `CROP_LONG_BOND` | Image preparation for OMR |
 | `SCAN_IMAGE_BUCKET`, `SCAN_IMAGE_RETENTION_DAYS`, `SCAN_IMAGE_MAX_SIDE`, `SCAN_IMAGE_JPEG_QUALITY` | Page viewing copies |
-| `BREVO_API_KEY` (secret), `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME` | Activation emails |
 | `TRUST_PROXY_HEADERS`, `FORWARDED_ALLOW_IPS` | Only when behind a proxy |
 
 Website frontend settings: `VITE_API_BASE`, `VITE_SHEET_SERVICE_ACCOUNT_EMAIL`.
@@ -583,7 +580,6 @@ Create the first admin: add the person in Supabase Auth, then a `user_info` row 
 
 ## 11.2 Admin
 
-- Activate an instructor: open "Activation" on the website. Type the real email twice. The instructor gets an email.
 - Manage users, subjects, departments and terms in the Flutter phone app.
 - Each scanning laptop is a "station". Regenerating its key stops the old PC.
 
@@ -640,7 +636,7 @@ Each row names the problem, the likely cause and the fix.
 - Re-importing the same Google Sheet adds blank-student rows again. A fix idea (stable `task_id` per row) is not built.
 - An n8n workflow crash during a sheet import is not caught (the Flutter phone app stops waiting after 60 minutes).
 - Google Sheet import errors show only in the Flutter phone app, not on the website.
-- Website audit items not yet decided: the n8n workflow being down leaves pages "Working on it" forever (no error mark), a re-sent file shows no "Already scanned", the forgotten-batch reason is only a tooltip, laptop names are case-sensitive, weak activation-email check, student-ID format not normalised for the overwrite guard.
+- Website audit items not yet decided: the n8n workflow being down leaves pages "Working on it" forever (no error mark), a re-sent file shows no "Already scanned", the forgotten-batch reason is only a tooltip, laptop names are case-sensitive, student-ID format not normalised for the overwrite guard.
 - The website backend still sends 0 for a blank in `review_logic.py` (around lines 630 and 653). The n8n workflow converts it, but it should be `None`.
 - No frontend tests. Website backend tests do not touch the database.
 - Flutter phone app tech debt: gatherer screens bypass the main scaffold; default app id; keystore passwords in gradle; README mentions a deleted screen.
@@ -670,7 +666,7 @@ Future work is frozen by the owner until after the capstone presentation and is 
 | Flutter phone app repo | `C:\Projects\ievaluateapp_final` |
 | OMR repo | `C:\Projects\OMR PYTHON DEPLOYMENT` (GitHub `4harvey7/OMR_Python_for_SAST`). Has uncommitted files already running on the VPS |
 | Docs | `README.md`, `SETUP.md`, `n8n\WEBSITE_BRANCH.md`, `n8n\README`, `omr_patch\README.md`, watcher guides, phone `README.md`, `MANUAL.md`, `docs\UAT_*.txt`, website `UAT-iEvaluate-Batch-Scanning-Website.docx` |
-| Accounts | Supabase (owner), Google (Gemini key, Firebase, Sheets service accounts), Brevo, GitHub, Contabo VPS, DuckDNS, Android keystore owner |
+| Accounts | Supabase (owner), Google (Gemini key, Firebase, Sheets service accounts), GitHub, Contabo VPS, DuckDNS, Android keystore owner |
 | Server | VPS login and Docker stack access: `<ask the previous developer>` |
 
 ## 14.2 Secrets to hand over securely and rotate
@@ -686,7 +682,6 @@ Hand secrets over through a password manager, never by email or chat. Names only
 | n8n admin login and n8n API key | n8n |
 | Gemini API key | n8n credential |
 | Firebase and Google service-account files | n8n credentials, `google-services.json` |
-| `BREVO_API_KEY` | Website backend `.env` |
 | Station keys | One per laptop; regenerate when handing over |
 | `release.jks` and its passwords | Flutter phone app signing. Back up |
 | VPS login | Server |
@@ -785,7 +780,6 @@ Notes are dated. Check live state before acting, because some may already be don
 | APK | The Android app install file |
 | Keystore | The file that signs the Android app. Losing it blocks updates |
 | FCM | Firebase Cloud Messaging: push notifications |
-| Brevo | Email sending service used for activation emails |
 | Caddy | Web server on the VPS that adds HTTPS to n8n |
 | DuckDNS | Free service that gives the VPS a web name |
 | Vite | Tool that runs and builds the frontend |
@@ -933,7 +927,7 @@ Admins see everything. Staff see their own batches and the batch of the laptop t
 About 97% of rows on tuning sets; the new table print went from 37% to 98.8% after the 2026-10-08 fix. It is fragile when the page touches the frame, is cut off, shows only the table, or is rotated. Measured: normal framing 10/10, page touching frame 1/10, cut-off edges 2/10, table-only 0/10, rotated 5 degrees 3/10. It then silently guesses a fixed grid (flag `omr_fallback_grid`). Header text OCR is off (`OCR_MODE=off`); Gemini reads the header.
 
 ### 36. What secrets exist and which must be rotated now?
-Secrets include `SUPABASE_SERVICE_KEY`, Supabase DB password, `SUPABASE_ANON_KEY`, `N8N_WEBHOOK_SECRET`, n8n admin login and API key, Gemini API key, Firebase and Google service-account files, `BREVO_API_KEY`, station keys, `release.jks` and its passwords, and the VPS login. Rotate now: the Supabase secret key (an old one was found in an n8n export; `SETUP.md` step 0), the n8n API key, the hard-coded keystore alias and passwords in `build.gradle.kts`, and delete old `perfect 101*.json` exports. Values are `<ask the previous developer>`.
+Secrets include `SUPABASE_SERVICE_KEY`, Supabase DB password, `SUPABASE_ANON_KEY`, `N8N_WEBHOOK_SECRET`, n8n admin login and API key, Gemini API key, Firebase and Google service-account files, station keys, `release.jks` and its passwords, and the VPS login. Rotate now: the Supabase secret key (an old one was found in an n8n export; `SETUP.md` step 0), the n8n API key, the hard-coded keystore alias and passwords in `build.gradle.kts`, and delete old `perfect 101*.json` exports. Values are `<ask the previous developer>`.
 
 ### 37. What work is pending that has not been committed?
 The website repo (watcher 2.5.0, review and stamp changes, frontend changes, `n8n\perfect-2.1.json`, `SastGuide.jsx`, tests, `watcher-package.zip`); the OMR repo (`api.py`, `utlis.py`, `requirements.txt`, `Dockerfile`, `.dockerignore`, `stamp_find.py`, `stamp_read.py`, weights, templates, `tools\`; do not commit `dataset\` or `eval_out\`); and the Flutter phone app repo (`env.dart`, `failed_scan_detail_screen.dart`, and others; do not commit `.mcp.json`). Branch `reused-image-and-heartbeat` (commit 76784c7) and `main` commits 68bcea4 and 0906f7b were never pushed as of the notes.

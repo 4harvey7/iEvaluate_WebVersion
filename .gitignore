@@ -42,3 +42,10 @@ coverage/
 
 # Office lock files (e.g. ~$Report.docx)
 ~$*
+
+graphify-out/
+
+# Private paper / UAT docs
+paper-updates/
+uat-website-screenshots/
+UAT-*.pdf

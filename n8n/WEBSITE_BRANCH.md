@@ -131,9 +131,7 @@ A row is **weak** when its `omr_debug` top score is < `WEAK_TOP_SCORE` (0.05) or
 | `omr_fallback_grid` | yes | no | the OMR used its fixed fallback grid |
 | `layout_mismatch` | yes | yes, never dropped | the printed layout is not the expected 5 columns O, VS, S, F, US x 20 rows (10 + 10); see "Layout safety net" below. While it is raised no row is resolved as `python_confident` |
 | `poor_scan_quality` | yes | yes | Gemini says poor quality AND (a critical issue, or a real difference ≥ 2 columns / too many blanks); unchanged |
-| `low_confidence_ocr_N_rows` | yes | yes | Python itself was unsure on ≥ 4 rows, even where Gemini agrees; kept |
-| `python_weak_gemini_blank_N_rows` | yes | no | Python read a mark on a weak row that Gemini reads as blank (a speck), on ≥ `WEAK_BLANK_LIMIT` (3) rows |
-| `python_weak_disagreement_N_rows` | yes | no | both read a rating on a weak Python row and they are ≥ 2 levels apart, on ≥ `WEAK_DISAGREE_LIMIT` (3) rows |
+| ~~`low_confidence_ocr_N_rows`~~, ~~`python_weak_gemini_blank_N_rows`~~, ~~`python_weak_disagreement_N_rows`~~ | removed 2026-11-10 | removed 2026-11-10 | weak (unsure) scanner rows no longer flag a page on their own; they only decide who wins a disagreement (agreement rule) |
 | `too_many_blanks_N_of_20` | yes | yes | more than 10 rows blank for both engines (rows the OMR rejected as non-check marks do not count); not raised together with `too_few_answers` |
 | `too_few_answers_N_of_20` | yes | yes | fewer than 5 of the 20 rows answered (min-answered rule). On a reliable scan the queue row is stored `discarded` (`auto_discard`); otherwise it is reviewed |
 | `missing_instructor`, `missing_subject` | no | yes | the phone has no batch selection, so a blank name (from Gemini) still needs review |
@@ -440,7 +438,7 @@ A wrong or missing secret gets n8n's own 403 before the workflow runs.
   "message": "…" }
 ```
 
-`auto_rejected` and `stamp_no` (stamp rule, additive) are in the `success` and `flagged` answers: `auto_rejected` is `'duplicate_stamp'` for a page discarded automatically because its stamp is already stored for the term (else null); `stamp_no` is the one stamp read on the page (null when none, several, or unreadable). The other answers (`rejected`, `duplicate`, the not-saved ones) do not carry them.
+`auto_rejected` and `stamp_no` (stamp rule, additive) are in the `success` and `flagged` answers: `auto_rejected` is `'duplicate_stamp'` for a page discarded automatically because its stamp is already stored for the term, `'min_answered_5'` for one discarded because fewer than 5 of the 20 items were answered (else null); `stamp_no` is the one stamp read on the page (null when none, several, or unreadable). The other answers (`rejected`, `duplicate`, the not-saved ones) do not carry them.
 
 `identity_check` is `null`, or, only when a `*_mismatch_*` reason is present, `{ "instructor": "match|mismatch|unreadable", "subject": "match|mismatch|unreadable", "ocr_instructor": "…", "ocr_subject": "…" }`.
 

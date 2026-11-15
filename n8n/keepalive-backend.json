@@ -1,0 +1,75 @@
+{
+  "name": "iEvaluate - Backend Keep-Alive",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [ { "field": "minutes", "minutesInterval": 10 } ] }
+      },
+      "id": "ka-schedule",
+      "name": "Every 10 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.BACKEND_URL }}/health",
+        "options": {
+          "timeout": 60000,
+          "response": { "response": { "fullResponse": true, "neverError": true } }
+        }
+      },
+      "id": "ka-ping",
+      "name": "Ping backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [240, 0],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "ka-cond",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": { "type": "number", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ka-if",
+      "name": "Status not 200?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "ka-set", "name": "note", "value": "backend did not respond", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ka-record",
+      "name": "Record failure",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [720, -80]
+    }
+  ],
+  "connections": {
+    "Every 10 minutes": { "main": [ [ { "node": "Ping backend", "type": "main", "index": 0 } ] ] },
+    "Ping backend": { "main": [ [ { "node": "Status not 200?", "type": "main", "index": 0 } ] ] },
+    "Status not 200?": { "main": [ [ { "node": "Record failure", "type": "main", "index": 0 } ], [] ] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false
+}

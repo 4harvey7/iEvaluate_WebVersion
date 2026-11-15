@@ -91,11 +91,16 @@ const REASON_TEXT = {
   // Blank or unreadable on the sheet: this batch's values are pre-selected; check them and approve.
   instructor_missing: "The instructor on the sheet is blank or couldn't be read. Check it; this batch's instructor is pre-selected.",
   subject_missing: "The subject on the sheet is blank or couldn't be read. Check it; this batch's subject is pre-selected.",
-  student_id_missing: "The student ID on the sheet is blank or couldn't be read. Type it in if it's on the sheet.",
+  // Student ID is optional: the stamp number identifies the form (older pages may still carry these codes).
+  student_id_missing: "No full student ID was read. That's fine: the stamp number identifies the form.",
+  student_id_invalid: "The student ID shown is what the reader saw. It's not required: the stamp number identifies the form.",
+  student_id_unverified: "The ID box looks empty, so no student ID was kept. It's not required: the stamp number identifies the form.",
+  student_id_missed: "No student ID was read. It's not required: the stamp number identifies the form.",
   reused_image:
     "This exact picture was already scanned in another batch. Check it isn't the same form counted twice before approving.",
   // Numbering-machine stamp on the sheet (one stamp = one paper, counted once per term).
   duplicate_stamp: "Already scanned: a form with this stamp number is already saved for this term, so this one is not counted.",
+  min_answered_5: "Discarded automatically, so it is not counted.",
   stamp_missing: "No stamp number was found on the sheet. Type it in if there is one, or choose \"Form has no stamp\".",
   stamp_unreadable: "The stamp number couldn't be read. Type it in from the sheet, or choose \"Form has no stamp\".",
   multiple_stamps: "More than one stamp number was found on the sheet. Pick the right one or type it in.",
@@ -137,7 +142,7 @@ export function unsavedStateText(row) {
 // Reasons that carry a number, e.g. "omr_agreement_below_80".
 const REASON_PATTERNS = [
   [/^omr_agreement_below_(\d+)$/, (n) => `The answer reader and the AI agree on fewer than ${n}% of the answers.`],
-  [/^low_confidence_ocr_(\d+)_rows$/, (n) => `The answer reader was unsure on ${n} answer${n === "1" ? "" : "s"}.`],
+  [/^low_confidence_ocr_(\d+)_rows$/, () => ""], // hidden on purpose; still flags the page
   [/^too_many_blanks_(\d+)_of_20$/, (n) => `${n} of the 20 answers are blank.`],
   [/^too_few_answers_(\d+)_of_20$/, (n) => `Fewer than 5 of the 20 items were answered (only ${n}), so this form can't be counted.`],
   [/^python_weak_gemini_blank_(\d+)_rows$/, (n) => `${n} faint mark${n === "1" ? "" : "s"} may be specks, not answers.`],

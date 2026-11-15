@@ -13,9 +13,7 @@ const MIN_ANSWERED      = 5;      // teacher rule: fewer answered items -> the f
 const FLAG_DIFF_MARGIN  = 2;      // levels apart for a real conflict (S vs VS is not one)
 const WEAK_TOP_SCORE    = 0.05;
 const WEAK_MARGIN       = 0.02;
-const WEAK_ROW_LIMIT    = 4;
-const WEAK_BLANK_LIMIT    = 3;    // website only
-const WEAK_DISAGREE_LIMIT = 3;    // website only
+// 2026-11-10: a weak (unsure) scanner row no longer flags a page on its own; it only decides who wins a disagreement
 const INVALID_MARK_TEXT = { x: 'an x', shade: 'a shaded bubble', circle: 'a circle', dot: 'a dot', double: 'two marks',
   outside: 'a mark outside the answer rows' };
 const FALLBACK_GRID_SOURCE  = 'fallback';
@@ -140,11 +138,8 @@ let agreedBlanks = 0;
 let filledByGemini = 0;
 let realDifferences = 0;
 let agreeRows = 0;
-let weakRows = 0;
 const conflictRows = [];   // differ AND count against the agreement rule
 const resolvedRows = [];   // differ, but kept as the scanner read them
-const weakGeminiBlankRows = [];
-const weakDisagreeRows = [];
 const invalidRows = [];   // { key, mark }: a non-check mark, left blank
 
 for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
@@ -170,19 +165,12 @@ for (const [section, prefix] of [['management', 'm'], ['performance', 'p']]) {
       (resolvedBy ? resolvedRows : conflictRows).push(`${key} (scanner ${letterOf(p)}, AI ${letterOf(g)})`);
     }
 
-    if (p !== null && conf.weak) weakRows++;
-
     let used;
     let source;
     if (p !== null) {
       used = p;
       source = 'python';
-      if (g !== null) {
-        if (farApart) realDifferences++;
-        if (conf.weak && farApart) weakDisagreeRows.push(key);
-      } else if (geminiOk && conf.weak) {
-        weakGeminiBlankRows.push(key);
-      }
+      if (farApart) realDifferences++;
     } else if (invalidMark) {
       used = null;
       source = 'invalid_mark';
@@ -266,7 +254,6 @@ if (geminiOk && gemini.scan_quality && gemini.scan_quality.poor_quality === true
   reasons.push('poor_scan_quality');
 }
 if (agreementKnown && flagAgreeRows < AGREEMENT_MIN_ROWS) reasons.push(`omr_agreement_below_${AGREEMENT_MIN_PCT}`);
-if (weakRows >= WEAK_ROW_LIMIT) reasons.push(`low_confidence_ocr_${weakRows}_rows`);
 // Teacher rule (2026-10-08): fewer than MIN_ANSWERED of the 20 items answered -> the form is discarded
 // and never counted. An answer is a stored rating: Python's, or Gemini's on a row Python read blank,
 // so a row either engine read as a valid mark counts (a disagreement never turns an answer into a
@@ -282,8 +269,6 @@ if (tooFewAnswers) reasons.push(`too_few_answers_${answeredCount}_of_20`);
 // one message for an (almost) empty form: too_few_answers replaces too_many_blanks
 else if (agreedBlanks > MAX_AGREED_BLANKS) reasons.push(`too_many_blanks_${agreedBlanks}_of_20`);
 // unlike phone, grid_not_detected stays even with Gemini ratings
-if (weakGeminiBlankRows.length >= WEAK_BLANK_LIMIT) reasons.push(`python_weak_gemini_blank_${weakGeminiBlankRows.length}_rows`);
-if (weakDisagreeRows.length >= WEAK_DISAGREE_LIMIT) reasons.push(`python_weak_disagreement_${weakDisagreeRows.length}_rows`);
 if (py.grid_source === FALLBACK_GRID_SOURCE) reasons.push('omr_fallback_grid');
 if (layoutMismatch) reasons.push('layout_mismatch');
 // stamp rule (2026-10-16, two readers 2026-10-17): one stamp number that Gemini and the OMR's stamp
@@ -312,21 +297,12 @@ if (reasons.includes('poor_scan_quality')) {
 if (reasons.some((r) => r.startsWith('omr_agreement_below_'))) {
   noteParts.push(`Python and Gemini clearly disagree on ${conflictRows.length} of ${TOTAL_ROWS} rows where the scanner was unsure or read nothing, so only ${flagAgreeRows} of ${TOTAL_ROWS} rows (${flagAgreePercent}%) count as agreeing; at least ${AGREEMENT_MIN_PCT}% is required. They differ on ${conflictRows.join(', ')}. Check those answers.${resolvedText}`);
 }
-if (reasons.some((r) => r.startsWith('low_confidence_ocr_'))) {
-  noteParts.push(`The scanner itself was unsure of its reading on ${weakRows} row(s), even where it matched the AI's read. Please double-check those answers.`);
-}
 if (py.table_found === false) {
   noteParts.push(
     py.grid_source
       ? `Table corners were not found — ${String(py.grid_source).replace(/_/g, ' ')} was used instead. All data needs verification.`
       : 'Table corners were not found in the scan, so an estimated crop was used. All data needs verification.'
   );
-}
-if (weakGeminiBlankRows.length >= WEAK_BLANK_LIMIT) {
-  noteParts.push(`The scanner read a faint mark on ${weakGeminiBlankRows.join(', ')} that the AI sees as blank (possibly a speck). Check whether those questions were really answered.`);
-}
-if (weakDisagreeRows.length >= WEAK_DISAGREE_LIMIT) {
-  noteParts.push(`The scanner was unsure on ${weakDisagreeRows.join(', ')} and the AI read a rating two or more levels away. Check those answers.`);
 }
 if (py.grid_source === FALLBACK_GRID_SOURCE && py.table_found !== false) {
   noteParts.push('The rating grid could not be located, so a fixed fallback grid was used. The row positions may be wrong; verify every rating.');
@@ -349,13 +325,13 @@ if (geminiCallFailed) {
 }
 
 // student ID check (2026-11-06, from the user's live export): Gemini writes ? for an unclear digit;
-// anything but 6 to 12 digits is not kept and goes to review (scanned IDs in the database are 6 to 9 digits)
+// anything but 6 to 12 digits is not stored as the ID (scanned IDs in the database are 6 to 9 digits).
+// Never a review reason (2026-11-10): the stamp number identifies the form; the raw read is passed on.
 const sidRaw = String(gText('student_id') ?? '').replace(/\s+/g, '');
 const SID_RE = /^[0-9]{6,12}$/;
 const sidValid = SID_RE.test(sidRaw);
 if (sidRaw && !sidValid) {
-  reasons.push('student_id_invalid');
-  noteParts.push(`The student ID was read as "${sidRaw.slice(0, 20)}", which is not a valid ID (unclear digits or wrong length). Type it from the sheet.`);
+  noteParts.push(`Student ID as read: "${sidRaw.slice(0, 20)}" (not a full ID). Not required: the stamp number identifies the form.`);
 }
 const needsReview = reasons.length > 0;
 // always show agreement on flagged pages
@@ -379,6 +355,7 @@ return [{
     remark_check: remarkResult.check,
     date: clean(gText('date')).slice(0, 50),
     student_id: ocrCheck.drop_student_id || !sidValid ? '' : sidRaw,
+    student_id_read: ocrCheck.drop_student_id ? '' : sidRaw.slice(0, 50),   // as read, shown to the reviewer
     ocr_check: ocrCheck.check,
     text_source: geminiOk ? 'gemini' : 'none',
     stamp_no: stamp.stamp_no,                 // the one stamp read on the page (status 'ok'), else null

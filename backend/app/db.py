@@ -96,7 +96,7 @@ class Settings:
         # would be spoofable); set true on Render (it sits behind Cloudflare).
         self.trust_proxy_headers: bool = _bool_env("TRUST_PROXY_HEADERS", False)
         # Brevo (app/mailer.py): same API key and sender as the Flutter app's
-        # Supabase functions. Optional: empty = activation still works, no email.
+        # Supabase functions. Optional: empty = no email is sent.
         self.brevo_api_key: str = os.environ.get("BREVO_API_KEY", "").strip()
         self.brevo_sender_email: str = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
         self.brevo_sender_name: str = os.environ.get("BREVO_SENDER_NAME", "").strip() or "SAO Management"

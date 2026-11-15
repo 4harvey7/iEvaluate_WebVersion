@@ -393,6 +393,9 @@ def test_duplicate_stamp_is_stored_flagged_with_its_reason(setup):
 def test_auto_rejected_without_the_reason_still_gets_it():
     v = logic.validate_n8n_response({**DUPLICATE_STAMP, "review_reasons": ["low_confidence"]})
     assert v["review_reasons"] == ["duplicate_stamp", "low_confidence"] and v["auto_rejected"] == "duplicate_stamp"
+    v = logic.validate_n8n_response({"status": "flagged", "flagged": True, "auto_rejected": "min_answered_5",
+                                     "review_reasons": ["too_few_answers_4_of_20"]})
+    assert v["review_reasons"] == ["min_answered_5", "too_few_answers_4_of_20"] and v["auto_rejected"] == "min_answered_5"
     # Unknown rules, bad stamps and other statuses are ignored.
     v = logic.validate_n8n_response({"status": "flagged", "auto_rejected": "whatever", "stamp_no": "12ab"})
     assert v["auto_rejected"] is None and v["stamp_no"] is None and v["review_reasons"] == []

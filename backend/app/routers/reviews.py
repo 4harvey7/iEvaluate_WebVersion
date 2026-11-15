@@ -332,9 +332,11 @@ def _other_raw_row(sb, instructor_id: str, subject_id: str, term_id: str | None,
     instructor, subject, term and student; crediting would overwrite it."""
     if not student_id or not term_id:
         return None
+    # Compared by keyed hash (migration 021); the database computes it, so the pepper never drifts.
+    hashed = sb.rpc("sast_hash_student_id", {"p_student_id": student_id}).execute().data
     rows = (sb.table("sast_all_raw_data_survey").select("task_id")
             .eq("instructor_ID", instructor_id).eq("subject_id", subject_id)
-            .eq("term_id", term_id).eq("student_id", student_id).limit(5).execute().data or [])
+            .eq("term_id", term_id).eq("student_id_hash", hashed).limit(5).execute().data or [])
     for r in rows:
         if r.get("task_id") != task_id:
             return r

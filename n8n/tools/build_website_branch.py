@@ -165,7 +165,7 @@ What it does
      and skips apply_sast_v2 when it is already applied.
  14. Student ID check (apply_student_id_rule; idempotent; 2026-11-06, ported from the user's live export):
      both prompts get STUDENT_ID_RULE (? for an unclear digit); both reconcilers keep only 6 to 12 digits,
-     else student_id_invalid (review).
+     else a note only (2026-11-10: no student ID case is a review reason; the stamp identifies the form).
 """
 from __future__ import annotations
 
@@ -2311,7 +2311,7 @@ def flagged_respond_expression() -> str:
         ": ('Flagged for manual review (' + (reasons.join(', ') || 'unspecified') + ').' + (note ? ' ' + note : '')).slice(0, 1000); "
         "return JSON.stringify({ status: 'flagged', flagged: true, task_id: String(w.task_id || ''), "
         "review_reasons: reasons, identity_check: (w.identity_check || null), "
-        "auto_rejected: (dupStamp ? 'duplicate_stamp' : null), stamp_no: (w.stamp_no || null), "
+        "auto_rejected: (dupStamp ? 'duplicate_stamp' : (discarded ? 'min_answered_5' : null)), stamp_no: (w.stamp_no || null), "
         "message: message }); "
         "})()"
     )
@@ -3831,7 +3831,7 @@ def apply_instructor_readings(out) -> list[str]:
 
 
 # Student ID (2026-11-06, ported from the user's live export 'BUTITI NA KAAYO NI'): digit by digit, ? when
-# unclear; the reconcilers keep only 6 to 12 digits, else student_id_invalid.
+# unclear; the reconcilers keep only 6 to 12 digits as the ID, else a note only (never a review reason, 2026-11-10).
 STUDENT_ID_OLD = "6. student_id: digits only."
 STUDENT_ID_RULE = (r"6. student_id: the student ID written in the ID box, digits only. Keep leading zeros and remove "
                    r"spaces, dashes and dots.\n   - Read each digit one by one.\n   - If a digit is unclear (for "
@@ -3851,7 +3851,7 @@ def apply_student_id_rule(out) -> list[str]:
             gem["jsonBody"] = replace_once(gem["jsonBody"], STUDENT_ID_OLD, STUDENT_ID_RULE, name)
             done.append(f"{name}: student ID rule")
     for name in (WEB_RECONCILE, PHONE_RECONCILE):
-        if "'student_id_invalid'" not in by_name[name]["parameters"]["jsCode"]:
+        if "const SID_RE = " not in by_name[name]["parameters"]["jsCode"]:
             raise SystemExit(f"{name}: no student ID check (website_src not applied?)")
     return done
 

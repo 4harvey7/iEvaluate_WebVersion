@@ -9,7 +9,7 @@ from app import page_images, page_scores
 from app.audit import audit
 from app.batch_access import is_batch_owner
 from app.db import get_settings, get_supabase, is_valid_uuid
-from app.logic import UNSAVED_REVIEW_MSG, item_error_code, last_activity, parse_ts
+from app.logic import AUTO_REJECT_RULES, UNSAVED_REVIEW_MSG, item_error_code, last_activity, parse_ts
 from app.routers.instructors import get_instructor_if_eligible
 from app.security import CurrentUser, require_staff
 from app.station_status import public_watcher_fields, select_stations, watcher_presence
@@ -170,6 +170,26 @@ def _with_review_status(sb, batch_id: str, items: list[dict]) -> list[dict]:
     return items
 
 
+def _auto_rejected_count(sb, batch_id: str) -> int:
+    """Flagged pages n8n discarded by itself (logic.AUTO_REJECT_RULES: stamp already saved
+    this term, or fewer than 5 of 20 answered) and not taken back on the review page
+    (Override). n8n answers them 'flagged', so complete_batch_item bumps flagged_count; the
+    live page shows them under Rejected instead (same rule as itemBucket in ScanningLive.jsx)."""
+    try:
+        items = (sb.table("scan_batch_items").select("task_id, review_reasons")
+                 .eq("batch_id", batch_id).eq("status", "flagged").limit(5000).execute().data or [])
+        items = [it for it in items if any(str(r).strip().lower() in AUTO_REJECT_RULES for r in (it.get("review_reasons") or []))]
+        if not items:
+            return 0
+        rows = (sb.table("failed_scan_queue").select("task_id, status")
+                .eq("batch_id", batch_id).limit(5000).execute().data or [])
+    except APIError:
+        log.exception("could not count auto-rejected pages for batch %s", batch_id)
+        return 0
+    by_task = {r.get("task_id"): r.get("status") for r in rows if r.get("task_id")}
+    return sum(1 for it in items if by_task.get(it.get("task_id")) not in ("pending", "validated"))
+
+
 def _latest_item_at(items: list[dict]) -> str | None:
     stamps = [t for it in items for t in (parse_ts(it.get("created_at")), parse_ts(it.get("updated_at"))) if t]
     return max(stamps).isoformat() if stamps else None
@@ -244,10 +264,11 @@ def get_batch(batch_id: str, user: CurrentUser = Depends(require_staff)):
 
     now = _now()
     instructor = people.get(b["instructor_id"], {})
+    auto_rejected = min(_auto_rejected_count(sb, batch_id), b.get("flagged_count") or 0)
     c = {
         "processed": b.get("processed_count") or 0,
-        "flagged": b.get("flagged_count") or 0,
-        "rejected": b.get("rejected_count") or 0,
+        "flagged": (b.get("flagged_count") or 0) - auto_rejected,
+        "rejected": (b.get("rejected_count") or 0) + auto_rejected,  # incl. pages n8n discarded by itself
         "duplicates": b.get("duplicate_count") or 0,
         "errors": counts["error"] - counts["failed"] - counts["unsaved"],
         "unsaved": counts["unsaved"],  # couldn't be saved; waiting on the review page

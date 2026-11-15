@@ -23,7 +23,7 @@ Both paths save to the same cloud database. The phone app also lets instructors,
 | Who | Uses what | What they do |
 |---|---|---|
 | SAO staff (`SAO_STAFF`) | Website, scanning PC, phone app | Scan forms, review problem forms |
-| SAO admin (`SAO_ADMIN`) | Website, phone app | Everything staff do, plus activate instructor accounts, manage users, subjects, departments, terms |
+| SAO admin (`SAO_ADMIN`) | Website, phone app | Everything staff do, plus manage users, subjects, departments, terms (instructor accounts are activated in the phone app only) |
 | Instructor | Phone app only | See own scores, remarks, AI suggestions |
 | Department head or dean | Phone app only | See department results, write intervention reports (the app emails the instructor) |
 
@@ -133,7 +133,6 @@ Pages (staff only):
 | Review | `/batch/<id>/review` | "Needs review" forms, import errors, "Couldn't be saved" pages. Edit and credit or discard. |
 | Review batches | `/review` | All batches the person may review |
 | Scanner laptop | `/scanner-setup` | Online/Offline light, download watcher installer, change scan folder |
-| Activation | `/activate` | Admin only. Give a placeholder instructor a real email so they can use the app (email sent through Brevo) |
 | SAST guidelines | `/sast-guidelines` | Do's and don'ts for filling the form. Shown once per semester |
 | Help | `/help` | "Something went wrong?" table |
 
@@ -192,7 +191,7 @@ Who sees what: admins see everything. Staff see their own batches and the batch 
 | `health-check` | Phone app | Returns "online" |
 
 Notes:
-- Alerts are push notifications (Firebase). n8n sends no emails. Instructor activation email comes from the backend (Brevo). Intervention emails come from a Supabase function used by the phone app.
+- Alerts are push notifications (Firebase). n8n sends no emails. Intervention emails come from a Supabase function used by the phone app.
 - Do NOT rearrange the canvas or set an Error Workflow in settings. Order of branches matters.
 - Node names contain typos (`subjetc`, `departmeht`). Keep them; code refers to nodes by name.
 - n8n source pieces live in `n8n\tools\website_src\`. See `n8n\WEBSITE_BRANCH.md` (main technical doc).
@@ -275,7 +274,7 @@ The app talks to Supabase directly, and to n8n only through `n8n-proxy`. Push me
 | Phone app | Supabase CLI | any recent | Only to deploy edge functions |
 | n8n tools (optional) | Python 3 and Node | any | For build and test scripts |
 
-Accounts needed: Supabase project, Google (Gemini API key; Google Cloud service accounts for Firebase and Sheets), Brevo (email), GitHub repos, VPS provider (Contabo), DuckDNS (name of the n8n address).
+Accounts needed: Supabase project, Google (Gemini API key; Google Cloud service accounts for Firebase and Sheets), GitHub repos, VPS provider (Contabo), DuckDNS (name of the n8n address).
 
 ---
 
@@ -322,7 +321,6 @@ Backend settings (names only; defaults are in `backend\.env.example`):
 | `WATCHER_ONLINE_SECONDS`, `WATCHER_API_BASE`, `PUBLIC_API_BASE` | Watcher light timing and the address given to watchers |
 | `PAD_FOR_OMR`, `PAD_PERCENT`, `CROP_LONG_BOND` | Image preparation for OMR |
 | `SCAN_IMAGE_BUCKET`, `SCAN_IMAGE_RETENTION_DAYS`, `SCAN_IMAGE_MAX_SIDE`, `SCAN_IMAGE_JPEG_QUALITY` | Page viewing copies |
-| `BREVO_API_KEY` (secret), `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME` | Activation emails |
 | `TRUST_PROXY_HEADERS`, `FORWARDED_ALLOW_IPS` | Only when behind a proxy |
 
 Frontend settings: `VITE_API_BASE`, `VITE_SHEET_SERVICE_ACCOUNT_EMAIL` (shown on screen so staff know which email to share a Google Sheet with).
@@ -498,7 +496,6 @@ Create the first admin: add the person in Supabase Auth, then a `user_info` row 
 6. Open "Needs a look" (Review). For each form: compare the picture with the typed values, fix, then Credit or Discard. Stamp problems: type the stamp number, or choose "Form has no stamp".
 
 **Admin**
-- Activate an instructor: open "Activation". Type the real email twice. The instructor gets an email.
 - Manage users, subjects, departments and terms in the phone app.
 - Each scanning laptop is a "station". Regenerating its key stops the old PC.
 
@@ -550,7 +547,7 @@ Limits today:
 - Re-importing the same Google Sheet adds blank-student rows again. A fix idea (stable `task_id` per row) is not built.
 - n8n crash during a sheet import is not caught (the app stops waiting after 60 minutes).
 - Google Sheet import errors show only in the phone app, not on the website.
-- Website audit items not yet decided: n8n down leaves pages "Working on it" forever (no error mark), re-sent file shows no "Already scanned", forgotten-batch reason is only a tooltip, laptop names are case-sensitive, weak activation-email check, student-ID format not normalised for the overwrite guard.
+- Website audit items not yet decided: n8n down leaves pages "Working on it" forever (no error mark), re-sent file shows no "Already scanned", forgotten-batch reason is only a tooltip, laptop names are case-sensitive, student-ID format not normalised for the overwrite guard.
 - The backend still sends 0 for a blank in `review_logic.py` (around lines 630 and 653). n8n converts it, but it should be `None`.
 - No frontend tests. Backend tests do not touch the database.
 - Phone app tech debt: gatherer screens bypass the main scaffold; default app id; keystore passwords in gradle; README mentions a deleted screen.
@@ -577,7 +574,7 @@ Future work (frozen by the owner until after the capstone presentation, meant fo
 | Phone app repo | `C:\Projects\ievaluateapp_final` |
 | OMR repo | `C:\Projects\OMR PYTHON DEPLOYMENT` (GitHub `4harvey7/OMR_Python_for_SAST`). Has uncommitted files already running on the VPS |
 | Docs | `README.md`, `SETUP.md`, `n8n\WEBSITE_BRANCH.md`, `n8n\README`, `omr_patch\README.md`, watcher guides, phone `README.md`, `MANUAL.md`, `docs\UAT_*.txt`, website `UAT-iEvaluate-Batch-Scanning-Website.docx` |
-| Accounts | Supabase (owner), Google (Gemini key, Firebase, Sheets service accounts), Brevo, GitHub, Contabo VPS, DuckDNS, Android keystore owner |
+| Accounts | Supabase (owner), Google (Gemini key, Firebase, Sheets service accounts), GitHub, Contabo VPS, DuckDNS, Android keystore owner |
 | Server | VPS login and Docker stack access: `<ask the previous developer>` |
 
 ### 14.2 Secrets to hand over securely (password manager, never email or chat) and rotate
@@ -593,7 +590,6 @@ Names only. Values: `<ask the previous developer>`.
 | n8n admin login and n8n API key | n8n |
 | Gemini API key | n8n credential |
 | Firebase and Google service-account files | n8n credentials, `google-services.json` |
-| `BREVO_API_KEY` | Backend `.env` |
 | Station keys | One per laptop; regenerate when handing over |
 | `release.jks` and its passwords | Phone app signing. Back up |
 | VPS login | Server |
@@ -690,7 +686,6 @@ Not deployed or not applied:
 | APK | The Android app install file |
 | Keystore | The file that signs the Android app. Losing it blocks updates |
 | FCM | Firebase Cloud Messaging: push notifications |
-| Brevo | Email sending service used for activation emails |
 | Caddy | Web server on the VPS that adds HTTPS to n8n |
 | DuckDNS | Free service that gives the VPS a web name |
 | Vite | Tool that runs and builds the frontend |
