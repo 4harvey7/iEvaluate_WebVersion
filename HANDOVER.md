@@ -138,7 +138,7 @@ Pages (staff only):
 
 Key files: `frontend\src\App.jsx` (routes), `api.js` (calls to backend), `messages.js` (all wording, including review reasons). The browser talks only to the backend, never to Supabase or n8n. Login is kept in the browser session, so closing the browser logs you out. There are no frontend tests.
 
-### 4.2 Folder watcher (version 2.5.0)
+### 4.2 Folder watcher (version 2.5.2)
 
 A small Python program on the scanning PC. It watches a folder, converts files (`.jpg .jpeg .png .tif .tiff .pdf`, multi-page PDFs are split) and sends them.
 
@@ -148,6 +148,7 @@ A small Python program on the scanning PC. It watches a folder, converts files (
 - Only one copy can run at a time.
 - Network folders are refused.
 - Since 2.5.0 it does NOT start by itself at log-on. Staff double-click "Start Scan Watcher" before scanning, and "Stop Scan Watcher" after.
+- Since 2.5.2 the "Browse..." button on Scanner setup asks the running watcher (on `http://127.0.0.1:47615`, this laptop only) to open the Windows folder window and return the full path. It answers only the website origins in `site_origins` of `watcher_config.json` (the installer copies the backend's `CORS_ORIGINS`), so after changing `CORS_ORIGINS` laptops need a fresh installer. The port is also in `vercel.json` and `vite.config.js` (CSP). A folder picked there is added to `allowed_roots`.
 
 ### 4.3 Backend (FastAPI)
 

@@ -86,7 +86,8 @@ const FAQ = [
     a: (
       <>
         Open <Link to="/scanner-setup">Scanner setup</Link>, type the full folder path (like C:\Scans\) and click{" "}
-        <strong>Save folder</strong>. The page checks it on the laptop within about 30 seconds. The folder must already
+        <strong>Save folder</strong>. On the scanner laptop you can click <strong>Browse...</strong> instead of typing
+        (the Scan Watcher must be open), then click <strong>Save folder</strong>. The page checks it on the laptop within about 30 seconds. The folder must already
         exist on the scanner laptop (C:\Scans\ is made at install). Then set the scanner to save into the same folder.
       </>
     ),

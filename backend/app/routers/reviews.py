@@ -1025,9 +1025,11 @@ def _send_correction(url: str, payload: dict) -> tuple[str, str, dict | None]:
     refused the correction because the stamp is already stored for the term
     (HTTP 409 {success: false, code: 'duplicate_stamp', duplicate_of}); nothing was saved."""
     secret = getattr(get_settings(), "n8n_webhook_secret", "") or ""
-    headers = {"X-Webhook-Secret": secret} if secret else {}
+    if not secret:  # never call n8n unauthenticated (validate_settings also refuses to start)
+        log.error("correction webhook not sent: N8N_WEBHOOK_SECRET is empty")
+        return "failed", "Marking refused the server's credentials (a setup problem). Ask IT to check N8N_WEBHOOK_SECRET.", None
     try:
-        resp = _n8n().post(url, json=payload, headers=headers)
+        resp = _n8n().post(url, json=payload, headers={"X-Webhook-Secret": secret})
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         log.warning("correction webhook unreachable: %s", type(e).__name__)
         return "failed", "Marking could not be reached, so the correction was not sent. Try again in a minute.", None

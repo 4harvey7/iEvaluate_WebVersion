@@ -89,7 +89,8 @@ def make(tmp_path, monkeypatch):
     scans = tmp_path / "Scans"
     scans.mkdir()
     cfg_path = tmp_path / "watcher_config.json"
-    cfg_path.write_text(json.dumps({"api_base": "http://server", "station_key": "k", "folder": str(scans)}))
+    cfg_path.write_text(json.dumps({"api_base": "https://server", "station_key": "k", "folder": str(scans),
+                                    "allowed_roots": [str(tmp_path)]}))
 
     def _make(server):
         w = fw.Watcher(fw.load_config(str(cfg_path)))
@@ -309,7 +310,7 @@ def test_kept_for_review_counts_as_delivered(make):
 
 
 def test_version():
-    assert fw.VERSION == "2.5.0"
+    assert fw.VERSION == "2.5.2"
 
 
 # ---------------------------------------------------------------- online light (2.4.4)
@@ -342,7 +343,7 @@ def test_send_offline(make, monkeypatch):
     monkeypatch.setattr(fw.requests, "post", post, raising=False)
     assert fw.send_offline(cfg) is True
     url, body, headers = calls[-1]
-    assert url == "http://server/scans/offline" and body == {"version": fw.VERSION}
+    assert url == "https://server/scans/offline" and body == {"version": fw.VERSION}
     assert headers["X-Station-Key"] == "k"
 
     monkeypatch.setattr(fw.requests, "post", lambda *a, **k: Resp(404, {}), raising=False)

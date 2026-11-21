@@ -97,7 +97,7 @@ def test_trust_proxy_headers_defaults_to_false(monkeypatch):
 
 # ================================================================ b. plaintext n8n
 def _cfg(url, **extra):
-    base = dict(n8n_batch_webhook_url=url, n8n_webhook_secret="s", n8n_correction_webhook_url="",
+    base = dict(n8n_batch_webhook_url=url, n8n_webhook_secret="s" * 32, n8n_correction_webhook_url="",
                 n8n_import_error_webhook_url="")
     base.update(extra)
     return SimpleNamespace(**base)
@@ -264,6 +264,8 @@ def test_installer_never_writes_a_network_folder(st_env):
     r = st_env(sb, _user(BOUND)).post(f"/stations/{SID}/installer", json={"api_base": "https://api.example.com"})
     cfg = json.loads(zipfile.ZipFile(io.BytesIO(r.content)).read("ScanWatcher/watcher_config.json"))
     assert cfg["folder"] == "C:/Scans"
+    # 2.5.2 Browse picker: the watcher answers only the backend's own CORS origins.
+    assert cfg["site_origins"] == [o for o in stations.get_settings().cors_origins if o != "*"]
 
 
 BATCH = {"id": BID, "station_id": SID, "status": "open", "created_by": BOUND}
@@ -327,7 +329,7 @@ def test_heartbeat_never_sends_a_network_folder(monkeypatch):
 
 
 def test_watcher_version():
-    assert fw.VERSION == "2.5.0"
+    assert fw.VERSION == "2.5.2"
 
 
 @pytest.mark.parametrize("remote", ["//srv/share/scans", "\\\\srv\\share\\scans", "\\\\?\\UNC\\srv\\share\\x"])

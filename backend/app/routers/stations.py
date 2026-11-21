@@ -225,6 +225,8 @@ def download_installer(
         "station_key": key,
         # Never a network share from the website (IT may set one on the laptop by hand).
         "folder": _installer_folder(station.get("folder_path")),
+        # Websites the watcher's local Browse picker (2.5.2+) answers: the CORS list, never "*".
+        "site_origins": [o for o in get_settings().cors_origins if o != "*"],
     }
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -276,7 +278,7 @@ def skipped_pages(station_id: str, body: SkippedPagesAction, user: CurrentUser =
     skipped/before-batch/. add_to_batch: the watcher puts them back and sends
     them to the open batch; discard: it moves them to skipped/discarded/<date>/
     (never deleted). Carried out on the watcher's next heartbeat (~10-30 s)."""
-    _get_station_row(station_id)
+    _require_station_manager(_get_station_row(station_id), user, "skipped_pages")
     sb = get_supabase()
     if body.action == "add_to_batch":
         open_rows = sb.table("scan_batches").select("id").eq("station_id", station_id).eq("status", "open").limit(1).execute().data

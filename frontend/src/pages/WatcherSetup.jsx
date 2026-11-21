@@ -16,6 +16,29 @@ import {
   usesFolderShortcut,
 } from "../scanner.jsx";
 
+// Scan Watcher 2.5.2+ on THIS laptop: opens the Windows folder window and returns
+// the full path (a browser alone can't). Port also in folder_watcher.py and vercel.json.
+const WATCHER_LOCAL = "http://127.0.0.1:47615";
+const CAN_BROWSE = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+const BROWSE_OFFLINE = "Open the Scan Watcher on this laptop to use Browse, or type the folder path.";
+
+// -> { path } (null path = cancelled) or { error: "offline" | "busy" | "no_dialog" | ... }
+async function pickFolderOnLaptop() {
+  try {
+    const ping = await fetch(`${WATCHER_LOCAL}/ping`, { signal: AbortSignal.timeout(3000) });
+    if (!ping.ok) return { error: "offline" };
+  } catch {
+    return { error: "offline" };
+  }
+  try {
+    const res = await fetch(`${WATCHER_LOCAL}/pick-folder`, { method: "POST" });
+    const body = await res.json().catch(() => ({}));
+    return res.ok ? { path: body.path || null } : { error: body.error || "failed" };
+  } catch {
+    return { error: "offline" };
+  }
+}
+
 // "Scanner laptop" page: status light, one-click installer, scan folder, and
 // the old manual setup tucked away under "Advanced (for IT)".
 export default function WatcherSetup({ stationId, stationKey, onStationKey, onStationMissing }) {
@@ -31,6 +54,8 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
   const [savingFolder, setSavingFolder] = useState(false);
   const [folderError, setFolderError] = useState("");
   const [folderCheck, setFolderCheck] = useState(null); // { folder, savedAt, startedMs } after a save
+  const [browsing, setBrowsing] = useState(false);
+  const [browseNote, setBrowseNote] = useState(null); // { tone: "info" | "warn", text }
   const now = useNow(2000);
   const check = folderCheckStatus(station, folderCheck, now);
 
@@ -78,6 +103,29 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
       setFolderError(err?.message || "The folder couldn't be saved. Please try again.");
     } finally {
       setSavingFolder(false);
+    }
+  }
+
+  async function browseFolder() {
+    setBrowseNote(null);
+    setBrowsing(true);
+    try {
+      const res = await pickFolderOnLaptop();
+      if (res.path) {
+        folderTouched.current = true;
+        setFolder(res.path);
+        setFolderCheck(null);
+        setFolderError("");
+        setBrowseNote({ tone: "info", text: "Folder chosen. Click Save folder to use it." });
+      } else if (res.error === "offline") {
+        setBrowseNote({ tone: "warn", text: BROWSE_OFFLINE });
+      } else if (res.error === "busy") {
+        setBrowseNote({ tone: "warn", text: "A folder window is already open on this laptop. It may be behind this window." });
+      } else if (res.error) {
+        setBrowseNote({ tone: "warn", text: "The folder window couldn't open on this laptop. Please type the folder path." });
+      }
+    } finally {
+      setBrowsing(false);
     }
   }
 
@@ -164,6 +212,7 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
               setFolder(e.target.value);
               setFolderCheck(null);
               setFolderError("");
+              setBrowseNote(null);
             }}
             placeholder={DEFAULT_FOLDER}
             maxLength={500}
@@ -172,6 +221,11 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
             aria-describedby="folder-tip"
             aria-invalid={folderError ? "true" : undefined}
           />
+          {CAN_BROWSE && (
+            <button type="button" onClick={browseFolder} disabled={browsing} aria-describedby="browse-note">
+              {browsing ? "Choose in the window..." : "Browse..."}
+            </button>
+          )}
           <button type="submit" className="primary" disabled={savingFolder || !station || !folderDirty}>
             <Icon name="folder" size={18} />
             {savingFolder ? "Saving..." : "Save folder"}
@@ -181,6 +235,11 @@ export default function WatcherSetup({ stationId, stationKey, onStationKey, onSt
       <p id="folder-tip" className="tip">
         <strong>Tip:</strong> Set your scanner to save into this same folder.
       </p>
+      <div id="browse-note" role="status">
+        {browseNote && (
+          <div className={browseNote.tone === "info" ? "success-box small" : "warning-box small"}>{browseNote.text}</div>
+        )}
+      </div>
       {folderError && <div className="error" role="alert">{folderError}</div>}
       {check && (
         <div

@@ -211,10 +211,11 @@ def require_admin(user: CurrentUser = Depends(require_staff)) -> CurrentUser:
 
 
 # ------------------------------------------------------------------ station key
-def require_station(x_station_key: str | None = Header(default=None, alias="X-Station-Key")) -> dict:
-    if not x_station_key or len(x_station_key) > 200:
-        raise HTTPException(status_code=401, detail={"code": "invalid_station_key", "message": "Missing or invalid station key."})
-    presented_hash = hash_station_key(x_station_key.strip())
+def station_by_key(key: str | None) -> dict | None:
+    """The station row for this X-Station-Key (without key_hash), or None."""
+    if not key or len(key) > 200:
+        return None
+    presented_hash = hash_station_key(key.strip())
     res = (
         get_supabase()
         .table("stations")
@@ -225,8 +226,20 @@ def require_station(x_station_key: str | None = Header(default=None, alias="X-St
     )
     row = res.data[0] if res.data else None
     if not row or not hmac.compare_digest(str(row.get("key_hash") or ""), presented_hash):
-        raise HTTPException(status_code=401, detail={"code": "invalid_station_key", "message": "Missing or invalid station key."})
+        return None
     row.pop("key_hash", None)
+    return row
+
+
+def station_key_known(key: str) -> bool:
+    """Early check used by body_limit before an ingest body is buffered."""
+    return station_by_key(key) is not None
+
+
+def require_station(x_station_key: str | None = Header(default=None, alias="X-Station-Key")) -> dict:
+    row = station_by_key(x_station_key)
+    if not row:
+        raise HTTPException(status_code=401, detail={"code": "invalid_station_key", "message": "Missing or invalid station key."})
     return row
 
 
@@ -282,15 +295,18 @@ def client_ip(request: Request) -> str:
     sending headers.
 
     TRUST_PROXY_HEADERS=true (Render, behind Cloudflare):
-      1. CF-Connecting-IP, which Cloudflare always overwrites with the real client;
+      1. TRUSTED_IP_HEADER (default CF-Connecting-IP, which Cloudflare always
+         overwrites with the real client; "none" skips this step);
       2. else the RIGHTMOST valid X-Forwarded-For entry, i.e. the one appended by
          the nearest proxy (entries to its left are client-supplied and spoofable);
       3. else the TCP peer.
     """
-    if get_settings().trust_proxy_headers:
-        cf_ip = _parse_ip(request.headers.get("cf-connecting-ip"))
-        if cf_ip:
-            return cf_ip
+    settings = get_settings()
+    if settings.trust_proxy_headers:
+        header = getattr(settings, "trusted_ip_header", "cf-connecting-ip")
+        edge_ip = _parse_ip(request.headers.get(header)) if header and header != "none" else None
+        if edge_ip:
+            return edge_ip
         xff = ",".join(request.headers.getlist("x-forwarded-for"))
         for part in reversed(xff.split(",")):
             ip = _parse_ip(part)

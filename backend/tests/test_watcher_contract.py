@@ -191,7 +191,7 @@ def test_ingest_still_validates_image_after_batch_check(env):
 
 # ---------------------------------------------------------------- 2. skipped-pages endpoint
 def test_add_to_batch_needs_open_batch(env):
-    sb = MemSB({"scan_batches": [], "stations": [_station()]})
+    sb = MemSB({"scan_batches": [], "stations": [_station(current_staff_id=USER.id)]})
     client = env(sb)
     r = client.post(f"/stations/{SID}/skipped-pages", json={"action": "add_to_batch"})
     assert r.status_code == 409
@@ -201,7 +201,7 @@ def test_add_to_batch_needs_open_batch(env):
 
 @pytest.mark.parametrize("action,command", [("add_to_batch", "resend_skipped"), ("discard", "discard_skipped")])
 def test_skipped_pages_sets_command_and_returns_station(env, action, command):
-    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station(watcher_skipped_files=3)], "user_info": []})
+    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station(current_staff_id=USER.id, watcher_skipped_files=3)], "user_info": []})
     client = env(sb)
     r = client.post(f"/stations/{SID}/skipped-pages", json={"action": action})
     assert r.status_code == 200, r.text
@@ -215,14 +215,14 @@ def test_skipped_pages_sets_command_and_returns_station(env, action, command):
 
 
 def test_discard_works_without_open_batch(env):
-    sb = MemSB({"scan_batches": [], "stations": [_station()], "user_info": []})
+    sb = MemSB({"scan_batches": [], "stations": [_station(current_staff_id=USER.id)], "user_info": []})
     client = env(sb)
     r = client.post(f"/stations/{SID}/skipped-pages", json={"action": "discard"})
     assert r.status_code == 200 and r.json()["watcher_command"] == "discard_skipped"
 
 
 def test_skipped_pages_without_migration_004_is_503(env):
-    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station()], "user_info": []},
+    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station(current_staff_id=USER.id)], "user_info": []},
                missing_columns=station_status.ALL_WATCHER_FIELDS)
     client = env(sb)
     r = client.post(f"/stations/{SID}/skipped-pages", json={"action": "add_to_batch"})
@@ -234,7 +234,7 @@ def test_skipped_pages_without_migration_004_is_503(env):
 
 
 def test_skipped_pages_rejects_unknown_action_and_station(env):
-    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station()]})
+    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station(current_staff_id=USER.id)]})
     client = env(sb)
     assert client.post(f"/stations/{SID}/skipped-pages", json={"action": "delete"}).status_code == 422
     other = "55555555-5555-5555-5555-555555555555"
@@ -258,7 +258,7 @@ def _hb(client, **body):
 
 
 def test_heartbeat_command_round_trip(env):
-    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station()], "user_info": []})
+    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station(current_staff_id=USER.id)], "user_info": []})
     client = env(sb)
     d = _hb(client)
     assert d["command"] is None and d["command_id"] is None
@@ -280,7 +280,7 @@ def test_heartbeat_command_round_trip(env):
 
 
 def test_command_done_for_old_id_keeps_newer_command(env):
-    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station()], "user_info": []})
+    sb = MemSB({"scan_batches": [_open_batch()], "stations": [_station(current_staff_id=USER.id)], "user_info": []})
     client = env(sb)
     client.post(f"/stations/{SID}/skipped-pages", json={"action": "discard"})
     d = _hb(client, command_done="some-older-id")

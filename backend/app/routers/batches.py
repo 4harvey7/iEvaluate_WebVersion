@@ -11,6 +11,7 @@ from app.batch_access import is_batch_owner
 from app.db import get_settings, get_supabase, is_valid_uuid
 from app.logic import AUTO_REJECT_RULES, UNSAVED_REVIEW_MSG, item_error_code, last_activity, parse_ts
 from app.routers.instructors import get_instructor_if_eligible
+from app.routers.stations import _require_station_manager
 from app.security import CurrentUser, require_staff
 from app.station_status import public_watcher_fields, select_stations, watcher_presence
 
@@ -51,8 +52,10 @@ def start_batch(body: StartBatch, user: CurrentUser = Depends(require_staff)):
         raise HTTPException(status_code=400, detail="Invalid instructor or subject ID")
     sb = get_supabase()
 
-    if not sb.table("stations").select("id").eq("id", body.station_id).limit(1).execute().data:
+    station = sb.table("stations").select("id, current_staff_id").eq("id", body.station_id).limit(1).execute().data
+    if not station:
         raise HTTPException(status_code=404, detail={"code": "station_not_found", "message": "Station not found."})
+    _require_station_manager(station[0], user, "start_batch")
     if not get_instructor_if_eligible(body.instructor_id):
         raise HTTPException(status_code=400, detail={"code": "invalid_instructor", "message": "That person is not an active instructor."})
     if not sb.table("subjects").select("id").eq("id", body.subject_id).limit(1).execute().data:

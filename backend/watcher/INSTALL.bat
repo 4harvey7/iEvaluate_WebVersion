@@ -112,6 +112,9 @@ fc /b "%HERE%watcher_config.json" "%DEST%\watcher_config.json" >nul 2>&1
 if errorlevel 1 goto copy_failed
 fc /b "%HERE%folder_watcher.py" "%DEST%\folder_watcher.py" >nul 2>&1
 if errorlevel 1 goto copy_failed
+REM The copy is verified: remove the station key from the download folder
+REM (only the installed copy in %DEST% keeps it).
+del /q "%HERE%watcher_config.json" >nul 2>&1
 REM Files from a download are marked "from the internet"; unmark our copies so
 REM Windows does not ask about them at every start-up.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath $env:SW_DEST -File | Unblock-File" >nul 2>&1

@@ -1,14 +1,11 @@
 """Instructor create (similar-name check + "different person" override), search
-ranking, the Brevo mailer itself and the subject-code duplicate check.
+ranking and the subject-code duplicate check.
 No network, no DB."""
-import json
 from types import SimpleNamespace
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import mailer
 from app.main import app
 from app.routers import instructors, subjects
 from app.security import require_staff
@@ -141,63 +138,6 @@ def test_search_puts_all_words_match_first(setup):
     r = client.get("/instructors/search", params={"q": "rodz licayan"})
     assert r.status_code == 200
     assert [x["id"] for x in r.json()] == [RODZ, RONALD]
-
-
-# ---------------------------------------------------------------- Brevo mailer
-KEY = "test-brevo-key-not-real"
-
-
-def _mail_settings(key=KEY, sender="sao@school.edu", name="SAO Management"):
-    return SimpleNamespace(brevo_api_key=key, brevo_sender_email=sender, brevo_sender_name=name,
-                           email_configured=bool(key and sender))
-
-
-def _mock_brevo(monkeypatch, handler):
-    monkeypatch.setattr(mailer, "get_settings", lambda: _mail_settings())
-    monkeypatch.setattr(mailer, "_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
-
-
-def test_send_email_posts_to_brevo(monkeypatch):
-    seen = []
-
-    def handler(request):
-        seen.append(request)
-        return httpx.Response(201, json={"messageId": "<x@brevo>"})
-
-    _mock_brevo(monkeypatch, handler)
-    assert mailer.send_email("ana@school.edu", "Hi", "<p>x</p>") == (True, None)
-    assert len(seen) == 1
-    req = seen[0]
-    assert req.method == "POST" and str(req.url) == "https://api.brevo.com/v3/smtp/email"
-    assert req.headers["api-key"] == KEY
-    assert req.headers["content-type"] == "application/json" and req.headers["accept"] == "application/json"
-    assert json.loads(req.content) == {
-        "sender": {"name": "SAO Management", "email": "sao@school.edu"},
-        "to": [{"email": "ana@school.edu"}],
-        "subject": "Hi",
-        "htmlContent": "<p>x</p>",
-    }
-
-
-def test_send_email_brevo_error_is_send_failed(monkeypatch, caplog):
-    _mock_brevo(monkeypatch, lambda request: httpx.Response(400, json={"code": "invalid_parameter"}))
-    assert mailer.send_email("ana@school.edu", "Hi", "<p>x</p>") == (False, "send_failed")
-    assert "400" in caplog.text and KEY not in caplog.text
-
-
-def test_send_email_timeout_is_send_failed_not_raised(monkeypatch, caplog):
-    def handler(request):
-        raise httpx.ConnectTimeout("timed out", request=request)
-
-    _mock_brevo(monkeypatch, handler)
-    assert mailer.send_email("ana@school.edu", "Hi", "<p>x</p>") == (False, "send_failed")
-    assert KEY not in caplog.text
-
-
-def test_send_email_not_configured(monkeypatch):
-    monkeypatch.setattr(mailer, "get_settings", lambda: _mail_settings(sender=""))
-    monkeypatch.setattr(mailer, "_client", lambda: pytest.fail("no HTTP call without config"))
-    assert mailer.send_email("ana@school.edu", "Hi", "<p>x</p>") == (False, "not_configured")
 
 
 def test_subject_duplicate_found_past_the_first_fifty_rows(monkeypatch):

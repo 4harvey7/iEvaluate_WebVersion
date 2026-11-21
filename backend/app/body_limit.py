@@ -2,8 +2,9 @@
 rejected with 413 before JSON parsing and before station-key / bearer auth.
 
 For the scan-ingest endpoint (the only one taking big bodies) it also:
-  * answers 401 straight away when the X-Station-Key header is missing, so an
-    anonymous caller can never make the server buffer a 17 MB body;
+  * answers 401 straight away when the X-Station-Key header is missing or does
+    not match a station (hash lookup), so a caller without a real key can never
+    take an ingest slot or make the server buffer a 17 MB body;
   * caps how many ingest calls run at once (INGEST_MAX_CONCURRENCY, default 4).
     Each one holds a decoded page in memory and waits for n8n; when all slots
     are taken the caller gets 503 server_busy with Retry-After, which the
@@ -13,6 +14,8 @@ from __future__ import annotations
 
 import json
 import threading
+
+from starlette.concurrency import run_in_threadpool
 
 INGEST_PATH = "/scans/ingest"
 INGEST_MAX_BYTES = 17 * 1024 * 1024       # 12 MB image, base64-encoded (~16 MB) + JSON
@@ -86,10 +89,10 @@ class BodySizeLimitMiddleware:
         if not is_ingest(path):
             return await self._buffer_and_call(scope, receive, send, limit)
 
-        # 2. Ingest: no station key -> 401 before reading a single body byte.
-        #    (The key itself is checked by require_station after routing.)
+        # 2. Ingest: missing or unknown station key -> 401 before reading a single
+        #    body byte or taking a slot. require_station still checks it after routing.
         key = next((v for n, v in headers if n == b"x-station-key"), b"").strip()
-        if not key:
+        if not key or not await self._key_known(key.decode("latin-1")):
             return await self._reject(send, 401, "invalid_station_key", "Missing or invalid station key.")
 
         # 3. Ingest: bounded concurrency.
@@ -102,6 +105,14 @@ class BodySizeLimitMiddleware:
             return await self._buffer_and_call(scope, receive, send, limit)
         finally:
             self.ingest_slots.release()
+
+    @staticmethod
+    async def _key_known(key: str) -> bool:
+        from app import security  # lazy: keeps this module import-light
+        try:
+            return await run_in_threadpool(security.station_key_known, key)
+        except Exception:  # database unreachable: let require_station answer (503)
+            return True
 
     async def _buffer_and_call(self, scope, receive, send, limit: int):
         # Actual size (chunked uploads / lying Content-Length): buffer up to

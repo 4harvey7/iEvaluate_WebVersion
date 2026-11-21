@@ -18,7 +18,18 @@ prefilled, from the website's "Scanner setup" page):
 this station is picked up automatically within ~15 s (no restart needed) and
 saved back into watcher_config.json.
 
-Optional keys: "processed_dir", "skipped_dir", "poll_seconds".
+Optional keys: "processed_dir", "skipped_dir", "poll_seconds", "allowed_roots",
+"site_origins".
+
+"site_origins" (2.5.2+, written by the installer): the website addresses allowed
+to use the Browse... button on the Scanner setup page. The watcher then answers
+on http://127.0.0.1:47615 only (GET /ping, POST /pick-folder opens the Windows
+folder window and returns the chosen path). A folder picked there is added to
+"allowed_roots", because a person chose it on this laptop.
+
+"allowed_roots" (2.5.1+): a folder sent from the website is only used when it is
+inside one of these folders (default: C:/Scans plus the "folder" in this file).
+"api_base" must be https:// (http:// only for localhost / 127.0.0.1).
 
 Pages scanned before the batch was started are set aside in
 skipped/before-batch/. The website can then ask (through the heartbeat) to add
@@ -52,12 +63,15 @@ import posixpath
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import requests
 
@@ -67,7 +81,7 @@ except ImportError:  # pragma: no cover
     print("Pillow is not installed. Run:  py -3 -m pip install -r requirements.txt")
     raise
 
-VERSION = "2.5.0"
+VERSION = "2.5.2"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCK_FILE_NAME = "watcher.lock"    # single instance (2.5.0+), next to this script
 EXIT_ALREADY_RUNNING = 7           # start_watcher.bat stops its restart loop on this code
@@ -257,6 +271,8 @@ class Config:
     processed_dir_explicit: bool = False
     skipped_dir_explicit: bool = False
     path: str = ""
+    allowed_roots: list = field(default_factory=list)  # website folders must be inside one of these
+    site_origins: list = field(default_factory=list)   # websites allowed to use the local Browse picker
 
 
 _PATH_KEYS = ("folder", "processed_dir", "skipped_dir")
@@ -302,8 +318,15 @@ def load_config(path: str) -> Config:
     if missing:
         raise ConfigError(f"watcher_config.json is missing: {', '.join(missing)}")
     folder = expand_folder(raw.get("folder")) or DEFAULT_FOLDER
+    api_base = str(raw["api_base"]).strip().rstrip("/")
+    if not is_safe_api_base(api_base):
+        raise ConfigError("watcher_config.json: api_base must start with https:// "
+                          "(http:// is only allowed for localhost / 127.0.0.1), or the station key would be sent in clear.")
+    roots = raw.get("allowed_roots")
+    if not isinstance(roots, list) or not roots:
+        roots = [DEFAULT_FOLDER, folder]  # existing installs keep their own folder
     cfg = Config(
-        api_base=str(raw["api_base"]).strip().rstrip("/"),
+        api_base=api_base,
         station_key=str(raw["station_key"]).strip(),
         folder=to_os_path(folder),
         processed_dir="",
@@ -312,6 +335,8 @@ def load_config(path: str) -> Config:
         processed_dir_explicit=bool(str(raw.get("processed_dir") or "").strip()),
         skipped_dir_explicit=bool(str(raw.get("skipped_dir") or "").strip()),
         path=path,
+        allowed_roots=[to_os_path(expand_folder(r)) for r in roots if isinstance(r, str) and r.strip()],
+        site_origins=parse_site_origins(raw.get("site_origins")),
     )
     cfg.processed_dir = (
         os.path.abspath(to_os_path(expand_folder(raw["processed_dir"]))) if cfg.processed_dir_explicit
@@ -324,11 +349,48 @@ def load_config(path: str) -> Config:
     return cfg
 
 
+def is_safe_api_base(url: str) -> bool:
+    """https:// anywhere; http:// only to this laptop."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return parts.scheme.lower() == "https" or (parts.scheme.lower() == "http" and host in ("localhost", "127.0.0.1"))
+
+
+def in_allowed_roots(folder: str, roots) -> bool:
+    """True when `folder` (symlinks resolved) is one of `roots` or inside one."""
+    real = os.path.normcase(os.path.realpath(to_os_path(folder)))
+    for r in roots:
+        root = os.path.normcase(os.path.realpath(to_os_path(r)))
+        try:
+            if os.path.commonpath([real, root]) == root:
+                return True
+        except ValueError:  # different drives
+            continue
+    return False
+
+
+_config_write_lock = threading.Lock()  # main loop (folder) and Browse picker (allowed_roots) both write
+
+
 def save_folder_to_config(path: str, folder: str) -> None:
-    """Atomically rewrite watcher_config.json with a new "folder", keeping
-    every other key."""
+    update_config(path, {"folder": folder})
+
+
+def update_config(path: str, updates: dict) -> None:
+    """Atomically rewrite watcher_config.json with `updates`, keeping every
+    other key."""
+    with _config_write_lock:
+        _write_config(path, updates)
+
+
+def _write_config(path: str, updates: dict) -> None:
     raw = read_config_json(path)
-    raw["folder"] = folder
+    raw.update(updates)
     d = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(prefix=".watcher_config.", suffix=".tmp", dir=d)
     try:
@@ -342,6 +404,170 @@ def save_folder_to_config(path: str, folder: str) -> None:
         except OSError:
             pass
         raise
+
+
+# --------------------------------------------------------------------------- Browse picker (2.5.2+)
+# The website can't learn a folder's full path from the browser, so its
+# "Browse..." button asks this program, on this laptop only.
+PICKER_PORT = 47615          # same number in frontend/src/pages/WatcherSetup.jsx and vercel.json (CSP)
+PICKER_TIMEOUT = 600.0       # a folder window left open this long is closed
+_ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
+
+
+def parse_site_origins(raw) -> list[str]:
+    """Exact website origins ("https://host[:port]") from the config; never "*"."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for o in raw:
+        o = str(o or "").strip().rstrip("/")
+        if _ORIGIN_RE.match(o):
+            out.append(o)
+    return out
+
+
+_TK_PICK = (
+    "import sys, tkinter as tk\n"
+    "from tkinter import filedialog\n"
+    "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
+    "p = filedialog.askdirectory(parent=r, initialdir=sys.argv[1] or None, mustexist=True,\n"
+    "                            title='Choose the scan folder')\n"
+    "sys.stdout.write(p or '')\n"
+)
+_PS_PICK = (
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+    "Add-Type -AssemblyName System.Windows.Forms; "
+    "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+    "$d.Description = 'Choose the scan folder'; $d.SelectedPath = $env:SW_INITIAL; "
+    "$f = New-Object System.Windows.Forms.Form -Property @{TopMost = $true}; "
+    "if ($d.ShowDialog($f) -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }"
+)
+
+
+def ask_folder(initial: str = "") -> str | None:
+    """Open the Windows folder window in a child process (so nothing here
+    blocks): tkinter, else PowerShell. Returns the path, "" when cancelled,
+    None when no folder window could be opened."""
+    env = dict(os.environ, SW_INITIAL=initial or "", PYTHONIOENCODING="utf-8")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for cmd in ([sys.executable, "-c", _TK_PICK, initial or ""],
+                ["powershell", "-NoProfile", "-STA", "-Command", _PS_PICK]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                               timeout=PICKER_TIMEOUT, env=env, creationflags=flags)
+        except subprocess.TimeoutExpired:
+            return ""  # nobody answered the window: treat as cancelled
+        except OSError:
+            continue
+        if r.returncode == 0:
+            return r.stdout.strip()
+        log.info("folder window via %s failed (exit %s)", os.path.basename(cmd[0]), r.returncode)
+    return None
+
+
+class FolderPicker:
+    """POST /pick-folder: one folder window at a time; returns only the path."""
+
+    def __init__(self, cfg: Config, ask=ask_folder):
+        self.cfg = cfg
+        self.ask = ask
+        self._busy = threading.Lock()
+
+    def __call__(self) -> tuple[int, dict]:
+        if not self._busy.acquire(blocking=False):
+            return 409, {"error": "busy"}
+        try:
+            chosen = self.ask(self.cfg.folder)
+        finally:
+            self._busy.release()
+        if chosen is None:
+            return 503, {"error": "no_dialog"}
+        if not chosen:
+            return 200, {"path": None}  # cancelled
+        folder = normalize_folder(chosen)
+        self.allow(folder)
+        return 200, {"path": to_os_path(folder)}
+
+    def allow(self, folder: str) -> None:
+        """A person chose this folder on this laptop: let the website set it
+        (allowed_roots). Unsafe and network folders are never added; the
+        website refuses them anyway."""
+        cfg = self.cfg
+        if is_network_path(folder) or local_folder_problem(folder) or in_allowed_roots(folder, cfg.allowed_roots):
+            return
+        cfg.allowed_roots = cfg.allowed_roots + [to_os_path(folder)]  # new list: the main loop reads it
+        log.info("Browse: %s chosen on this laptop - added to allowed_roots", folder)
+        if cfg.path:
+            try:
+                update_config(cfg.path, {"allowed_roots": [normalize_folder(r) for r in cfg.allowed_roots]})
+            except (OSError, ConfigError, ValueError) as e:
+                log.warning("Could not save allowed_roots into %s (%s)", cfg.path, e)
+
+
+def picker_reply(method: str, path: str, headers, client_ip: str, origins, port: int, pick):
+    """(status, headers, json body or None) for one request to the local picker.
+    Only this laptop, only Host 127.0.0.1/localhost (DNS rebinding), only the
+    website's exact origins."""
+    origin = headers.get("Origin") or ""
+    host = (headers.get("Host") or "").lower()
+    if (client_ip not in ("127.0.0.1", "::1") or host not in (f"127.0.0.1:{port}", f"localhost:{port}")
+            or origin not in origins):
+        return 403, {}, {"error": "forbidden"}
+    cors = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    route = path.split("?", 1)[0]
+    if method == "OPTIONS":
+        cors.update({"Access-Control-Allow-Methods": "GET, POST", "Access-Control-Max-Age": "600"})
+        if (headers.get("Access-Control-Request-Private-Network") or "").lower() == "true":
+            cors["Access-Control-Allow-Private-Network"] = "true"  # Chrome/Edge: https page -> 127.0.0.1
+        return 204, cors, None
+    if method == "GET" and route == "/ping":
+        return 200, cors, {"ok": True, "app": "scan-watcher", "version": VERSION}
+    if method == "POST" and route == "/pick-folder":
+        status, body = pick()
+        return status, cors, body
+    return 404, cors, {"error": "not_found"}
+
+
+def start_picker_server(cfg: Config, port: int = PICKER_PORT, pick=None):
+    """Serve picker_reply on 127.0.0.1 in a background thread. Returns the
+    server, or None when it's off (no site_origins) or the port is taken."""
+    if not cfg.site_origins:
+        log.info("Browse button off: no site_origins in watcher_config.json (download the installer again to turn it on).")
+        return None
+    pick = pick or FolderPicker(cfg)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self):
+            status, hdrs, body = picker_reply(self.command, self.path, self.headers, self.client_address[0],
+                                              cfg.site_origins, port, pick)
+            data = json.dumps(body).encode() if body is not None else b""
+            self.send_response(status)
+            for k, v in hdrs.items():
+                self.send_header(k, v)
+            self.send_header("Cache-Control", "no-store")
+            if body is not None:
+                self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = do_POST = do_OPTIONS = _reply
+
+        def log_message(self, *args):  # requests are not worth logging
+            pass
+
+    class Server(ThreadingHTTPServer):
+        allow_reuse_address = False  # on Windows SO_REUSEADDR would let another program share the port
+
+    try:
+        srv = Server(("127.0.0.1", port), Handler)
+    except OSError as e:
+        log.warning("Browse button off: port %s on this laptop is in use (%s).", port, e)
+        return None
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, name="picker", daemon=True).start()
+    log.info("Browse button on: listening on 127.0.0.1:%s for %s", port, ", ".join(cfg.site_origins))
+    return srv
 
 
 # --------------------------------------------------------------------------- state
@@ -495,8 +721,9 @@ def iter_candidates(cfg: Config):
         for name in files:
             if name.startswith((".", "~")) or name.lower().endswith((".tmp", ".part", ".crdownload")):
                 continue
-            if os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS:
-                yield os.path.join(root, name)
+            path = os.path.join(root, name)
+            if os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS and not os.path.islink(path):
+                yield path
 
 
 def move_file(path: str, dest_root: str, subdir: str | None = None) -> str:
@@ -519,7 +746,7 @@ def list_page_files(folder: str) -> list[str]:
         with os.scandir(folder) as it:
             names = [
                 e.path for e in it
-                if e.is_file() and not e.name.startswith((".", "~"))
+                if e.is_file() and not e.is_symlink() and not e.name.startswith((".", "~"))
                 and os.path.splitext(e.name)[1].lower() in SUPPORTED_EXTENSIONS
             ]
     except OSError:
@@ -673,6 +900,16 @@ class Watcher:
                 log.error(
                     "The website asks to watch %s, but that folder is too big to watch - still watching %s. "
                     "Pick a folder just for scans, like C:\\Scans.", remote, self.cfg.folder,
+                )
+                self.last_heartbeat = 0.0
+            self.rejected_remote_folder = remote
+            return
+        if not in_allowed_roots(new, self.cfg.allowed_roots):
+            if self.rejected_remote_folder != remote:
+                log.error(
+                    "The website asks to watch %s, but it is not inside allowed_roots in watcher_config.json "
+                    "(%s) - still watching %s. IT can add the folder there.", remote,
+                    ", ".join(self.cfg.allowed_roots), self.cfg.folder,
                 )
                 self.last_heartbeat = 0.0
             self.rejected_remote_folder = remote
@@ -1106,6 +1343,7 @@ class Watcher:
         self.check_folder(create=True)
         self.heartbeat(force=True)
         threading.Thread(target=self._keepalive_loop, name="keepalive", daemon=True).start()
+        start_picker_server(self.cfg)
         while True:
             try:
                 self.heartbeat()

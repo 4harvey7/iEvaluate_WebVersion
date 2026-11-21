@@ -95,19 +95,15 @@ class Settings:
         # the rightmost X-Forwarded-For entry. Leave false for local runs (headers
         # would be spoofable); set true on Render (it sits behind Cloudflare).
         self.trust_proxy_headers: bool = _bool_env("TRUST_PROXY_HEADERS", False)
-        # Brevo (app/mailer.py): same API key and sender as the Flutter app's
-        # Supabase functions. Optional: empty = no email is sent.
-        self.brevo_api_key: str = os.environ.get("BREVO_API_KEY", "").strip()
-        self.brevo_sender_email: str = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
-        self.brevo_sender_name: str = os.environ.get("BREVO_SENDER_NAME", "").strip() or "SAO Management"
+        # Header the edge proxy overwrites with the real client IP (checked before
+        # X-Forwarded-For). Default: Cloudflare's, which fronts Render. Set it to
+        # "none" if the deployment is not behind Cloudflare, or a client could
+        # pick its own rate-limit bucket by sending the header.
+        self.trusted_ip_header: str = os.environ.get("TRUSTED_IP_HEADER", "cf-connecting-ip").strip().lower()
 
     @property
     def simulation_mode(self) -> bool:
         return self.simulate_scans and not self.n8n_batch_webhook_url
-
-    @property
-    def email_configured(self) -> bool:
-        return bool(self.brevo_api_key and self.brevo_sender_email)
 
 
 BATCH_WEBHOOK_PATH = "sast-batch-scan"
@@ -173,16 +169,21 @@ class DatabaseUnreachable(RuntimeError):
     503 database_unreachable."""
 
 
+MIN_WEBHOOK_SECRET_LEN = 32
+
+
 def validate_settings(s: Settings) -> None:
     """Refuse to start with an unsafe configuration."""
-    if s.n8n_batch_webhook_url and not s.n8n_webhook_secret:
+    urls = (("N8N_BATCH_WEBHOOK_URL", "n8n_batch_webhook_url"),
+            ("N8N_CORRECTION_WEBHOOK_URL", "n8n_correction_webhook_url"),
+            ("N8N_IMPORT_ERROR_WEBHOOK_URL", "n8n_import_error_webhook_url"))
+    if any(getattr(s, attr, "") for _, attr in urls) and len(s.n8n_webhook_secret or "") < MIN_WEBHOOK_SECRET_LEN:
         raise ConfigError(
-            "N8N_BATCH_WEBHOOK_URL is set but N8N_WEBHOOK_SECRET is empty. Set N8N_WEBHOOK_SECRET "
-            "(the shared secret the n8n workflow checks in the X-Webhook-Secret header) and restart."
+            f"An N8N_*_WEBHOOK_URL is set but N8N_WEBHOOK_SECRET is empty or shorter than {MIN_WEBHOOK_SECRET_LEN} "
+            "characters. Set N8N_WEBHOOK_SECRET (the shared secret the n8n workflow checks in the "
+            "X-Webhook-Secret header) and restart."
         )
-    for name, attr in (("N8N_BATCH_WEBHOOK_URL", "n8n_batch_webhook_url"),
-                       ("N8N_CORRECTION_WEBHOOK_URL", "n8n_correction_webhook_url"),
-                       ("N8N_IMPORT_ERROR_WEBHOOK_URL", "n8n_import_error_webhook_url")):
+    for name, attr in urls:
         url = getattr(s, attr, "") or ""
         if url and not is_safe_webhook_url(url):
             # Never echo the URL itself (it can carry a token).

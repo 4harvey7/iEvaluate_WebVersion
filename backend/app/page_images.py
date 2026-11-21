@@ -17,7 +17,8 @@ image or a key). The same job stores the page's score summary
 
 Retention: pictures older than SCAN_IMAGE_RETENTION_DAYS (default 90; 0 =
 keep) are removed by maybe_cleanup(), started at most once an hour from the
-batch page's poll, also in the background pool.
+batch page's poll, also in the background pool. To enforce it even when nobody
+opens a batch, schedule `python -m app.page_images cleanup_expired` (daily).
 
 Until migration 010 is applied (columns missing / bucket missing) every
 function here is a no-op that is tried again every 5 minutes; the batch page
@@ -457,3 +458,30 @@ def images_since(sb) -> datetime | None:
     with _since_lock:
         _since.update(at=now, value=value)
     return value
+
+
+if __name__ == "__main__":
+    # Scheduled retention (e.g. a daily Render cron job), not throttled:
+    #   python -m app.page_images cleanup_expired
+    import sys
+
+    from app.db import get_settings, get_supabase
+
+    if sys.argv[1:] != ["cleanup_expired"]:
+        sys.exit("usage: python -m app.page_images cleanup_expired")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    total = 0
+    while True:  # each call removes at most CLEANUP_MAX_ROUNDS x CLEANUP_BATCH pictures
+        n = cleanup_expired(get_supabase(), get_settings())
+        total += n
+        if n < CLEANUP_MAX_ROUNDS * CLEANUP_BATCH:
+            break
+    print(f"page picture cleanup: removed {total} pictures")
+    # Database copies (base64 images, plaintext student IDs): migration 038.
+    days = get_settings().scan_image_retention_days
+    if days >= 30:
+        try:
+            res = get_supabase().rpc("run_retention_cleanup", {"p_days": days}).execute()
+            print(f"database retention cleanup: {res.data}")
+        except Exception as e:  # 038 not applied yet: the bucket part above still counts
+            sys.exit(f"database retention cleanup failed ({type(e).__name__}); is migration 038 applied?")

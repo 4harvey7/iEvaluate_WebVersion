@@ -53,7 +53,10 @@ def _revoke(client) -> None:
 def login(req: LoginRequest, request: Request):
     email = req.email.strip().lower()
     ip = client_ip(request)
-    if not login_limiter.hit(f"ip:{ip}", 30, 300) or not login_limiter.hit(f"email:{email}", 8, 300):
+    # Per (email, IP) so someone elsewhere can't lock a named user out; the
+    # sliding window is the cooldown (attempts older than 5 minutes drop off).
+    email_key = f"email:{email}|ip:{ip}"
+    if not login_limiter.hit(f"ip:{ip}", 30, 300) or not login_limiter.hit(email_key, 8, 300):
         raise HTTPException(status_code=429, detail={"code": "rate_limited", "message": "Too many login attempts. Wait a few minutes and try again."})
 
     client = new_auth_client()
@@ -75,7 +78,7 @@ def login(req: LoginRequest, request: Request):
         _revoke(client)
         raise HTTPException(status_code=401, detail={"code": "login_failed", "message": GENERIC_LOGIN_ERROR})
 
-    login_limiter.reset(f"email:{email}")
+    login_limiter.reset(email_key)
     return _session_payload(session, staff)
 
 

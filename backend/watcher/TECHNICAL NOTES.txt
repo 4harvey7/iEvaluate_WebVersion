@@ -32,6 +32,20 @@ WHAT IT IS
   copy: it exits with code 7. Re-running INSTALL on a 2.4.x laptop removes the
   old auto-start. IT can opt in to auto-start with install_task.bat.
   The website shows a note for stations still reporting a version below 2.5.0.
+  2.5.1+ (security review; reinstall needed): a folder sent from the website is
+  used only if it is inside "allowed_roots" (see below); "api_base" must be
+  https:// (http:// only for localhost / 127.0.0.1), else the watcher refuses
+  to start ("Config problem"); symbolic links in the scan folder are ignored;
+  INSTALL deletes watcher_config.json from the extracted download after the
+  verified copy (the key then lives only in %LOCALAPPDATA%\ScanWatcher\).
+  2.5.2+ (reinstall needed): "Browse..." on the website's Scanner setup page.
+  While running, the watcher listens on http://127.0.0.1:47615 (this laptop
+  only): GET /ping, POST /pick-folder opens the Windows folder window
+  (tkinter, else PowerShell) and returns only the chosen path. It answers only
+  the website origins in "site_origins" (written by the installer from the
+  backend's CORS_ORIGINS; missing = Browse off) and one window at a time. A
+  folder picked there is added to "allowed_roots". If the port is in use,
+  Browse is off and watcher.log says so; typing the folder still works.
 
 THE PACKAGE (ScanWatcher-<station>.zip, top folder ScanWatcher\)
   INSTALL.bat          one-click installer (see below)
@@ -48,7 +62,15 @@ THE PACKAGE (ScanWatcher-<station>.zip, top folder ScanWatcher\)
   watcher_config.json:
     { "api_base": "https://<backend>", "station_key": "<secret>", "folder": "C:/Scans" }
   "folder" is optional (default C:/Scans). Use forward slashes (backslashes are
-  tolerated). Optional: "processed_dir", "skipped_dir", "poll_seconds".
+  tolerated). Optional: "processed_dir", "skipped_dir", "poll_seconds",
+  "allowed_roots".
+  "allowed_roots" (2.5.1+), e.g. ["C:/Scans", "D:/Scans"]: a folder sent from
+  the website is used only when it is one of these folders or inside one
+  (checked after resolving links). Default when the key is missing or empty:
+  C:/Scans plus the "folder" in this file at start-up, so existing installs
+  keep working. Anything else is refused like an unsafe folder (old folder
+  kept, website shows "That folder isn't allowed"); IT adds the root here by
+  hand and restarts the watcher.
 
 WHAT INSTALL.bat DOES (safe to re-run; re-running = clean reinstall)
   1. Refuses to run from inside the zip / %TEMP% or with files missing; needs
@@ -61,7 +83,8 @@ WHAT INSTALL.bat DOES (safe to re-run; re-running = clean reinstall)
      "iEvaluate Scan Watcher" scheduled task), then
        <python> -m pip install -q -r requirements.txt      (3 tries)
   4. Copies the program + watcher_config.json to  %LOCALAPPDATA%\ScanWatcher\
-     (the extracted download can be deleted afterwards), removes the
+     and, once the copy is verified, deletes watcher_config.json (the station
+     key) from the extracted download (2.5.1+); removes the
      downloaded-from-internet mark (Unblock-File), creates the scan folder.
   5. Shortcuts (2.5.0+): "Start Scan Watcher" and "Stop Scan Watcher" on the
      desktop and in the Start Menu folder "iEvaluate Scan Watcher". No
@@ -96,6 +119,22 @@ FOLDER HANDLING
     unsafe folder pushed from the website is ignored (old folder kept).
   - Missing folder (e.g. USB/network drive absent): retried; website shows
     "Folder not found". No permission: "Can't open the folder".
+  - 2.5.1+: website folders must also be inside "allowed_roots" (see above).
+
+RETENTION OF PROCESSED / SKIPPED SCANS (manual, IT)
+  The watcher never deletes scans: processed\<date>\, skipped\ and
+  skipped\discarded\<date>\ grow until someone removes them. They hold signed
+  forms with student IDs. The server keeps its own copies for 90 days
+  (SCAN_IMAGE_RETENTION_DAYS), so keep the laptop copies no longer than that:
+  once a month, after the term's batches are reviewed, delete the dated
+  folders under processed\ and skipped\discarded\ older than 90 days, e.g.
+  (PowerShell, check the path first):
+    Get-ChildItem C:\Scans\processed, C:\Scans\skipped\discarded -Directory |
+      Where-Object LastWriteTime -lt (Get-Date).AddDays(-90) |
+      Remove-Item -Recurse
+  Leave skippedefore-batch\ alone (pages waiting to be added to a batch).
+  This is deliberately not automatic: a wrong folder setting must never make
+  the watcher delete files.
 
 STATUS LIGHT ON THE WEBSITE (from heartbeats)
   green "Online - watching <folder>" | red "Offline" (no heartbeat for 40 s,

@@ -50,7 +50,7 @@ def test_startup_refuses_webhook_without_secret():
         validate_settings(SimpleNamespace(n8n_batch_webhook_url="https://n8n.example/hook", n8n_webhook_secret=""))
     assert "N8N_WEBHOOK_SECRET" in str(e.value)
     assert "n8n.example" not in str(e.value)  # never echo the URL
-    validate_settings(SimpleNamespace(n8n_batch_webhook_url="https://n8n.example/hook", n8n_webhook_secret="x"))
+    validate_settings(SimpleNamespace(n8n_batch_webhook_url="https://n8n.example/hook", n8n_webhook_secret="x" * 32))
     validate_settings(SimpleNamespace(n8n_batch_webhook_url="", n8n_webhook_secret=""))
 
 
