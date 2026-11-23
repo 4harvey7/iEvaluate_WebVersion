@@ -328,19 +328,19 @@ def _subject(sb, subject_id: str) -> dict | None:
 
 def _other_raw_row(sb, instructor_id: str, subject_id: str, term_id: str | None, student_id: str,
                    task_id: str | None) -> dict | None:
-    """A stored result of ANOTHER form (different or no task_id) for the same
-    instructor, subject, term and student; crediting would overwrite it."""
-    if not student_id or not term_id:
+    """A stored sheet-import row (no task_id) for the same instructor, subject, term
+    and student that crediting this task-less form would overwrite.
+    A scanned form (with a task_id) is keyed by its own task (migration 022): a
+    student ID never replaces another form; duplicates go by stamp number only."""
+    if not student_id or not term_id or task_id:
         return None
     # Compared by keyed hash (migration 021); the database computes it, so the pepper never drifts.
     hashed = sb.rpc("sast_hash_student_id", {"p_student_id": student_id}).execute().data
     rows = (sb.table("sast_all_raw_data_survey").select("task_id")
             .eq("instructor_ID", instructor_id).eq("subject_id", subject_id)
-            .eq("term_id", term_id).eq("student_id_hash", hashed).limit(5).execute().data or [])
-    for r in rows:
-        if r.get("task_id") != task_id:
-            return r
-    return None
+            .eq("term_id", term_id).eq("student_id_hash", hashed).is_("task_id", "null")
+            .limit(1).execute().data or [])
+    return rows[0] if rows else None
 
 
 def _pending_import_error_for_task(sb, task_id: str | None) -> bool:
@@ -376,8 +376,7 @@ def _would_overwrite(existing: dict, student_id: str) -> HTTPException:
     task = existing.get("task_id")
     return _err(409, "would_overwrite",
                 f"A form from student {student_id} is already stored for this instructor, subject and term"
-                + (" (another scanned page)." if task else " (from the phone app or a sheet import).")
-                + " Saving would replace it. Confirm only if this form should replace that one.",
+                + " (from a sheet import). Saving would replace it. Confirm only if this form should replace that one.",
                 existing_task_id=task, student_id=student_id)
 
 

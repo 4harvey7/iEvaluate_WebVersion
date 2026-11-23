@@ -300,6 +300,10 @@ EXPECTED_ADDED_EDGES = {("Unified AI Analysis1", "main", 1, REMARK_LOOP_WAIT, 0)
                         ("Normalize Sheet Rows", "main", 1, "Sheet Import Error Response", 0),
                         ("image to ocr and omr python", "main", 0, "Phone Known Names", 0),
                         ("Phone Known Names", "main", 0, "ai validation ocr and omr", 0),
+                        # keep-alive merged into this workflow
+                        ("Every 10 minutes", "main", 0, "Ping backend", 0),
+                        ("Ping backend", "main", 0, "Status not 200?", 0),
+                        ("Status not 200?", "main", 0, "Record failure", 0),
                         # stamp rule (migration 015)
                         ("reconcile ocr and omr1", "main", 0, "Phone Stamp Check", 0),
                         ("Phone Stamp Check", "main", 0, "Phone Stamp Verdict", 0),
@@ -581,13 +585,18 @@ def main(argv):
             or "LEFT JOIN public.department_table" not in by_name[n]["parameters"]["query"]]
     check(not corr, "correction instructor lookups (get instructor id7 / id9) accept placeholder instructors"
           + (f": {corr}" if corr else ""))
-    check("duplicate_student_exists" in idsql and "r.task_id IS DISTINCT FROM $5" in idsql
-          and "reasons.push('duplicate_student_id')" in dec
+    mig022 = (HERE.parent.parent / "migrations" / "022_stamp_only_duplicates.sql").read_text(encoding="utf-8")
+    up_cols = by_name["Insert or update rows in a table1"]["parameters"]["columns"]
+    check("student" not in idsql.split("WITH", 1)[1] and "duplicate_student" not in dec
+          and "duplicate_student" not in by_name["Website Flagged Record"]["parameters"]["jsCode"]
+          and up_cols["matchingColumns"] == ["subject_id", "term_id", "instructor_ID", "student_id", "dedupe_key"]
+          and "dedupe_key: (r['task_id']" in by_name["Code in JavaScript"]["parameters"]["jsCode"]
           and "public.save_website_raw_row(" in by_name["Website Raw Upsert"]["parameters"]["query"]
-          and "where s.task_id = excluded.task_id" in (HERE.parent.parent / "migrations" / "015_stamp_no.sql").read_text(encoding="utf-8"),
-          "same student + instructor + subject + term with another task_id -> duplicate_student_id "
-          "(Identity Check/Decide), and Website Raw Upsert (public.save_website_raw_row, migration 015) never overwrites "
-          "another page's row")
+          and "where s.task_id = excluded.task_id" in mig022
+          and 'on conflict (subject_id, term_id, "instructor_ID", student_id, dedupe_key)' in mig022,
+          "student ID optional, never a duplicate key (SAO rule 2026-11-23): Identity Check/Decide/Flagged Record have "
+          "no student duplicate; the shared upsert matches on dedupe_key (migration 022: a scanned form only upserts "
+          "its own task's row); Website Raw Upsert never overwrites another page's row")
     inv = by_name["Website Invalid Request Response"]["parameters"]["jsCode"]
     check("review_reasons: ['invalid_request', 'not_saved_permanent']" in inv and "'internal_error_not_saved'" not in inv,
           "invalid request -> review_reasons ['invalid_request', 'not_saved_permanent'] (not retryable)")
@@ -635,13 +644,13 @@ def main(argv):
     not_null += [f"{n} ('unverified')" for n, c in web_code.items() if "'unverified'" in c]
     params = sorted(set(re.findall(r"\$(\d+)", idsql)), key=int)
     qr_id = by_name["Website Identity Check"]["parameters"]["options"]["queryReplacement"]
-    sql_ok = (params == ["1", "2", "3", "4", "5", "6"] and "similarity" not in idsql
+    sql_ok = (params == ["1", "2", "3", "4", "5"] and "similarity" not in idsql
               and "ocr_instructor" not in qr_id and "subject_code_candidates" not in qr_id
               and "$json.stamp_status === 'ok'" in qr_id)
     check(not ident_bad and not not_null and sql_ok,
           "website: none of the removed identity reasons (" + ", ".join(IDENTITY_REASONS) + "); identity_check null "
-          "in every answer that cannot carry a mismatch; Website Identity Check = batch integrity only (5 parameters + "
-          "the stamp as $6, no similarity)" + (f": reasons {ident_bad}" if ident_bad else "")
+          "in every answer that cannot carry a mismatch; Website Identity Check = batch integrity only (4 parameters + "
+          "the stamp as $5, no similarity, no student ID)" + (f": reasons {ident_bad}" if ident_bad else "")
           + (f": identity_check not null in {not_null}" if not_null else "")
           + ("" if sql_ok else f": identity SQL params {params}"))
 
@@ -680,8 +689,7 @@ def main(argv):
         if len(re.findall(rf"^const {const}\s*=\s*{re.escape(val)};", dec, re.M)) != 1:
             dec_bad.append(f"const {const} = {val}")
     for needle in ("nodeItem('Website Identity Check')", "$input.first()", "const MISMATCH_RE = /^(instructor|subject)_mismatch_/;",
-                   "const identityCheck = reasons.some((r) => MISMATCH_RE.test(r))", "identity_check: identityCheck,",
-                   "if (targetDiffers) {"):
+                   "const identityCheck = reasons.some((r) => MISMATCH_RE.test(r))", "identity_check: identityCheck,"):
         if needle not in dec:
             dec_bad.append(f"Decide lacks {needle!r}")
     dec_bad += [f"partial_data.{k}" for k in FORM_PD_KEYS if f"      {k}: " not in dec]
@@ -693,7 +701,7 @@ def main(argv):
     check(not fm_bad and not dec_bad and not frec_bad and resp_ok,
           f"website form check: {FORM_MATCH} (form_match.sql, 5 array parameters, error output) between Identity Check "
           "(both outputs) and Decide (both outputs); Decide flags " + ", ".join(MISMATCH_REASONS) + f", {FORM_MATCH_FAILED} "
-          "with the suggestion pre-filled, drops a batch duplicate_student_id when the suggestion differs, sets "
+          "with the suggestion pre-filled, sets "
           "identity_check only with a *_mismatch_* reason; Flagged Record error paths 'unchecked' + batch suggestion; "
           "Respond to Webhook passes identity_check through"
           + (f": {fm_bad}" if fm_bad else "") + (f": Decide {dec_bad}" if dec_bad else "")
@@ -1032,7 +1040,7 @@ def main(argv):
                 st_bad.append(f"{name}: lacks {needle!r}")
     if "public.sast_stamp_duplicate_of(" not in idsql or "duplicate_stamp_exists" not in idsql \
             or by_name["Website Identity Check"]["parameters"]["options"].get("queryReplacement") != IDENTITY_CHECK_PARAMS:
-        st_bad.append("Website Identity Check: stamp duplicate ($6) missing")
+        st_bad.append("Website Identity Check: stamp duplicate ($5) missing")
     wru = by_name["Website Raw Upsert"]["parameters"]
     if wru.get("query") != read("website_raw_upsert.sql") or wru["options"].get("queryReplacement") != RAW_UPSERT_PARAMS \
             or sorted(set(re.findall(r"\$(\d+)", wru["query"])), key=int) != [str(k) for k in range(1, 13)]:

@@ -14,7 +14,7 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "={{ $env.BACKEND_URL }}/health",
+        "url": "={{ String($env.BACKEND_URL || '').replace(/\\/+$/, '') }}/health",
         "options": {
           "timeout": 60000,
           "response": { "response": { "fullResponse": true, "neverError": true } }
@@ -70,6 +70,6 @@
     "Ping backend": { "main": [ [ { "node": "Status not 200?", "type": "main", "index": 0 } ] ] },
     "Status not 200?": { "main": [ [ { "node": "Record failure", "type": "main", "index": 0 } ], [] ] }
   },
-  "settings": { "executionOrder": "v1" },
+  "settings": { "executionOrder": "v1", "availableInMCP": false, "saveDataSuccessExecution": "none" },
   "active": false
 }

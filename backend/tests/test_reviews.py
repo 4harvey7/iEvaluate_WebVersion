@@ -135,6 +135,10 @@ class FakeQuery:
         wanted = {_s(x) for x in vals}
         return self._filter(col, lambda v: _s(v) in wanted)
 
+    def is_(self, col, val):
+        assert val == "null", val
+        return self._filter(col, lambda v: v is None)
+
     def gte(self, col, val):
         return self._filter(col, lambda v: v is not None and _cmp_value(v) >= _cmp_value(val))
 
@@ -567,33 +571,21 @@ def test_approve_in_progress_and_stale_submission(env):
     assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body()).status_code == 200
 
 
-def test_approve_would_overwrite_and_confirm(env):
+def test_approve_same_student_id_is_no_duplicate(env):
+    # SAO rule 2026-11-23: the student ID is optional and never a duplicate key; a scanned form
+    # (has a task_id) is keyed by its own task (migration 022), duplicates go by stamp only.
     db, n8n, client = env()
     db.tables["sast_all_raw_data_survey"] = [
-        raw_row(instructor_ID=PEDRO, subject_id=IT101, term_id=TERM, student_id="2021-0001", task_id="web:x:other")]
+        raw_row(instructor_ID=PEDRO, subject_id=IT101, term_id=TERM, student_id="2021-0001", task_id="web:x:other"),
+        raw_row(instructor_ID=PEDRO, subject_id=IT101, term_id=TERM, student_id="2021-0001", task_id=None)]
     r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body())
-    assert r.status_code == 409
-    d = r.json()["detail"]
-    assert d["code"] == "would_overwrite" and d["existing_task_id"] == "web:x:other"
-    assert n8n.calls == [] and db.row("failed_scan_queue", Q1)["review_version"] == 3
-    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(confirm_overwrite=True))
     assert r.status_code == 200 and len(n8n.calls) == 1
 
 
-def test_overwrite_check_compares_the_keyed_hash_not_the_plaintext(env):
+def test_approve_blank_student_id_is_accepted(env):
     db, n8n, client = env()
-    # same plaintext but no/other hash (e.g. a different pepper): not this student's stored form
-    db.tables["sast_all_raw_data_survey"] = [
-        {"instructor_ID": PEDRO, "subject_id": IT101, "term_id": TERM, "student_id": "2021-0001",
-         "student_id_hash": "h1:" + "0" * 64, "task_id": "web:x:other"}]
-    assert client.post(f"/reviews/queue/{Q1}/approve", json=approve_body()).status_code == 200
-    # the stored row's hash matches the typed ID (spaces ignored, like the database's btrim)
-    db2, _, client2 = env()
-    db2.tables["sast_all_raw_data_survey"] = [
-        {"instructor_ID": PEDRO, "subject_id": IT101, "term_id": TERM, "student_id": None,
-         "student_id_hash": fake_hash(" 2021-0001 "), "task_id": "web:x:other"}]
-    r = client2.post(f"/reviews/queue/{Q1}/approve", json=approve_body())
-    assert r.status_code == 409 and r.json()["detail"]["student_id"] == "2021-0001"
+    r = client.post(f"/reviews/queue/{Q1}/approve", json=approve_body(student_id=""))
+    assert r.status_code == 200 and n8n.calls[0][1]["student_id"] == ""
 
 
 def test_same_task_raw_row_is_not_an_overwrite(env):
@@ -837,13 +829,12 @@ def test_import_error_resolve_keeps_raw_values_when_not_edited(env):
 
 def test_import_error_resolve_http_error_and_overwrite(env):
     db, n8n, client = env(n8n=FakeN8n(status=502))
+    # a scanned page (has a task_id) is keyed by its task (migration 022): the same student ID
+    # stored from a sheet is no overwrite and no duplicate (duplicates go by stamp only)
     db.tables["sast_all_raw_data_survey"] = [
         raw_row(instructor_ID=JUAN, subject_id=IT101, term_id=TERM, student_id="2021-0009", task_id=None)]
     body = {"expected_version": 1, "instructor_id": JUAN, "subject_id": IT101}
     r = client.post("/reviews/import-errors/101/resolve", json=body)
-    assert r.status_code == 409 and r.json()["detail"]["code"] == "would_overwrite"
-    assert r.json()["detail"]["existing_task_id"] is None
-    r = client.post("/reviews/import-errors/101/resolve", json={**body, "confirm_overwrite": True})
     assert r.status_code == 502 and r.json()["detail"]["code"] == "correction_failed"
     assert db.row("import_errors", 101)["review_state"] == "submit_failed"
     assert db.row("import_errors", 101)["status"] == "pending"
