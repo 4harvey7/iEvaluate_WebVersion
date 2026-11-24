@@ -3830,8 +3830,8 @@ def apply_instructor_readings(out) -> list[str]:
     return done
 
 
-# Remark spelling (2026-11-24): the website Gemini prompt also fixes the student's misspelled words in the
-# remarks, nothing else (no rephrasing, grammar or translation). Website only; the phone prompt is unchanged.
+# Remark spelling (2026-11-24): both Gemini prompts (website and phone) also fix the student's misspelled
+# words in the remarks, nothing else (no rephrasing, grammar or translation).
 SPELLING_ANCHOR = "transcribe the handwriting letter by letter and do not invent words."
 SPELLING_LINE = (" Then fix only misspelled words in the remarks (e.g. 'teching' -> 'teaching', 'intresting' -> "
                  "'interesting'): keep the student's exact words, word order, language, slang, grammar, punctuation "
@@ -3840,12 +3840,17 @@ SPELLING_LINE = (" Then fix only misspelled words in the remarks (e.g. 'teching'
 
 
 def apply_remark_spelling(out) -> list[str]:
-    """Idempotent; full build and live export. Website AI Validation prompt: SPELLING_LINE after the remarks rule."""
-    gem = {n["name"]: n for n in out["nodes"]}[WEB_GEMINI_NODE]["parameters"]
-    if SPELLING_LINE in gem["jsonBody"]:
-        return []
-    gem["jsonBody"] = replace_once(gem["jsonBody"], SPELLING_ANCHOR, SPELLING_ANCHOR + SPELLING_LINE, WEB_GEMINI_NODE)
-    return [f"{WEB_GEMINI_NODE}: remark spelling fix"]
+    """Idempotent; full build and live export. Website AI Validation and phone ai validation ocr and omr
+    prompts: SPELLING_LINE after the remarks rule."""
+    by_name = {n["name"]: n for n in out["nodes"]}
+    done = []
+    for name in (PHONE_GEMINI_NODE, WEB_GEMINI_NODE):
+        gem = by_name[name]["parameters"]
+        if SPELLING_LINE in gem["jsonBody"]:
+            continue
+        gem["jsonBody"] = replace_once(gem["jsonBody"], SPELLING_ANCHOR, SPELLING_ANCHOR + SPELLING_LINE, name)
+        done.append(f"{name}: remark spelling fix")
+    return done
 
 
 # Student ID (2026-11-06, ported from the user's live export 'BUTITI NA KAAYO NI'): digit by digit, ? when
@@ -4033,7 +4038,7 @@ def main(argv):
     apply_ocr_crosscheck(out)          # AI student ID / remark vs OMR ink, white-ink rows, double marks
     apply_outside_mark(out)            # a check in a header row is no answer (OMR 'outside', prompt line)
     apply_instructor_readings(out)     # alternative instructor spellings + subject links, matched locally
-    apply_remark_spelling(out)         # website prompt: fix misspelled remark words only
+    apply_remark_spelling(out)         # both prompts: fix misspelled remark words only
     apply_student_id_rule(out)         # ? for an unclear ID digit; reconcilers keep 6 to 12 digits only
 
     # 5d. word cloud words (real word counts next to the AI themes)
