@@ -3830,6 +3830,24 @@ def apply_instructor_readings(out) -> list[str]:
     return done
 
 
+# Remark spelling (2026-11-24): the website Gemini prompt also fixes the student's misspelled words in the
+# remarks, nothing else (no rephrasing, grammar or translation). Website only; the phone prompt is unchanged.
+SPELLING_ANCHOR = "transcribe the handwriting letter by letter and do not invent words."
+SPELLING_LINE = (" Then fix only misspelled words in the remarks (e.g. 'teching' -> 'teaching', 'intresting' -> "
+                 "'interesting'): keep the student's exact words, word order, language, slang, grammar, punctuation "
+                 "and tone; never rephrase, paraphrase, summarize, translate, add or drop words, or fix grammar; leave "
+                 "a word as read when its intended spelling is unclear or it is Tagalog/Bisaya-Cebuano, slang or a name.")
+
+
+def apply_remark_spelling(out) -> list[str]:
+    """Idempotent; full build and live export. Website AI Validation prompt: SPELLING_LINE after the remarks rule."""
+    gem = {n["name"]: n for n in out["nodes"]}[WEB_GEMINI_NODE]["parameters"]
+    if SPELLING_LINE in gem["jsonBody"]:
+        return []
+    gem["jsonBody"] = replace_once(gem["jsonBody"], SPELLING_ANCHOR, SPELLING_ANCHOR + SPELLING_LINE, WEB_GEMINI_NODE)
+    return [f"{WEB_GEMINI_NODE}: remark spelling fix"]
+
+
 # Student ID (2026-11-06, ported from the user's live export 'BUTITI NA KAAYO NI'): digit by digit, ? when
 # unclear; the reconcilers keep only 6 to 12 digits as the ID, else a note only (never a review reason, 2026-11-10).
 STUDENT_ID_OLD = "6. student_id: digits only."
@@ -3888,6 +3906,7 @@ def live_main(argv):
     crosscheck = apply_ocr_crosscheck(out)
     outside = apply_outside_mark(out)
     readings = apply_instructor_readings(out)
+    spelling = apply_remark_spelling(out)
     student_id = apply_student_id_rule(out)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -3915,6 +3934,7 @@ def live_main(argv):
     print("ocr cross-check: " + ("; ".join(crosscheck) if crosscheck else "already applied"))
     print("outside mark: " + ("; ".join(outside) if outside else "already applied"))
     print("instructor readings: " + ("; ".join(readings) if readings else "already applied"))
+    print("remark spelling: " + ("; ".join(spelling) if spelling else "already applied"))
     print("student id rule: " + ("; ".join(student_id) if student_id else "already applied"))
     return 0
 
@@ -4013,6 +4033,7 @@ def main(argv):
     apply_ocr_crosscheck(out)          # AI student ID / remark vs OMR ink, white-ink rows, double marks
     apply_outside_mark(out)            # a check in a header row is no answer (OMR 'outside', prompt line)
     apply_instructor_readings(out)     # alternative instructor spellings + subject links, matched locally
+    apply_remark_spelling(out)         # website prompt: fix misspelled remark words only
     apply_student_id_rule(out)         # ? for an unclear ID digit; reconcilers keep 6 to 12 digits only
 
     # 5d. word cloud words (real word counts next to the AI themes)
